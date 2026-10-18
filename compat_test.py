@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LearnON nginx 语法兼容性测试：拉起网关（conf/compat_nginx.conf），验证新指令行为。"""
+"""ONRouter nginx 语法兼容性测试：拉起网关（conf/compat_nginx.conf），验证新指令行为。"""
 import subprocess, sys, time, os
 import urllib.request, urllib.error
 
@@ -27,7 +27,7 @@ def check(name, ok, detail=""):
     print(("PASS" if ok else "FAIL"), name, detail if not ok else "")
 
 def main():
-    exe = os.path.join(RUST, "target", "release", "learnon.exe")
+    exe = os.path.join(RUST, "target", "release", "onrouter.exe")
     gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "compat_nginx.conf")],
                           cwd=RUST, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
@@ -69,7 +69,7 @@ def main():
 
         # 6. alias
         st, b = req("GET", "/up/index.html")
-        check("alias 映射", st == 200 and b"LearnON" in b, f"{st} {b[:60]}")
+        check("alias 映射", st == 200 and b"ONRouter" in b, f"{st} {b[:60]}")
 
         # 7. index 多值（/home/ 下只有 index.htm）
         st, b = req("GET", "/home/")

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Implemented OpenResty-compatible response filtering APIs for LearnON, enabling modification of response headers and bodies through Lua scripts.
+Implemented OpenResty-compatible response filtering APIs for ONRouter, enabling modification of response headers and bodies through Lua scripts.
 
 ## Features Implemented
 
@@ -33,7 +33,7 @@ Implemented OpenResty-compatible response filtering APIs for LearnON, enabling m
 
 ### Files Modified
 
-#### 1. `crates/learnon-server/src/engine.rs`
+#### 1. `crates/onrouter-server/src/engine.rs`
 Added filter argument storage to `RequestCtx`:
 ```rust
 /// body_filter_by_lua 参数：ngx.arg[1]=chunk, ngx.arg[2]=eof
@@ -41,7 +41,7 @@ pub filter_chunk: Option<Vec<u8>>,
 pub filter_eof: bool,
 ```
 
-#### 2. `crates/learnon-server/src/lua_engine.rs`
+#### 2. `crates/onrouter-server/src/lua_engine.rs`
 Implemented `ngx.arg` table with metamethods for indexed access:
 ```rust
 // ngx.arg —— body_filter_by_lua 参数访问（ngx.arg[1]=chunk, ngx.arg[2]=eof）
@@ -102,7 +102,7 @@ ngx.set("arg", arg)?;
 - `__newindex` allows writing back modified values via `ngx.arg[1] = new_value`
 - Read-only protection on `ngx.arg[2]` (eof flag)
 
-#### 3. `crates/learnon-server/src/router.rs`
+#### 3. `crates/onrouter-server/src/router.rs`
 Added directive parsing support:
 ```rust
 "header_filter_by_lua",
@@ -112,7 +112,7 @@ Added directive parsing support:
 ```
 Both in location-level allowed directives and server-level allowed directives.
 
-#### 4. `crates/learnon-server/src/server.rs`
+#### 4. `crates/onrouter-server/src/server.rs`
 Integrated filter execution into response flow:
 ```rust
 // 执行 header_filter_by_lua（如果存在，用于修改响应头）
@@ -158,7 +158,7 @@ if let Some((_, filter_name, filter_src)) = loc.lua_phases.iter()
 ## Testing
 
 ### Test Configuration
-Added to `conf/learnon.conf`:
+Added to `conf/onrouter.conf`:
 ```nginx
 location /api/body_filter_test {
     content_by_lua "ngx.say('Hello World')";
@@ -185,7 +185,7 @@ location /api/body_filter_test {
 
 ### Test Command
 ```bash
-./target/debug/learnon.exe conf/learnon.conf
+./target/debug/onrouter.exe conf/onrouter.conf
 curl http://127.0.0.1:8080/api/body_filter_test
 # Expected output: Hello OpenResty
 ```
@@ -220,7 +220,7 @@ body_filter_by_lua "
 ### 3. Dynamic Header Manipulation
 ```lua
 header_filter_by_lua "
-    ngx.header['X-Powered-By'] = 'LearnON'
+    ngx.header['X-Powered-By'] = 'ONRouter'
     ngx.header['X-Request-ID'] = ngx.var.request_id
     ngx.header['Cache-Control'] = 'max-age=3600'
 ";
@@ -249,7 +249,7 @@ body_filter_by_lua "
             if string.match(body, '</html>') then
                 -- Inject footer only for HTML responses
                 body = string.gsub(body, '</body>',
-                    '<footer>Powered by LearnON</footer></body>')
+                    '<footer>Powered by ONRouter</footer></body>')
                 ngx.arg[1] = body
             end
         end
@@ -260,7 +260,7 @@ body_filter_by_lua "
 ## Limitations & Differences from OpenResty
 
 ### Current Limitations
-1. **Single-Shot Execution**: Unlike OpenResty which calls body_filter multiple times for chunked responses, LearnON currently buffers the entire body and calls filter once with `eof=true`
+1. **Single-Shot Execution**: Unlike OpenResty which calls body_filter multiple times for chunked responses, ONRouter currently buffers the entire body and calls filter once with `eof=true`
    - Reason: Simpler implementation, matches current synchronous Lua model
    - Impact: Cannot stream large responses; memory usage scales with response size
 
@@ -268,13 +268,13 @@ body_filter_by_lua "
    - Future: Implement streaming filter with proper chunk boundary handling
 
 3. **No Subrequest Support**: body_filter cannot be used with subrequests (ngx.location.capture)
-   - Not yet implemented in LearnON
+   - Not yet implemented in ONRouter
 
 4. **Limited Error Recovery**: Filter errors result in 500 status with empty body
    - Future: Allow graceful degradation (send original body on filter error)
 
 ### Compatibility Matrix
-| Feature | OpenResty | LearnON v0.3 | Notes |
+| Feature | OpenResty | ONRouter v0.3 | Notes |
 |---------|-----------|--------------|-------|
 | `ngx.arg[1]` read | ✅ | ✅ | Body chunk |
 | `ngx.arg[1]` write | ✅ | ✅ | Modified chunk |

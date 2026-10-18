@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 # HTTP/3 (QUIC) serving E2E —— 用真实 QUIC/h3 流量证明 HTTP/3 服务真的可用。
-# 本机 curl/Node 均无 HTTP/3，故用自研 quinn+h3 客户端探针 lon-h3check（与 LearnON 同栈）：
+# 本机 curl/Node 均无 HTTP/3，故用自研 quinn+h3 客户端探针 orr-h3check（与 ONRouter 同栈）：
 #   * h3 单请求：STATUS=200 且 PROTO=HTTP/3 且 BODY 正确
 #   * h3 较大响应体：逐帧 send_data 完整送达（按长度校验）
 #   * h3 单连接多路复用：并发多流都拿到 200
 #   * 同端口共存：TCP-TLS 上 HTTP/1.1（curl -k --http1.1）仍可用，且响应带 alt-svc: h3
 #
-#   cargo build --release -p learnon-server && python tools/http3_e2e.py
+#   cargo build --release -p onrouter-server && python tools/http3_e2e.py
 import os
 import shutil
 import subprocess
@@ -55,11 +55,11 @@ def curl(args, timeout=15):
 
 
 def h3_probe(exe, path, mode, n=None, timeout=25):
-    """跑 lon-h3check，返回解析后的键值 dict。"""
+    """跑 orr-h3check，返回解析后的键值 dict。"""
     cmd = [exe, f"127.0.0.1:{H3_PORT}", SNI, path, mode]
     if n is not None:
         cmd.append(str(n))
-    env = dict(os.environ, LON_H3_CERT=CERT)
+    env = dict(os.environ, ORR_H3_CERT=CERT)
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                              cwd=ROOT, env=env)
@@ -79,12 +79,12 @@ def h3_probe(exe, path, mode, n=None, timeout=25):
 
 
 def kill_orphans():
-    """清掉残留的 learnon 进程，避免占用 18127（教训：先杀孤儿再跑 E2E）。"""
+    """清掉残留的 onrouter 进程，避免占用 18127（教训：先杀孤儿再跑 E2E）。"""
     try:
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq learnon.exe"],
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq onrouter.exe"],
                              capture_output=True, text=True, timeout=10)
-        if "learnon.exe" in out.stdout:
-            subprocess.run(["taskkill", "/IM", "learnon.exe", "/F"],
+        if "onrouter.exe" in out.stdout:
+            subprocess.run(["taskkill", "/IM", "onrouter.exe", "/F"],
                            capture_output=True, text=True, timeout=10)
             time.sleep(0.5)
     except Exception:
@@ -94,10 +94,10 @@ def kill_orphans():
 def main():
     if not os.path.exists(CERT):
         raise SystemExit("!! 缺证书 certs_scenario/server.pem")
-    server = find_bin("learnon")
-    probe = find_bin("lon-h3check")
+    server = find_bin("onrouter")
+    probe = find_bin("orr-h3check")
     if not server or not probe:
-        raise SystemExit("!! 先构建：cargo build --release -p learnon-server")
+        raise SystemExit("!! 先构建：cargo build --release -p onrouter-server")
 
     kill_orphans()
     os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
@@ -113,7 +113,7 @@ def main():
                 break
             time.sleep(0.2)
         if not ready:
-            raise SystemExit("!! learnon 未就绪（18127 被占用？看 logs/http3_out.log）")
+            raise SystemExit("!! onrouter 未就绪（18127 被占用？看 logs/http3_out.log）")
 
         # 1) h3 单请求
         kv = h3_probe(probe, "/hi", "single")

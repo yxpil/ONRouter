@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-# LearnON VM 内 Lua 协程并发 E2E —— 用真实并发流量证明同一 VM 上多条在途请求能在
+# ONRouter VM 内 Lua 协程并发 E2E —— 用真实并发流量证明同一 VM 上多条在途请求能在
 # ngx.sleep 处交错让出（墙钟≈单次睡眠时长），而非各自独占 VM 串行（墙钟≈ceil(K/vm)*时长）。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/lua_concurrency_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/lua_concurrency_e2e.py
 import os
 import socket
 import subprocess
@@ -13,7 +13,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONF = os.path.join(ROOT, "conf", "lua_concurrency.conf")
-LON_HOST, LON_PORT = "127.0.0.1", 18106
+ORR_HOST, ORR_PORT = "127.0.0.1", 18106
 
 VM_COUNT = min(max(os.cpu_count() or 4, 1), 16)  # 与 lua_engine.rs 的 clamp(1,16) 对齐
 SLEEP_MS = 500
@@ -28,18 +28,18 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def wait_ready(timeout=25):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            s = socket.create_connection((LON_HOST, LON_PORT), timeout=1)
+            s = socket.create_connection((ORR_HOST, ORR_PORT), timeout=1)
             s.close()
             return True
         except OSError:
@@ -49,7 +49,7 @@ def wait_ready(timeout=25):
 
 def http_get(path, timeout=15):
     """阻塞式单次 GET，返回 (status, body_text)。每次一条新连接，用于制造并发。"""
-    s = socket.create_connection((LON_HOST, LON_PORT), timeout=timeout)
+    s = socket.create_connection((ORR_HOST, ORR_PORT), timeout=timeout)
     s.sendall(f"GET {path} HTTP/1.1\r\nHost: concurrency.local\r\nConnection: close\r\n\r\n".encode())
     buf = b""
     while True:
@@ -96,7 +96,7 @@ def main():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         if not wait_ready():
-            raise SystemExit("!! learnon never became ready on %s" % LON_PORT)
+            raise SystemExit("!! onrouter never became ready on %s" % ORR_PORT)
 
         # ---- 1) 并发让出证明：K=3*VM 个 /sleep500 同时打到网关 ----
         #   旧模型（每 VM 串行一条）：墙钟≈ceil(3*VM/VM)*0.5=1.5s

@@ -1,4 +1,4 @@
-# Cosocket API Design for LearnON v0.3
+# Cosocket API Design for ONRouter v0.3
 
 ## Goal
 Provide foundational non-blocking TCP socket API in Lua, enabling external service connectivity without blocking tokio workers.
@@ -28,7 +28,7 @@ Provide foundational non-blocking TCP socket API in Lua, enabling external servi
 ### Key Challenge
 OpenResty's cosocket uses Nginx event loop + Lua coroutines to achieve "sync-style async" programming. When a socket operation would block, it yields the coroutine and registers with Nginx epoll. When data arrives, Nginx resumes the coroutine.
 
-LearnON uses tokio runtime + mlua. To match OpenResty behavior, we need:
+ONRouter uses tokio runtime + mlua. To match OpenResty behavior, we need:
 1. Async socket operations (tokio::net::TcpStream)
 2. Coroutine suspension/resumption (mlua::Coroutine)
 3. Event-driven resumption (tokio select! on socket readiness)
@@ -160,7 +160,7 @@ location /test/http {
 ## Performance Characteristics
 
 ### vs OpenResty
-| Metric | OpenResty | LearnON v0.3 | Notes |
+| Metric | OpenResty | ONRouter v0.3 | Notes |
 |--------|-----------|--------------|-------|
 | Connect latency | ~50μs | ~100μs | Extra tokio overhead |
 | Throughput (small msgs) | 50k req/s | 20k req/s | Blocking in spawn_blocking |

@@ -1,4 +1,4 @@
-# Cosocket API Foundation - LearnON v0.3
+# Cosocket API Foundation - ONRouter v0.3
 
 ## Implementation Status
 
@@ -17,7 +17,7 @@ Full async cosocket implementation requires:
 
 ## What Was Built
 
-### 1. Type Definition (`crates/learnon-server/src/lua_engine.rs`)
+### 1. Type Definition (`crates/onrouter-server/src/lua_engine.rs`)
 ```rust
 /// TCP cosocket 对象（对标 ngx.socket.tcp）- v0.3 简化版：API 骨架，为 v0.4 完整实现预留接口
 pub struct TcpSocket {
@@ -108,7 +108,7 @@ location /api/data {
 ### Option 2: Rust Native Module
 For custom protocols, write Rust handler:
 ```rust
-// In crates/learnon-server/src/engine.rs
+// In crates/onrouter-server/src/engine.rs
 registry.register("my_tcp_client", |ctx| {
     let mut stream = TcpStream::connect("service:6379").await?;
     stream.write_all(b"PING\r\n").await?;

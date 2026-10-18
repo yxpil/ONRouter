@@ -1,11 +1,11 @@
 version: '3.8'
 
 services:
-  learnon:
+  onrouter:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: learnon-gateway
+    container_name: onrouter-gateway
     restart: unless-stopped
     ports:
       - "80:80"
@@ -16,16 +16,16 @@ services:
       # Mount certificates for TLS
       - ./certs:/app/certs:ro
       # Persist logs
-      - learnon-logs:/app/logs
+      - onrouter-logs:/app/logs
       # Branding assets (logo)
       - ./public:/app/public:ro
     environment:
       # Optional: Override config path
-      - LEARNON_CONFIG=/app/conf/learnon.conf
+      - ONROUTER_CONFIG=/app/conf/onrouter.conf
       # Optional: Log level
       - RUST_LOG=info
     networks:
-      - learnon-net
+      - onrouter-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80/"]
       interval: 30s
@@ -49,19 +49,19 @@ services:
   # Optional: Add a demo backend service
   demo-backend:
     image: nginx:alpine
-    container_name: learnon-demo-backend
+    container_name: onrouter-demo-backend
     restart: unless-stopped
     volumes:
       - ./demo/html:/usr/share/nginx/html:ro
     networks:
-      - learnon-net
+      - onrouter-net
     expose:
       - "80"
 
 volumes:
-  learnon-logs:
+  onrouter-logs:
     driver: local
 
 networks:
-  learnon-net:
+  onrouter-net:
     driver: bridge

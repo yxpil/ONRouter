@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LearnON 冒烟测试：自动拉起两个演示后端 + 网关，跑完全部检查后清理。"""
+"""ONRouter 冒烟测试：自动拉起两个演示后端 + 网关，跑完全部检查后清理。"""
 import subprocess, sys, time, os, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.request, urllib.error
@@ -55,10 +55,10 @@ def main():
     b1 = start_backend(9001, "backend-1")
     b2 = start_backend(9002, "backend-2")
 
-    exe = os.path.join(RUST, "target", "release", "learnon.exe")
+    exe = os.path.join(RUST, "target", "release", "onrouter.exe")
     if not os.path.exists(exe):
-        exe = os.path.join(RUST, "target", "debug", "learnon.exe")
-    gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "learnon.conf")],
+        exe = os.path.join(RUST, "target", "debug", "onrouter.exe")
+    gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "onrouter.conf")],
                           cwd=RUST, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
         for _ in range(50):
@@ -68,11 +68,11 @@ def main():
 
         # 1 基础
         st, h, b = req("GET", "/")
-        check("index 页面", st == 200 and "LearnON" in b.decode("utf-8", "ignore"), f"{st} {b[:80]}")
+        check("index 页面", st == 200 and "ONRouter" in b.decode("utf-8", "ignore"), f"{st} {b[:80]}")
         st, h, b = req("GET", "/static/logo.png")
         check("logo 静态文件", st == 200 and "image/png" in h.get("content-type", ""), f"{st} {b[:60]}")
         st, h, b = req("GET", "/static/")
-        check("静态 index", st == 200 and b"LearnON" in b, f"{st} {b[:60]}")
+        check("静态 index", st == 200 and b"ONRouter" in b, f"{st} {b[:60]}")
         st, h, b = req("GET", "/no/such/path")
         check("404", st == 404, f"{st} {b[:60]}")
 
@@ -129,18 +129,18 @@ def main():
         txt = b.decode("utf-8", "ignore")
         check("ngx.re 正则捕获", st == 200 and "re-capture=tools" in txt, f"{st} {b[:100]}")
         check("escape_uri/unescape_uri", "a%20b%2Fc%3Fd" in txt and "你好" in txt, txt[:150])
-        st, h, b = req("POST", "/api/tools", data=b"hello-learnon-body")
+        st, h, b = req("POST", "/api/tools", data=b"hello-onrouter-body")
         check("请求体读取", st == 200 and "body_len=18" in b.decode("utf-8", "ignore"),
               f"{st} {b.decode('utf-8', 'ignore')[:150]}")
 
         # 6 add_header
         st, h, b = req("GET", "/hello")
-        check("add_header", h.get("x-powered-by") == "LearnON/0.2", f"{st} {h.get('x-powered-by')}")
+        check("add_header", h.get("x-powered-by") == "ONRouter/0.2", f"{st} {h.get('x-powered-by')}")
 
         # 7 HTTPS/TLS（8443 端口，自签名证书）
         st, h, b = req("GET", "/hello", https=True)
         check("HTTPS Lua", st == 200 and b"Hello from Lua" in b, f"{st} {b[:60]}")
-        check("HTTPS Server 头", h.get("server", "").startswith("LearnON/"), str(h.get("server")))
+        check("HTTPS Server 头", h.get("server", "").startswith("ONRouter/"), str(h.get("server")))
         st, h, b = req("GET", "/proxy/ping", https=True)
         check("HTTPS 反代", st == 200 and b"backend-" in b, f"{st} {b[:60]}")
         st, h, b = req("GET", "/count", https=True)

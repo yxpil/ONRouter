@@ -7,7 +7,7 @@
 #   * 全 off 对照 → 原样透传
 #   * sub_filter 强制缓冲路径（缓冲缝 build_buffered_response）同样改写、body 不变
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/proxy_redirect_cookie_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/proxy_redirect_cookie_e2e.py
 import os
 import subprocess
 import sys
@@ -35,11 +35,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -136,7 +136,7 @@ def main():
                 pass
             time.sleep(0.2)
         if not ready:
-            raise SystemExit("!! learnon 未就绪（端口 18200/18201 被占用？看 logs/proxy_redirect_out.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18200/18201 被占用？看 logs/proxy_redirect_out.log）")
 
         # 1) 字面量前缀 redirect + cookie domain/path（流式缝）
         st, hs, _ = request("/lit/redir")

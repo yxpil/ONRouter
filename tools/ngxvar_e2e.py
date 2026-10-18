@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ngx.var E2E —— 用真实 HTTP 流量证明 Lua 读/写 nginx 变量语义正确。
-#   cargo build --release -p learnon-server --bin learnon && python tools/ngxvar_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/ngxvar_e2e.py
 import os
 import subprocess
 import sys
@@ -25,11 +25,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def req(path, method="GET", headers=None):
@@ -63,7 +63,7 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18154 被占用？看 logs/ngxvar_e2e_err.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18154 被占用？看 logs/ngxvar_e2e_err.log）")
 
         st, body = req("/echo?x=1&y=2", headers={"X-Test": "abc"})
         e = kv(body)

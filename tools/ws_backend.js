@@ -1,5 +1,5 @@
 // 最小 WebSocket 回显后端（RFC6455，无第三方依赖）
-// 用途：验证 LearnON 的 101 升级隧道端到端可用
+// 用途：验证 ONRouter 的 101 升级隧道端到端可用
 const http = require('http');
 const crypto = require('crypto');
 const port = Number(process.argv[2] || 9301);

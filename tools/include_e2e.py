@@ -4,7 +4,7 @@
 #   · 片段内部再 include 的 nested/d.conf（递归展开）给 /inc_c 加上响应头；
 #   · 非 *.conf 的 notes.txt（含 /decoy）不被通配命中 → /decoy 应 404。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/include_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/include_e2e.py
 import os
 import subprocess
 import sys
@@ -28,11 +28,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def get(path, timeout=8):
@@ -58,7 +58,7 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18112 被占用？看 conf/include_demo/out.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18112 被占用？看 conf/include_demo/out.log）")
 
         st, body, _ = get("/inc_a")
         check("include 片段 vhosts/10-a.conf 的 /inc_a 命中", st == 200 and body == "A-from-include", f"st={st} body={body!r}")

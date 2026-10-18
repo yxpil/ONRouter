@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Orderin
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use learnon_config::Directive;
+use onrouter_config::Directive;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{log_error, log_info, log_warn};
@@ -445,7 +445,7 @@ pub struct UpstreamPool {
 }
 
 impl UpstreamPool {
-    pub fn parse_all(config: &learnon_config::Config) -> Result<Self, AppError> {
+    pub fn parse_all(config: &onrouter_config::Config) -> Result<Self, AppError> {
         let mut map = HashMap::new();
         for d in config.root.block.iter().filter(|d| d.name == "upstream") {
             let up = Self::parse_upstream(d)?;
@@ -672,7 +672,7 @@ mod tests {
     use super::*;
 
     fn pool(conf: &str) -> Result<UpstreamPool, AppError> {
-        let cfg = learnon_config::Config::parse(&format!("upstream u {{ {conf} }}"))
+        let cfg = onrouter_config::Config::parse(&format!("upstream u {{ {conf} }}"))
             .expect("配置应能解析");
         UpstreamPool::parse_all(&cfg)
     }

@@ -5,7 +5,7 @@
 #   * set_timeouts 覆盖读超时：慢后端睡 3s，但读超时压到 400ms → ~0.4s 内 502；
 #   * 服务发现风格轮转：共享字典计数器在 A/B 间均分真实请求。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/balancer_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/balancer_e2e.py
 import os
 import subprocess
 import sys
@@ -32,11 +32,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def get(path, headers=None):
@@ -88,7 +88,7 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18150 被占用？看 logs/balancer_e2e_err.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18150 被占用？看 logs/balancer_e2e_err.log）")
 
         st, body, _ = get("/ping")
         check("/ping pong", st == 200 and "pong" in body, f"st={st} body={body!r}")

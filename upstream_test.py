@@ -92,7 +92,7 @@ def main():
     if os.path.exists(ERRLOG):
         os.remove(ERRLOG)
 
-    exe = os.path.join(ROOT, "target", "release", "learnon.exe")
+    exe = os.path.join(ROOT, "target", "release", "onrouter.exe")
     gw = subprocess.Popen([exe, CONF], cwd=ROOT,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:

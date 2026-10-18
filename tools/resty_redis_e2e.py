@@ -2,7 +2,7 @@
 # resty.redis 纯 Lua RESP 客户端 E2E —— 网关内 resty.redis 向一个真实 RESP 存根服务器发命令，
 # 用真实流量证明动态命令派发、全类型回复解析、pipeline、错误/nil 回复、keepalive 连接池复用。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/resty_redis_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/resty_redis_e2e.py
 import os
 import socket
 import socketserver
@@ -31,11 +31,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def get(path):
@@ -198,7 +198,7 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18148 被占用？看 logs/resty_redis_err.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18148 被占用？看 logs/resty_redis_err.log）")
 
         st, body = get("/basic")
         b = kv(body)

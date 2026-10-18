@@ -54,7 +54,7 @@ pub type BoxResponse = Response<RespBody>;
 use http_body_util::combinators::BoxBody;
 
 /// 所有响应统一携带的品牌头（对标 nginx 的 Server 头）
-pub const SERVER_HEADER: &str = concat!("LearnON/", env!("CARGO_PKG_VERSION"));
+pub const SERVER_HEADER: &str = concat!("ONRouter/", env!("CARGO_PKG_VERSION"));
 
 /// location 匹配/内部重定向的最大跳数（nginx NGX_HTTP_MAX_URI_CHANGES = 10）
 const MAX_URI_CHANGES: usize = 10;
@@ -3018,7 +3018,7 @@ mod tests {
     /// 每个用例一个独立临时目录，避免静态缓存与用例互相污染
     fn tmp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "learnon-static-{}-{}-{}",
+            "onrouter-static-{}-{}-{}",
             tag,
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)

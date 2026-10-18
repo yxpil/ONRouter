@@ -1,5 +1,5 @@
 // 演示后端：返回自身端口 + 收到的路径/UA，附带一个 1MB 二进制路由和一个慢路由
-// 用于验证 LearnON 转发的正确性（负载均衡、请求头保留、大响应完整性、超时/中断）
+// 用于验证 ONRouter 转发的正确性（负载均衡、请求头保留、大响应完整性、超时/中断）
 const http = require('http');
 const crypto = require('crypto');
 const port = Number(process.argv[2]);

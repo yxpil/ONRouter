@@ -657,46 +657,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "learnon-config"
-version = "0.3.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "learnon-server"
-version = "0.3.0"
-dependencies = [
- "bytes",
- "chrono",
- "crossbeam-channel",
- "flate2",
- "futures-util",
- "h3",
- "h3-quinn",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "learnon-config",
- "mlua",
- "native-tls",
- "quinn",
- "rcgen",
- "regex",
- "ring",
- "rustls",
- "rustls-pemfile",
- "socket2",
- "thiserror",
- "tokio",
- "tokio-native-tls",
- "tokio-rustls",
- "tower-service",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -847,6 +807,46 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "onrouter-config"
+version = "0.3.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "onrouter-server"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "crossbeam-channel",
+ "flate2",
+ "futures-util",
+ "h3",
+ "h3-quinn",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "mlua",
+ "native-tls",
+ "onrouter-config",
+ "quinn",
+ "rcgen",
+ "regex",
+ "ring",
+ "rustls",
+ "rustls-pemfile",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-rustls",
+ "tower-service",
+]
 
 [[package]]
 name = "openssl"

@@ -33,8 +33,8 @@ class B(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',9001),B).serve_forever()
 """])
-    exe = os.path.join(RUST, "target", "release", "learnon.exe")
-    gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "learnon.conf")],
+    exe = os.path.join(RUST, "target", "release", "onrouter.exe")
+    gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "onrouter.conf")],
                           cwd=RUST, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     ok = True
     try:

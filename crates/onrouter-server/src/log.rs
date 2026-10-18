@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use learnon_config::Config;
+use onrouter_config::Config;
 
 use crate::resolve_path;
 
@@ -103,7 +103,7 @@ impl FileWriter {
         }
         // 滚动：先拿到占位句柄，把当前句柄彻底关掉，才能改名（Windows 上打开中的文件无法 rename）
         let Some(null) = empty_writer() else {
-            let _ = writeln!(std::io::stderr(), "[learnon] 无法滚动日志，继续写入原文件");
+            let _ = writeln!(std::io::stderr(), "[onrouter] 无法滚动日志，继续写入原文件");
             return;
         };
         let _ = self.file.flush();
@@ -134,7 +134,7 @@ fn empty_writer() -> Option<BufWriter<std::fs::File>> {
     OpenOptions::new()
         .create(true)
         .append(true)
-        .open(std::env::temp_dir().join("learnon-log-placeholder.tmp"))
+        .open(std::env::temp_dir().join("onrouter-log-placeholder.tmp"))
         .ok()
         .map(BufWriter::new)
 }
@@ -146,7 +146,7 @@ fn open_append(p: &Path) -> Option<BufWriter<std::fs::File>> {
     match OpenOptions::new().create(true).append(true).open(p) {
         Ok(f) => Some(BufWriter::new(f)),
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "[learnon] error_log 打开失败 {}: {e}", p.display());
+            let _ = writeln!(std::io::stderr(), "[onrouter] error_log 打开失败 {}: {e}", p.display());
             None
         }
     }
@@ -193,7 +193,7 @@ pub fn init(config: &Config, base_dir: &PathBuf) -> Arc<ErrorLog> {
         let mut writer = FileWriter::open(&file_path, max_size, keep);
         let d2 = Arc::clone(&dropped);
         worker = std::thread::Builder::new()
-            .name("learnon-error-log".into())
+            .name("onrouter-error-log".into())
             .spawn(move || {
                 let mut reported = 0u64;
                 loop {
@@ -210,7 +210,7 @@ pub fn init(config: &Config, base_dir: &PathBuf) -> Arc<ErrorLog> {
                         reported = d;
                         let _ = writeln!(
                             std::io::stderr(),
-                            "[learnon] error_log 队列已满，累计丢弃 {d} 条"
+                            "[onrouter] error_log 队列已满，累计丢弃 {d} 条"
                         );
                     }
                     let mut shutdown = false;
@@ -311,13 +311,13 @@ impl ErrorLog {
                 {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                     if l >= Level::Warn {
-                        let _ = writeln!(std::io::stderr(), "[learnon/{}] {m}", l.as_str());
+                        let _ = writeln!(std::io::stderr(), "[onrouter/{}] {m}", l.as_str());
                     }
                 }
             }
             None => {
                 if level >= Level::Warn {
-                    let _ = writeln!(std::io::stderr(), "[learnon/{}] {msg}", level.as_str());
+                    let _ = writeln!(std::io::stderr(), "[onrouter/{}] {msg}", level.as_str());
                 }
             }
         }
@@ -329,7 +329,7 @@ pub fn with_log(level: Level, msg: String) {
         Some(log) => log.log(level, msg),
         None => {
             if level >= Level::Warn {
-                let _ = writeln!(std::io::stderr(), "[learnon/{}] {msg}", level.as_str());
+                let _ = writeln!(std::io::stderr(), "[onrouter/{}] {msg}", level.as_str());
             }
         }
     }

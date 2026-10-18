@@ -2,7 +2,7 @@
 # cosocket 扩展 API E2E —— 用真实 TCP 后端证明 receiveany / receiveuntil / shutdown /
 # setsize / setkeepalive（进程级连接池跨请求复用）全部工作。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/sock_ext_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/sock_ext_e2e.py
 import itertools
 import os
 import re
@@ -17,7 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONF = os.path.join(ROOT, "conf", "sock_ext.conf")
 
-LON_HOST, LON_PORT = "127.0.0.1", 18133
+ORR_HOST, ORR_PORT = "127.0.0.1", 18133
 KA_PORT, SHUT_PORT, ANY_PORT, UNTIL_PORT = 18134, 18135, 18136, 18137
 
 results = []
@@ -106,18 +106,18 @@ def start(handler, port):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def wait_ready(timeout=25):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            s = socket.create_connection((LON_HOST, LON_PORT), timeout=1)
+            s = socket.create_connection((ORR_HOST, ORR_PORT), timeout=1)
             s.close()
             return True
         except OSError:
@@ -126,7 +126,7 @@ def wait_ready(timeout=25):
 
 
 def http_get(path, timeout=15):
-    s = socket.create_connection((LON_HOST, LON_PORT), timeout=timeout)
+    s = socket.create_connection((ORR_HOST, ORR_PORT), timeout=timeout)
     s.sendall(f"GET {path} HTTP/1.1\r\nHost: sockext.local\r\nConnection: close\r\n\r\n".encode())
     buf = b""
     while True:
@@ -157,7 +157,7 @@ def main():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         if not wait_ready():
-            raise SystemExit("!! learnon never became ready on %d" % LON_PORT)
+            raise SystemExit("!! onrouter never became ready on %d" % ORR_PORT)
 
         # === setkeepalive 连接池跨请求复用 ===
         st1, b1 = http_get("/ka")

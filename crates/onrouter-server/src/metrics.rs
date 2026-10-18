@@ -17,7 +17,7 @@ pub struct Metrics {
     pub(crate) http_3xx: AtomicU64,
     pub(crate) http_4xx: AtomicU64,
     pub(crate) http_5xx: AtomicU64,
-    /// worker_connections 上限（渲染 learnon_connections_capacity）
+    /// worker_connections 上限（渲染 onrouter_connections_capacity）
     pub(crate) capacity: AtomicU64,
     start: OnceLock<Instant>,
 }
@@ -74,30 +74,30 @@ impl Metrics {
         let uptime = self.start.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
         let cap = g(&self.capacity);
         let mut s = String::with_capacity(1024);
-        s.push_str("# HELP learnon_uptime_seconds Process uptime in seconds.\n");
-        s.push_str("# TYPE learnon_uptime_seconds counter\n");
-        s.push_str(&format!("learnon_uptime_seconds {uptime}\n"));
-        s.push_str("# HELP learnon_connections_accepted Total accepted TCP connections.\n");
-        s.push_str("# TYPE learnon_connections_accepted counter\n");
-        s.push_str(&format!("learnon_connections_accepted {}\n", g(&self.accepted)));
-        s.push_str("# HELP learnon_connections_active Current open connections (gauge).\n");
-        s.push_str("# TYPE learnon_connections_active gauge\n");
-        s.push_str(&format!("learnon_connections_active {}\n", g(&self.active)));
-        s.push_str("# HELP learnon_connections_capacity worker_connections limit.\n");
-        s.push_str("# TYPE learnon_connections_capacity gauge\n");
-        s.push_str(&format!("learnon_connections_capacity {cap}\n"));
-        s.push_str("# HELP learnon_http_requests_total Total HTTP requests handled.\n");
-        s.push_str("# TYPE learnon_http_requests_total counter\n");
-        s.push_str(&format!("learnon_http_requests_total {}\n", g(&self.handled)));
-        s.push_str("# HELP learnon_http_responses_total Response count by status class.\n");
-        s.push_str("# TYPE learnon_http_responses_total counter\n");
+        s.push_str("# HELP onrouter_uptime_seconds Process uptime in seconds.\n");
+        s.push_str("# TYPE onrouter_uptime_seconds counter\n");
+        s.push_str(&format!("onrouter_uptime_seconds {uptime}\n"));
+        s.push_str("# HELP onrouter_connections_accepted Total accepted TCP connections.\n");
+        s.push_str("# TYPE onrouter_connections_accepted counter\n");
+        s.push_str(&format!("onrouter_connections_accepted {}\n", g(&self.accepted)));
+        s.push_str("# HELP onrouter_connections_active Current open connections (gauge).\n");
+        s.push_str("# TYPE onrouter_connections_active gauge\n");
+        s.push_str(&format!("onrouter_connections_active {}\n", g(&self.active)));
+        s.push_str("# HELP onrouter_connections_capacity worker_connections limit.\n");
+        s.push_str("# TYPE onrouter_connections_capacity gauge\n");
+        s.push_str(&format!("onrouter_connections_capacity {cap}\n"));
+        s.push_str("# HELP onrouter_http_requests_total Total HTTP requests handled.\n");
+        s.push_str("# TYPE onrouter_http_requests_total counter\n");
+        s.push_str(&format!("onrouter_http_requests_total {}\n", g(&self.handled)));
+        s.push_str("# HELP onrouter_http_responses_total Response count by status class.\n");
+        s.push_str("# TYPE onrouter_http_responses_total counter\n");
         for (class, cell) in [
             ("2xx", &self.http_2xx),
             ("3xx", &self.http_3xx),
             ("4xx", &self.http_4xx),
             ("5xx", &self.http_5xx),
         ] {
-            s.push_str(&format!("learnon_http_responses_total{{class=\"{class}\"}} {}\n", g(cell)));
+            s.push_str(&format!("onrouter_http_responses_total{{class=\"{class}\"}} {}\n", g(cell)));
         }
         s
     }
@@ -148,9 +148,9 @@ mod tests {
         m.record_status(200);
         let text = m.render();
         for needle in [
-            "learnon_connections_accepted 1",
-            "learnon_http_requests_total 1",
-            "learnon_connections_capacity 1024",
+            "onrouter_connections_accepted 1",
+            "onrouter_http_requests_total 1",
+            "onrouter_connections_capacity 1024",
             "class=\"2xx\"",
         ] {
             assert!(text.contains(needle), "missing {needle} in:\n{text}");

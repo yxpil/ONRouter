@@ -3,7 +3,7 @@
 # 计数随流量单调增长（做前后差值，避开全局单例的绝对值）、活跃连接 gauge 在途时 >=1、
 # capacity 取 worker_connections 默认值 10240。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/metrics_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/metrics_e2e.py
 import os
 import re
 import subprocess
@@ -28,11 +28,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def get(path, timeout=8):
@@ -71,24 +71,24 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18113 被占用？看 conf/logs/metrics_err.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18113 被占用？看 conf/logs/metrics_err.log）")
 
         # 快照 1（这次 /metrics 请求本身也会计数，所以后面用差值）
         st, text1 = get("/metrics")
         check("/metrics 返回 200", st == 200, f"st={st}")
         m1 = parse_prom(text1)
-        for fam in ["learnon_uptime_seconds", "learnon_connections_accepted",
-                    "learnon_connections_active", "learnon_connections_capacity",
-                    "learnon_http_requests_total"]:
+        for fam in ["onrouter_uptime_seconds", "onrouter_connections_accepted",
+                    "onrouter_connections_active", "onrouter_connections_capacity",
+                    "onrouter_http_requests_total"]:
             check(f"渲染含 {fam}", fam in m1, f"文本={text1!r}")
         for cls in ["2xx", "3xx", "4xx", "5xx"]:
-            check(f"渲染含 learnon_http_responses_total{{class=\"{cls}\"}}",
-                  f'learnon_http_responses_total{{class="{cls}"}}' in m1, f"parsed={m1}")
+            check(f"渲染含 onrouter_http_responses_total{{class=\"{cls}\"}}",
+                  f'onrouter_http_responses_total{{class="{cls}"}}' in m1, f"parsed={m1}")
 
         # capacity 应等于 worker_connections 默认值 10240
         check("capacity = worker_connections 默认 10240",
-              m1.get("learnon_connections_capacity") == 10240,
-              f"got={m1.get('learnon_connections_capacity')}")
+              m1.get("onrouter_connections_capacity") == 10240,
+              f"got={m1.get('onrouter_connections_capacity')}")
 
         # === 真实流量：5 个 200 + 3 个 404 ===
         N_HEALTH, N_404 = 5, 3
@@ -100,9 +100,9 @@ def main():
         # 快照 2
         st, text2 = get("/metrics")
         m2 = parse_prom(text2)
-        d_req = m2["learnon_http_requests_total"] - m1["learnon_http_requests_total"]
-        d_2xx = m2['learnon_http_responses_total{class="2xx"}'] - m1['learnon_http_responses_total{class="2xx"}']
-        d_4xx = m2['learnon_http_responses_total{class="4xx"}'] - m1['learnon_http_responses_total{class="4xx"}']
+        d_req = m2["onrouter_http_requests_total"] - m1["onrouter_http_requests_total"]
+        d_2xx = m2['onrouter_http_responses_total{class="2xx"}'] - m1['onrouter_http_responses_total{class="2xx"}']
+        d_4xx = m2['onrouter_http_responses_total{class="4xx"}'] - m1['onrouter_http_responses_total{class="4xx"}']
 
         # 两次快照之间至少发生了 N_HEALTH+N_404 个请求（快照 2 自身的 /metrics 也计入 requests_total/2xx）
         check("requests_total 随流量增长（>= 20 个业务请求）",
@@ -110,11 +110,11 @@ def main():
         check("2xx 计数随 /health 流量增长", d_2xx >= N_HEALTH, f"delta={d_2xx}")
         check("4xx 计数随 /notfound 流量增长", d_4xx >= N_404, f"delta={d_4xx}")
         check("active gauge 在途请求时 >= 1",
-              m2["learnon_connections_active"] >= 1,
-              f"active={m2['learnon_connections_active']}")
+              m2["onrouter_connections_active"] >= 1,
+              f"active={m2['onrouter_connections_active']}")
         check("accepted >= active",
-              m2["learnon_connections_accepted"] >= m2["learnon_connections_active"],
-              f"accepted={m2['learnon_connections_accepted']} active={m2['learnon_connections_active']}")
+              m2["onrouter_connections_accepted"] >= m2["onrouter_connections_active"],
+              f"accepted={m2['onrouter_connections_accepted']} active={m2['onrouter_connections_active']}")
 
         # Content-Type 校验（单独一次连接拿头）
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

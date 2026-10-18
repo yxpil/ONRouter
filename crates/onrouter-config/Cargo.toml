@@ -1,6 +1,6 @@
 [package]
-name = "learnon-config"
-description = "Nginx-style configuration lexer/parser for LearnON"
+name = "onrouter-config"
+description = "Nginx-style configuration lexer/parser for ONRouter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

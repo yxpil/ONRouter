@@ -9,7 +9,7 @@
 //! * `proxy_pass <upstream-name> | <host:port>;` —— 转发目标，可命名 upstream（复用 L7 的
 //!   负载均衡/健康检查池）或直接给地址。
 //! * `ssl_preread on|off;` —— 是否窥探 SNI。off 时直接连到 `proxy_pass` 默认目标。
-//! * `sni_match <name> <target>;`（可重复，LearnON 扩展的显式 SNI 路由）—— name 为精确主机名
+//! * `sni_match <name> <target>;`（可重复，ONRouter 扩展的显式 SNI 路由）—— name 为精确主机名
 //!   或 `*.example.com` 通配（只匹配一级标签）；命中则路由到 target，未命中回落 `proxy_pass`。
 //! * 窥探是 best-effort：不是 TLS / 读不完整 / 没有 SNI 时，仍按默认目标接线，并把已经读到的
 //!   字节原样补给后端（字节透明，绝不吃掉握手数据）。

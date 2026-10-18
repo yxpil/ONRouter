@@ -2,7 +2,7 @@
 # cosocket TLS E2E —— 用真实 TLS echo 后端证明 sock:tlshandshake 能把明文 TCP cosocket
 # 升级为 rustls 客户端 TLS 流，并在其上正常 send/receive/receiveany。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/sock_tls_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/sock_tls_e2e.py
 import os
 import socket
 import ssl
@@ -15,7 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONF = os.path.join(ROOT, "conf", "sock_tls.conf")
 
-LON_HOST, LON_PORT = "127.0.0.1", 18141
+ORR_HOST, ORR_PORT = "127.0.0.1", 18141
 TLS_PORT = 18142
 # 复用 https_backend 套件已生成的 localhost 证书；没有就现场自签一张（verify off，自签即可）。
 CERT_DIR = os.path.join(ROOT, "certs_https")
@@ -89,18 +89,18 @@ def start_tls_echo(port):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def wait_ready(timeout=25):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            s = socket.create_connection((LON_HOST, LON_PORT), timeout=1)
+            s = socket.create_connection((ORR_HOST, ORR_PORT), timeout=1)
             s.close()
             return True
         except OSError:
@@ -109,7 +109,7 @@ def wait_ready(timeout=25):
 
 
 def http_get(path, timeout=20):
-    s = socket.create_connection((LON_HOST, LON_PORT), timeout=timeout)
+    s = socket.create_connection((ORR_HOST, ORR_PORT), timeout=timeout)
     s.sendall(f"GET {path} HTTP/1.1\r\nHost: socktls.local\r\nConnection: close\r\n\r\n".encode())
     buf = b""
     while True:
@@ -131,7 +131,7 @@ def main():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         if not wait_ready():
-            raise SystemExit("!! learnon never became ready on %d" % LON_PORT)
+            raise SystemExit("!! onrouter never became ready on %d" % ORR_PORT)
 
         # 1) 握手 + 在 TLS 流上 receive(*l)
         st, body = http_get("/tls")

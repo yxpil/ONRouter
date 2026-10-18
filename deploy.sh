@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# LearnON Gateway Deployment Script
+# ONRouter Gateway Deployment Script
 # Supports: Docker, Docker Compose, Kubernetes
 
 COLOR_GREEN='\033[0;32m'
@@ -10,7 +10,7 @@ COLOR_RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 VERSION="0.2.0"
-IMAGE_NAME="yxpil/learnon"
+IMAGE_NAME="yxpil/onrouter"
 
 usage() {
     echo "Usage: $0 [command] [options]"
@@ -43,7 +43,7 @@ log_error() {
 }
 
 build_image() {
-    log_info "Building LearnON Docker image v$VERSION..."
+    log_info "Building ONRouter Docker image v$VERSION..."
     docker build -t ${IMAGE_NAME}:${VERSION} .
     docker tag ${IMAGE_NAME}:${VERSION} ${IMAGE_NAME}:latest
     log_success "Image built successfully: ${IMAGE_NAME}:${VERSION}"
@@ -63,9 +63,9 @@ deploy_compose() {
     mkdir -p conf certs
     
     # Check if config exists
-    if [ ! -f conf/learnon.conf ]; then
+    if [ ! -f conf/onrouter.conf ]; then
         log_info "Creating default configuration..."
-        cat > conf/learnon.conf << 'EOF'
+        cat > conf/onrouter.conf << 'EOF'
 worker_connections 10240;
 
 events {
@@ -90,7 +90,7 @@ http {
         server_name localhost;
         
         location / {
-            return 200 'LearnON Gateway is running!';
+            return 200 'ONRouter Gateway is running!';
             add_header Content-Type text/plain;
         }
         
@@ -101,7 +101,7 @@ http {
     }
 }
 EOF
-        log_success "Default configuration created at conf/learnon.conf"
+        log_success "Default configuration created at conf/onrouter.conf"
     fi
     
     docker-compose up -d
@@ -120,7 +120,7 @@ deploy_kubernetes() {
     log_success "Kubernetes deployment applied"
     
     log_info "Waiting for pods to be ready..."
-    kubectl wait --for=condition=ready pod -l app=learnon --timeout=120s
+    kubectl wait --for=condition=ready pod -l app=onrouter --timeout=120s
     log_success "All pods are ready"
 }
 
@@ -135,11 +135,11 @@ stop_deployment() {
 }
 
 view_logs() {
-    docker-compose logs -f learnon
+    docker-compose logs -f onrouter
 }
 
 check_status() {
-    echo "=== LearnON Gateway Status ==="
+    echo "=== ONRouter Gateway Status ==="
     echo ""
     
     if docker-compose ps &> /dev/null; then
@@ -150,12 +150,12 @@ check_status() {
     
     if command -v kubectl &> /dev/null; then
         echo "Kubernetes Pods:"
-        kubectl get pods -l app=learnon 2>/dev/null || echo "No Kubernetes deployment found"
+        kubectl get pods -l app=onrouter 2>/dev/null || echo "No Kubernetes deployment found"
         echo ""
     fi
     
     echo "Local Processes:"
-    ps aux | grep learnon | grep -v grep || echo "No local processes running"
+    ps aux | grep onrouter | grep -v grep || echo "No local processes running"
 }
 
 # Parse arguments

@@ -23,7 +23,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use learnon_config::{Config, Directive};
+use onrouter_config::{Config, Directive};
 
 const SHARDS: usize = 32;
 /// 单片最多跟踪多少 key

@@ -7,7 +7,7 @@
 #   * 同一明文端口上 HTTP/1.1 → 仍是 1.1（前导未命中即回落 h1，共存）
 #   * 单连接多路复用：并发多流都拿到 200
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/http2_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/http2_e2e.py
 import os
 import shutil
 import subprocess
@@ -32,11 +32,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 CURL = shutil.which("curl") or "curl"
@@ -106,7 +106,7 @@ def main():
                 break
             time.sleep(0.2)
         if not ready:
-            raise SystemExit("!! learnon 未就绪（端口 18124/18125 被占用？看 logs/http2_out.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18124/18125 被占用？看 logs/http2_out.log）")
 
         # 1) 明文 h2c prior-knowledge（Node 客户端只在服务端确实协商 h2 时才拿到 200）
         kv = node_probe(f"http://127.0.0.1:{H2C_PORT}/", "single")

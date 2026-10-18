@@ -59,8 +59,8 @@ def bench(path, n, threads=1):
 
 def main():
     backends = [start_backend(p) for p in (9001, 9002)]
-    exe = os.path.join(RUST, "target", "release", "learnon.exe")
-    gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "learnon.conf")],
+    exe = os.path.join(RUST, "target", "release", "onrouter.exe")
+    gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "onrouter.conf")],
                           cwd=RUST, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     try:
         for p in (9001, 9002):

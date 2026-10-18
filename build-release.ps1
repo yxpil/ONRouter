@@ -1,4 +1,4 @@
-# LearnON Cross-Platform Build Script for Windows PowerShell
+# ONRouter Cross-Platform Build Script for Windows PowerShell
 # Supports: Windows (x86_64, ARM64), cross-compilation info
 
 $ErrorActionPreference = "Stop"
@@ -54,12 +54,12 @@ function Build-Target {
     New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
     
     # Build binaries
-    cargo build --release --target $Target --bin learnon
-    cargo build --release --target $Target --bin lon-gencert
+    cargo build --release --target $Target --bin onrouter
+    cargo build --release --target $Target --bin orr-gencert
     
     # Copy binaries
-    Copy-Item "target\$Target\release\learnon.exe" "$OutputDir\" -ErrorAction SilentlyContinue
-    Copy-Item "target\$Target\release\lon-gencert.exe" "$OutputDir\" -ErrorAction SilentlyContinue
+    Copy-Item "target\$Target\release\onrouter.exe" "$OutputDir\" -ErrorAction SilentlyContinue
+    Copy-Item "target\$Target\release\orr-gencert.exe" "$OutputDir\" -ErrorAction SilentlyContinue
     
     Write-Success "Built for $Target"
 }
@@ -68,7 +68,7 @@ function Create-Archive {
     param([string]$Target)
     
     $OutputDir = "$BUILD_DIR\$Target"
-    $ArchiveName = "learnon-$VERSION-$Target"
+    $ArchiveName = "onrouter-$VERSION-$Target"
     
     Write-Info "Creating archive for $Target..."
     
@@ -101,7 +101,7 @@ function Generate-Checksums {
 
 function Show-Matrix {
     Write-Host ""
-    Write-Host "=== LearnON Build Matrix ===" -ForegroundColor Cyan
+    Write-Host "=== ONRouter Build Matrix ===" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Operating Systems:"
     Write-Host "  ✓ Linux (x86_64, aarch64, armv7, riscv64)"

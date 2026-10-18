@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LearnON 场景模拟测试（本地签名证书，全 HTTPS 9443）
+"""ONRouter 场景模拟测试（本地签名证书，全 HTTPS 9443）
 
 场景：
   S1  静态官网（site1.local）：首页 / about / 自定义 404 / 301 跳转
@@ -90,7 +90,7 @@ HTTPServer(("{HOST}", {port}), B).serve_forever()
 def main():
     b1 = start_backend(9101, "api-node-1")
     b2 = start_backend(9102, "api-node-2")
-    exe = os.path.join(RUST, "target", "release", "learnon.exe")
+    exe = os.path.join(RUST, "target", "release", "onrouter.exe")
     gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "scenario.conf")],
                           cwd=RUST, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
@@ -113,7 +113,7 @@ def main():
         check("S1 自定义 404 页", st == 404 and "custom-404" in b.decode(), f"{st} {b[:80]}")
         st, h, b = req("/promo")
         check("S1 301 跳转", st == 301 and "/promo-2026" in h.get("location", ""), f"{st} {h.get('location')}")
-        check("S1 Server 头", h.get("server", "").startswith("LearnON/"), h.get("server"))
+        check("S1 Server 头", h.get("server", "").startswith("ONRouter/"), h.get("server"))
 
         # ===== S2 API 反代 =====
         st, h, b = req("/api/users", host="api.local")

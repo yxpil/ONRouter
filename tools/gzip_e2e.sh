@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# gzip response-compression E2E: drives a live LearnON with real HTTP and asserts
+# gzip response-compression E2E: drives a live ONRouter with real HTTP and asserts
 # both compression (Content-Encoding, gzip magic, size drop, byte-exact round-trip)
 # and every pass-through gate (no AE, HEAD, <gzip_min_length, non-eligible type,
 # Accept-Encoding q=0, non-2xx).
 #
 # Build the debug binary first, then run from anywhere:
-#   cargo build -p learnon-server --bin learnon && bash tools/gzip_e2e.sh
+#   cargo build -p onrouter-server --bin onrouter && bash tools/gzip_e2e.sh
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
-if [ -x ./target/debug/learnon.exe ]; then BIN=./target/debug/learnon.exe; else BIN=./target/debug/learnon; fi
-if [ ! -x "$BIN" ]; then echo "!! $BIN not found; run: cargo build -p learnon-server --bin learnon"; exit 2; fi
+if [ -x ./target/debug/onrouter.exe ]; then BIN=./target/debug/onrouter.exe; else BIN=./target/debug/onrouter; fi
+if [ ! -x "$BIN" ]; then echo "!! $BIN not found; run: cargo build -p onrouter-server --bin onrouter"; exit 2; fi
 
 CONF=conf/gzip_test.conf
 PORT=18097
 BASE="http://127.0.0.1:${PORT}"
-OUT=$(mktemp -d); trap 'rm -rf "$OUT"; kill "$LON" 2>/dev/null' EXIT
+OUT=$(mktemp -d); trap 'rm -rf "$OUT"; kill "$ORR" 2>/dev/null' EXIT
 mkdir -p logs
 
 pass=0; fail=0
@@ -25,15 +25,15 @@ sha()        { sha256sum "$1" | cut -d' ' -f1; }
 has_gzip()   { grep -i -q '^content-encoding:[[:space:]]*gzip' "$1"; }
 gzip_magic() { od -An -tx1 -N2 "$1" | tr -d ' \n' | grep -q 1f8b; }
 
-echo "== starting LearnON =="
-"$BIN" -c "$CONF" >"$OUT/learnon.log" 2>&1 &
-LON=$!
+echo "== starting ONRouter =="
+"$BIN" -c "$CONF" >"$OUT/onrouter.log" 2>&1 &
+ORR=$!
 ready=0
 for _ in $(seq 1 30); do
   curl -s -o /dev/null --max-time 1 "${BASE}/big.html" && { ready=1; break; }
   sleep 0.2
 done
-[ "$ready" = 1 ] || { echo "!! server not ready:"; cat "$OUT/learnon.log"; exit 3; }
+[ "$ready" = 1 ] || { echo "!! server not ready:"; cat "$OUT/onrouter.log"; exit 3; }
 
 echo "[1] text/html + Accept-Encoding: gzip"
 curl -s -D "$OUT/h1" -H 'Accept-Encoding: gzip' -o "$OUT/b1" "${BASE}/big.html"
@@ -78,6 +78,6 @@ echo "[8] non-2xx (404) never compresses"
 curl -s -D "$OUT/h9" -H 'Accept-Encoding: gzip' -o /dev/null "${BASE}/missing.html"
 head -1 "$OUT/h9" | grep -q ' 404' && ok "got 404" || bad "expected 404"
 
-kill "$LON" 2>/dev/null; wait "$LON" 2>/dev/null
+kill "$ORR" 2>/dev/null; wait "$ORR" 2>/dev/null
 echo; echo "================ gzip E2E: PASS=${pass} FAIL=${fail} ================"
 [ "$fail" = 0 ] && echo "ALL GREEN" || { echo "SOME FAILED"; exit 1; }

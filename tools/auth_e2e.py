@@ -5,7 +5,7 @@
 #   * /allow_localhost 本机连接命中 allow → 200；/deny_all → 403
 #   * auth_basic off 显式关闭 → 200
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/auth_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/auth_e2e.py
 import base64
 import os
 import subprocess
@@ -30,11 +30,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def basic(user, pw):
@@ -69,7 +69,7 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18114 被占用？看 conf/logs/auth_err.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18114 被占用？看 conf/logs/auth_err.log）")
 
         # ---- 对照组 ----
         st, body, _ = get("/open")

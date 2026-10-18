@@ -2,7 +2,7 @@
 # ngx.socket.udp E2E —— 用真实 UDP 后端证明数据报 setpeername/send/receive 往返、
 # 同一 socket 连续收发、以及无应答时的超时/拒收（nil + err）。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/sock_udp_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/sock_udp_e2e.py
 import os
 import socket
 import subprocess
@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONF = os.path.join(ROOT, "conf", "sock_udp.conf")
 
-LON_HOST, LON_PORT = "127.0.0.1", 18138
+ORR_HOST, ORR_PORT = "127.0.0.1", 18138
 ECHO_PORT, DEAD_PORT = 18139, 18140
 
 results = []
@@ -51,18 +51,18 @@ def start_udp_echo(port):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def wait_ready(timeout=25):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            s = socket.create_connection((LON_HOST, LON_PORT), timeout=1)
+            s = socket.create_connection((ORR_HOST, ORR_PORT), timeout=1)
             s.close()
             return True
         except OSError:
@@ -71,7 +71,7 @@ def wait_ready(timeout=25):
 
 
 def http_get(path, timeout=15):
-    s = socket.create_connection((LON_HOST, LON_PORT), timeout=timeout)
+    s = socket.create_connection((ORR_HOST, ORR_PORT), timeout=timeout)
     s.sendall(f"GET {path} HTTP/1.1\r\nHost: sockudp.local\r\nConnection: close\r\n\r\n".encode())
     buf = b""
     while True:
@@ -92,7 +92,7 @@ def main():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         if not wait_ready():
-            raise SystemExit("!! learnon never became ready on %d" % LON_PORT)
+            raise SystemExit("!! onrouter never became ready on %d" % ORR_PORT)
 
         # 1) 单数据报往返
         st, body = http_get("/udp")

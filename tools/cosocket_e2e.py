@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# LearnON cosocket (ngx.socket.tcp) E2E —— 真实 TCP 后端往返 + 让出并发证明。
+# ONRouter cosocket (ngx.socket.tcp) E2E —— 真实 TCP 后端往返 + 让出并发证明。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/cosocket_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/cosocket_e2e.py
 import os
 import socket
 import socketserver
@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONF = os.path.join(ROOT, "conf", "lua_cosocket.conf")
 
-LON_HOST, LON_PORT = "127.0.0.1", 18108
+ORR_HOST, ORR_PORT = "127.0.0.1", 18108
 ECHO_PORT, BLACKHOLE_PORT = 18120, 18121
 ECHO_DELAY = 0.30
 
@@ -64,18 +64,18 @@ def start_tcp(handler, port):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def wait_ready(timeout=25):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            s = socket.create_connection((LON_HOST, LON_PORT), timeout=1)
+            s = socket.create_connection((ORR_HOST, ORR_PORT), timeout=1)
             s.close()
             return True
         except OSError:
@@ -84,7 +84,7 @@ def wait_ready(timeout=25):
 
 
 def http_get(path, timeout=15):
-    s = socket.create_connection((LON_HOST, LON_PORT), timeout=timeout)
+    s = socket.create_connection((ORR_HOST, ORR_PORT), timeout=timeout)
     s.sendall(f"GET {path} HTTP/1.1\r\nHost: cosocket.local\r\nConnection: close\r\n\r\n".encode())
     buf = b""
     while True:
@@ -131,7 +131,7 @@ def main():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         if not wait_ready():
-            raise SystemExit("!! learnon never became ready on %d" % LON_PORT)
+            raise SystemExit("!! onrouter never became ready on %d" % ORR_PORT)
 
         # 1) 往返：connect+send+receive(*l)
         #    注意 ngx.say 用空格连接各参数，断言前去掉空格再比。

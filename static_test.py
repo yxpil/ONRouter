@@ -49,7 +49,7 @@ def http(method, path, headers=None):
 
 
 def main():
-    exe = "learnon.exe" if os.name == "nt" else "learnon"
+    exe = "onrouter.exe" if os.name == "nt" else "onrouter"
     binary = os.path.join(ROOT, "target", "debug", exe)
     if not os.path.exists(binary):
         binary = os.path.join(ROOT, "target", "release", exe)

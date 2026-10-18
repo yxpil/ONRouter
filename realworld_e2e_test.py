@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LearnON 真实工作场景全量模拟（一个社区站的一天）
+"""ONRouter 真实工作场景全量模拟（一个社区站的一天）
 
 S1  静态官网：首页 200 + ETag/304 协商缓存 + Range/206 断点续传 + 自定义 404 + 301 迁移
 S2  API 网关：GET/POST JSON 反代、轮询负载均衡、XFF/X-Real-IP 注入
@@ -31,7 +31,7 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 GW_PORT = 9600
-BIN = os.path.join(ROOT, "target", "debug", "learnon.exe")
+BIN = os.path.join(ROOT, "target", "debug", "onrouter.exe")
 results = []
 
 def check(name, ok, detail=""):

@@ -5,7 +5,7 @@
 #   * 18129 ssl_protocols TLSv1.3 → 1.3 客户端拿到 only-1.3；1.2 客户端握手失败
 #   * 18130 默认               → 1.2 与 1.3 都能协商到 both
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/tls_protocols_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/tls_protocols_e2e.py
 import os
 import socket
 import ssl
@@ -32,16 +32,16 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def kill_orphans():
     try:
-        subprocess.run(["taskkill", "/F", "/IM", "learnon.exe"],
+        subprocess.run(["taskkill", "/F", "/IM", "onrouter.exe"],
                        capture_output=True, text=True)
     except Exception:
         pass
@@ -103,7 +103,7 @@ def main():
                 break
             time.sleep(0.2)
         if not ready:
-            raise SystemExit("!! learnon 未就绪（端口 18128/18129/18130 被占用？看 logs/tls_protocols_out.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18128/18129/18130 被占用？看 logs/tls_protocols_out.log）")
 
         # 1) 只开 TLS1.2：1.2 成功，1.3 被拒
         r = tls_get(P12, "1.2")

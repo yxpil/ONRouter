@@ -8,9 +8,9 @@
 #     拒绝 ECDSA（本机 certs_scenario 是 id-ecPublicKey，故本套件在运行时自签一张
 #     RSA-2048 证书，用完即删，绝不落盘进仓库）。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/tls_legacy_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/tls_legacy_e2e.py
 #
-# 依赖：openssl 客户端（本机 MSYS2 openssl 3.5.7）。设 LEARNON_SKIP_BUILD=1 可复用已构建二进制。
+# 依赖：openssl 客户端（本机 MSYS2 openssl 3.5.7）。设 ONROUTER_SKIP_BUILD=1 可复用已构建二进制。
 import os
 import shutil
 import subprocess
@@ -39,18 +39,18 @@ def run(cmd, **kw):
 
 def build_native(dst):
     r = run(["cargo", "build", "--release", "--features", "native-tls",
-             "-p", "learnon-server", "--bin", "learnon"])
+             "-p", "onrouter-server", "--bin", "onrouter"])
     if r.returncode != 0:
         raise SystemExit("!! native-tls 构建失败：\n" + r.stderr[-2000:])
-    src = os.path.join(ROOT, "target", "release", "learnon.exe")
+    src = os.path.join(ROOT, "target", "release", "onrouter.exe")
     shutil.copy(src, dst)
 
 
 def build_default(dst):
-    r = run(["cargo", "build", "--release", "-p", "learnon-server", "--bin", "learnon"])
+    r = run(["cargo", "build", "--release", "-p", "onrouter-server", "--bin", "onrouter"])
     if r.returncode != 0:
         raise SystemExit("!! 默认构建失败：\n" + r.stderr[-2000:])
-    src = os.path.join(ROOT, "target", "release", "learnon.exe")
+    src = os.path.join(ROOT, "target", "release", "onrouter.exe")
     shutil.copy(src, dst)
 
 
@@ -73,7 +73,7 @@ def write_conf(tmp, pem, key):
     with open(conf, "w", encoding="utf-8") as f:
         f.write(
             'error_log "%s" info;\n' % esc(os.path.join(tmp, "err.log")) +
-            'pid "%s";\n' % esc(os.path.join(tmp, "learnon.pid")) +
+            'pid "%s";\n' % esc(os.path.join(tmp, "onrouter.pid")) +
             "server {\n"
             "    listen 127.0.0.1:%d ssl;\n" % PORT +
             "    server_name legacy.local;\n"
@@ -171,25 +171,25 @@ def main():
         if shutil.which(exe) is None:
             raise SystemExit("!! 需要 %s 在 PATH" % exe)
 
-    tmp = tempfile.mkdtemp(prefix="learnon-legacy-")
+    tmp = tempfile.mkdtemp(prefix="onrouter-legacy-")
     pem, key = gen_rsa_cert(tmp)
     conf = write_conf(tmp, pem, key)
 
-    native_exe = os.path.join(tmp, "learnon-native.exe")
-    default_exe = os.path.join(tmp, "learnon-default.exe")
-    if os.environ.get("LEARNON_SKIP_BUILD") == "1":
+    native_exe = os.path.join(tmp, "onrouter-native.exe")
+    default_exe = os.path.join(tmp, "onrouter-default.exe")
+    if os.environ.get("ONROUTER_SKIP_BUILD") == "1":
         # 复用调用方预先放到 tmp 之外的二进制
-        cand = os.path.join(ROOT, "target", "release", "learnon.exe")
+        cand = os.path.join(ROOT, "target", "release", "onrouter.exe")
         shutil.copy(cand, native_exe)
         shutil.copy(cand, default_exe)
-        print("!! LEARNON_SKIP_BUILD=1：两阶段都用同一二进制，仅当它确为 native 构建时有效")
+        print("!! ONROUTER_SKIP_BUILD=1：两阶段都用同一二进制，仅当它确为 native 构建时有效")
     else:
         build_native(native_exe)
         build_default(default_exe)
 
     try:
         # ========== 阶段 A：native 后端应协商全部 1.0/1.1/1.2/1.3 ==========
-        kill("learnon-native.exe")
+        kill("onrouter-native.exe")
         proc, outlog = start(native_exe, conf, tmp)
         try:
             if not wait_ready():
@@ -211,14 +211,14 @@ def main():
             except subprocess.TimeoutExpired:
                 proc.kill()
             outlog.close()
-            kill("learnon-native.exe")
+            kill("onrouter-native.exe")
 
         # ========== 阶段 B：默认 rustls 应拒绝 1.0/1.1、仍服务 1.2/1.3 ==========
         # 清空 err.log 以便断言本阶段的告警
         ep = os.path.join(tmp, "err.log")
         if os.path.exists(ep):
             os.remove(ep)
-        kill("learnon-default.exe")
+        kill("onrouter-default.exe")
         proc, outlog = start(default_exe, conf, tmp)
         try:
             if not wait_ready():
@@ -239,7 +239,7 @@ def main():
             except subprocess.TimeoutExpired:
                 proc.kill()
             outlog.close()
-            kill("learnon-default.exe")
+            kill("onrouter-default.exe")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)  # 私钥/证书只存在于临时目录，随用随删
 

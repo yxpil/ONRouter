@@ -6,7 +6,7 @@
 #   * 存根对 missing.invalid 回 NXDOMAIN → 解析失败 → 502（对齐 nginx）
 #   * valid=30s TTL 缓存：第二次代理请求不再向 DNS 服务器发查询（脚本侧对 A 查询计数）
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/resolver_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/resolver_e2e.py
 import os
 import socket
 import struct
@@ -43,11 +43,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -151,7 +151,7 @@ def main():
                 pass
             time.sleep(0.2)
         if not ready:
-            raise SystemExit("!! learnon 未就绪（端口 18119 被占用？看 logs/resolver_out.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18119 被占用？看 logs/resolver_out.log）")
 
         with _lock:
             first_round = stats["queries"]

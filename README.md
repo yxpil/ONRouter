@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="public/logo.png" alt="LearnON logo" width="180">
+  <img src="public/logo.png" alt="ONRouter logo" width="180">
 </p>
 
-# LearnON (Rust)
+# ONRouter (Rust)
 
-> **LearnON** (short **LON**) — an OpenResty alternative written from scratch in Rust.
+> **ONRouter** (short **ORR**) — an OpenResty alternative written from scratch in Rust.
 
 A Nginx / OpenResty-style gateway server **implemented from scratch in Rust**: reverse proxy, load
 balancing (with passive health checks), rewrite, virtual hosts, an embedded Lua 5.4 scripting layer
@@ -61,10 +61,10 @@ all gateway logic is hand-written.
 
 ## Feature map
 
-| Nginx / OpenResty | LearnON (Rust) | Location |
+| Nginx / OpenResty | ONRouter (Rust) | Location |
 |---|---|---|
 | master/worker event loop | tokio async runtime + hyper HTTP/1 | `server.rs` |
-| nginx.conf syntax | custom lexer + recursive-descent parser, incl. `include <file \| glob>` (with unit tests) | `crates/learnon-config` |
+| nginx.conf syntax | custom lexer + recursive-descent parser, incl. `include <file \| glob>` (with unit tests) | `crates/onrouter-config` |
 | `upstream` + load balancing | weighted round-robin / `least_conn` / `ip_hash` (with connection tracking) | `upstream.rs` |
 | passive health checks `max_fails` / `fail_timeout` | failure counting + node removal + expiry recovery (falls back to full set when all are down) | `upstream.rs` |
 | `proxy_pass` reverse proxy | hyper connection pool, `proxy_set_header` variable interpolation, prefix replacement | `proxy.rs` |
@@ -100,12 +100,12 @@ all gateway logic is hand-written.
 
 ```
 rust/
-├── conf/learnon.conf        # example gateway config (full-feature demo)
+├── conf/onrouter.conf        # example gateway config (full-feature demo)
 ├── lua/                     # Lua business scripts (auth.lua / time.lua / rewrite_mark.lua)
 ├── public/                  # static file root (includes logo.png)
 └── crates/
-    ├── learnon-config/      # Nginx-style config parser
-    └── learnon-server/      # server main program
+    ├── onrouter-config/      # Nginx-style config parser
+    └── onrouter-server/      # server main program
         └── src/
             ├── main.rs      # startup: config -> router -> upstream -> lua -> listen
             ├── router.rs    # server/location matching (= / prefix / ~ regex), directive model
@@ -124,10 +124,10 @@ rust/
 ```bash
 cd rust
 # Option 1: run directly with cargo (debug)
-cargo run -- conf/learnon.conf
+cargo run -- conf/onrouter.conf
 # Option 2: packaged exe (release)
 cargo build --release
-target\release\learnon.exe conf\learnon.conf
+target\release\onrouter.exe conf\onrouter.conf
 
 # start two demo backends (either way):
 python -m http.server 9001 --bind 127.0.0.1
@@ -138,7 +138,7 @@ python -m http.server 9002 --bind 127.0.0.1
 
 ```bash
 # generate a self-signed cert (SAN: localhost, 127.0.0.1; custom domains also supported)
-cargo run --bin lon-gencert -- certs/cert.pem certs/key.pem your.domain.com
+cargo run --bin orr-gencert -- certs/cert.pem certs/key.pem your.domain.com
 ```
 
 Config:
@@ -399,7 +399,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 - Phase & request introspection: `ngx.get_phase()` (returns the running phase, e.g. `content_by_lua`)
   and `ngx.is_subrequest` (true inside an `ngx.location.capture` subrequest)
 - Workers & config: `ngx.worker.pid() / id() / count()` and `ngx.config.subsystem / prefix() /
-  no_debug` — LearnON is a single-process reactor, so `id()` is always `0` and `count()` is `1`
+  no_debug` — ONRouter is a single-process reactor, so `id()` is always `0` and `count()` is `1`
   (`pid()` is the real OS pid)
 - All of the above are exercised end-to-end against real traffic by `tools/ngx_api_e2e.py` (36 checks).
 
@@ -422,9 +422,9 @@ them as standalone runnable assertion scripts.
   reference. Running a full `.t` directly via Test::Nginx requires a real OpenResty binary as
   `TEST_NGINX_BINARY` plus `*_by_lua_block` syntax and Unix signals, which do not run on this Windows
   host — hence the ported-assertions route.
-- nginx syntax-compat shim: LearnON now accepts nginx's `-p <prefix>`, `-g "<directives>"`, `-e <file>`
+- nginx syntax-compat shim: ONRouter now accepts nginx's `-p <prefix>`, `-g "<directives>"`, `-e <file>`
   flags and writes a pid file, and the config parser flattens the `http{}` wrapper (dropping
-  `events{}`), so the official `nginx-tests` Perl harness (Test::Nginx) can spawn LearnON directly.
+  `events{}`), so the official `nginx-tests` Perl harness (Test::Nginx) can spawn ONRouter directly.
 - Compatibility regression: `compat_test.py` 17/17, security `sec_test.py` 30 checks, plus the
   static / scenario / upstream suites in this directory.
 
@@ -503,9 +503,9 @@ Already done (previously listed as gaps, now implemented):
   connection layer — accepted-count on each TCP accept, an active-connections gauge via an RAII guard
   scoped to each connection task, requests-handled per HTTP request, and responses bucketed by status
   class (2xx/3xx/4xx/5xx) in `finalize`. `content_by_rust metrics` reads the singleton and renders it
-  in the Prometheus text exposition format (`# HELP`/`# TYPE` + `learnon_uptime_seconds`,
-  `learnon_connections_{accepted,active,capacity}`, `learnon_http_requests_total`,
-  `learnon_http_responses_total{class="…"}`). It uses the singleton because the native handler signature
+  in the Prometheus text exposition format (`# HELP`/`# TYPE` + `onrouter_uptime_seconds`,
+  `onrouter_connections_{accepted,active,capacity}`, `onrouter_http_requests_total`,
+  `onrouter_http_responses_total{class="…"}`). It uses the singleton because the native handler signature
   has no access to `AppState`. (`metrics.rs`, `server.rs`, `engine.rs`, verified by
   `tools/metrics_e2e.py`: with traffic interleaved between two scrapes, `requests_total`/`2xx`/`4xx`
   deltas track the real request counts, the active gauge stays ≥1 while a connection is in flight, and
@@ -562,7 +562,7 @@ Already done (previously listed as gaps, now implemented):
   non-caching control location with no `X-Cache-Status`.) Not yet implemented: `proxy_cache_use_stale`,
   revalidation (`If-None-Match` to origin), `proxy_cache_purge`, on-disk `keys_zone`, and `Vary`-aware
   keying.
-- **HTTP/2 serving**: LearnON serves HTTP/2 over both transports. On TLS endpoints the `h2` protocol is
+- **HTTP/2 serving**: ONRouter serves HTTP/2 over both transports. On TLS endpoints the `h2` protocol is
   negotiated through ALPN (`listen … ssl http2`). On cleartext endpoints `http2 on;` turns on
   prior-knowledge h2c: the connection layer peeks the first 24 bytes with `MSG_PEEK` (`TcpStream::peek`,
   non-consuming) and, only if they match the client connection preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`),
@@ -600,7 +600,7 @@ Already done (previously listed as gaps, now implemented):
   endpoint advertises `Alt-Svc: h3=":<port>"; ma=3600` so real clients can discover HTTP/3. Hot-reload
   works for h3 too (shared `RwLock<Arc<Router>>`; the UDP socket is never rebound). WebSocket `Upgrade`
   tunnels remain HTTP/1.1-over-TCP only (h3 has no `Upgrade`).
-  (Verified by `tools/http3_e2e.py` with the in-repo `lon-h3check` probe — quinn+h3, since local curl/Node
+  (Verified by `tools/http3_e2e.py` with the in-repo `orr-h3check` probe — quinn+h3, since local curl/Node
   have no HTTP/3: a real QUIC handshake + h3 GET returns `200` with protocol `HTTP/3` and the configured
   body; a ~15 KB response arrives complete across h3 `DATA` frames; 5 concurrent streams on one QUIC
   connection all reach `200`; and HTTP/1.1 over TLS still works on the same port with an `alt-svc: h3=`

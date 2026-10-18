@@ -32,7 +32,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 use tokio::sync::{mpsc, oneshot};
 
-use learnon_config::Config;
+use onrouter_config::Config;
 
 use crate::engine::RequestCtx;
 use crate::shared_dict::SharedDicts;
@@ -129,7 +129,7 @@ impl LuaSource {
         }
     }
 
-    pub fn from_directive(d: &learnon_config::Directive, base_dir: &PathBuf) -> Option<LuaSource> {
+    pub fn from_directive(d: &onrouter_config::Directive, base_dir: &PathBuf) -> Option<LuaSource> {
         let arg = d.arg(0)?;
         Some(if d.name.ends_with("_file") {
             LuaSource::File(resolve_path(arg, base_dir))
@@ -1490,10 +1490,10 @@ impl LuaEngine {
             }));
         }
         for (name, _) in &inits {
-            println!("[learnon] 已执行 {name}（x{n} VM）");
+            println!("[onrouter] 已执行 {name}（x{n} VM）");
         }
         println!(
-            "[learnon] Lua VM 池就绪：{n} 个实例（每核心一个，VM 内协程并发多条在途请求）"
+            "[onrouter] Lua VM 池就绪：{n} 个实例（每核心一个，VM 内协程并发多条在途请求）"
         );
         Ok(LuaEngine {
             vms,
@@ -1642,7 +1642,7 @@ impl LuaEngine {
         ngx.set("exec", exec)?;
 
         // ngx.sleep(secs) —— 让出当前请求协程，不阻塞 VM（单位与 OpenResty 对齐：秒，可带小数）：
-        // _learnon_sleep_start 用 tokio 定时器计时，把完成事件投回所属 VM 调度器并返回 sleep id；
+        // _onrouter_sleep_start 用 tokio 定时器计时，把完成事件投回所属 VM 调度器并返回 sleep id；
         // Lua 侧随即 coroutine.yield(id) 挂起，调度器收到该 id 的事件后再 resume 本协程。
         {
             let ev_tx = ev_tx.clone();
@@ -1657,7 +1657,7 @@ impl LuaEngine {
                 });
                 Ok(id)
             })?;
-            lua.globals().set("_learnon_sleep_start", sleep_start)?;
+            lua.globals().set("_onrouter_sleep_start", sleep_start)?;
         }
         let sleep_wrapper: LuaFunction = lua
             .load(
@@ -1666,7 +1666,7 @@ impl LuaEngine {
                     if not (coroutine.isyieldable and coroutine.isyieldable()) then
                         error("ngx.sleep must run inside a coroutine (not usable in this context)", 0)
                     end
-                    local id = _learnon_sleep_start(ms)
+                    local id = _onrouter_sleep_start(ms)
                     return coroutine.yield(id)
                 end
                 "#,
@@ -1974,7 +1974,7 @@ impl LuaEngine {
                 let cs = Cosocket::new(ev_tx.clone(), Arc::clone(&op_counter));
                 Ok(lua.create_userdata(cs)?)
             })?;
-            lua.globals().set("_learnon_sock_new", sock_new)?;
+            lua.globals().set("_onrouter_sock_new", sock_new)?;
         }
         {
             let ev_tx = ev_tx.clone();
@@ -1983,7 +1983,7 @@ impl LuaEngine {
                 let us = UdpCosocket::new(ev_tx.clone(), Arc::clone(&op_counter));
                 Ok(lua.create_userdata(us)?)
             })?;
-            lua.globals().set("_learnon_udp_new", udp_new)?;
+            lua.globals().set("_onrouter_udp_new", udp_new)?;
         }
         let cosocket_mod: LuaFunction = lua
             .load(
@@ -2050,7 +2050,7 @@ impl LuaEngine {
                     end
                     function M:getstats() return { bytes_received = 0, bytes_sent = 0 } end
                     socket_tbl.tcp = function()
-                        return setmetatable({ _h = _learnon_sock_new() }, mt)
+                        return setmetatable({ _h = _onrouter_sock_new() }, mt)
                     end
                     local umt = { __index = {} }
                     local U = umt.__index
@@ -2069,7 +2069,7 @@ impl LuaEngine {
                     function U:close() return self._h:_close() end
                     function U:settimeout(ms) return self._h:_settimeout(ms) end
                     socket_tbl.udp = function()
-                        return setmetatable({ _h = _learnon_udp_new() }, umt)
+                        return setmetatable({ _h = _onrouter_udp_new() }, umt)
                     end
                     return true
                 end
@@ -2080,7 +2080,7 @@ impl LuaEngine {
         ngx.set("socket", socket)?;
 
         // ngx.location.capture(uri, opts?) —— 内部子请求（对标 OpenResty）。
-        // Rust 侧只提供「不 yield 的启动原语」_learnon_capture_start：读父 ctx、spawn
+        // Rust 侧只提供「不 yield 的启动原语」_onrouter_capture_start：读父 ctx、spawn
         // 一个跑完整管线的 tokio 任务（经晚绑定的 AppState），把结果作为 SubReq 唤醒值投回
         // 调度器；Lua 侧 coroutine.yield(op_id) 让出（不持 VM 锁），恢复时拿到 {status,body,header} 表。
         {
@@ -2111,7 +2111,7 @@ impl LuaEngine {
                 });
                 Ok(id)
             })?;
-            lua.globals().set("_learnon_capture_start", capture_start)?;
+            lua.globals().set("_onrouter_capture_start", capture_start)?;
         }
         let location_mod: LuaFunction = lua
             .load(
@@ -2120,7 +2120,7 @@ impl LuaEngine {
                     local function capture(uri, opts)
                         local method = "GET"
                         if opts and opts.method then method = tostring(opts.method) end
-                        local res = coroutine.yield(_learnon_capture_start(uri, method))
+                        local res = coroutine.yield(_onrouter_capture_start(uri, method))
                         if res == nil then
                             return { status = 0, body = nil, header = {} }
                         end
@@ -2159,7 +2159,7 @@ impl LuaEngine {
             .eval()?;
         define_body.call::<()>(())?;
 
-        // _learnon_thread_spawn(func, packed_args) -> tid：建子协程 + 登记信箱。
+        // _onrouter_thread_spawn(func, packed_args) -> tid：建子协程 + 登记信箱。
         {
             let ctl = Arc::clone(sched_ctl);
             let counter = Arc::clone(co_counter);
@@ -2187,9 +2187,9 @@ impl LuaEngine {
                 });
                 Ok(tid as i64)
             })?;
-            lua.globals().set("_learnon_thread_spawn", spawn)?;
+            lua.globals().set("_onrouter_thread_spawn", spawn)?;
         }
-        // _learnon_thread_wait(tids) -> op：登记等待意图，返回让出用的 op id。
+        // _onrouter_thread_wait(tids) -> op：登记等待意图，返回让出用的 op id。
         {
             let ctl = Arc::clone(sched_ctl);
             let counter = Arc::clone(op_counter);
@@ -2212,21 +2212,21 @@ impl LuaEngine {
                 ctl.lock().unwrap().waits.push(WaitReq { op, tids: v });
                 Ok(op as i64)
             })?;
-            lua.globals().set("_learnon_thread_wait", wait)?;
+            lua.globals().set("_onrouter_thread_wait", wait)?;
         }
-        // _learnon_thread_yield() -> 哨兵 op id：让出重排（不阻塞、不等待）。
+        // _onrouter_thread_yield() -> 哨兵 op id：让出重排（不阻塞、不等待）。
         {
             let y = lua.create_function(|_lua, ()| Ok(THREAD_YIELD_MARK as i64))?;
-            lua.globals().set("_learnon_thread_yield", y)?;
+            lua.globals().set("_onrouter_thread_yield", y)?;
         }
-        // _learnon_thread_kill(tid) -> true：请求杀子线程，由调度器在下一步回收。
+        // _onrouter_thread_kill(tid) -> true：请求杀子线程，由调度器在下一步回收。
         {
             let ctl = Arc::clone(sched_ctl);
             let kill = lua.create_function(move |_lua, tid: i64| {
                 ctl.lock().unwrap().kills.push(tid as u64);
                 Ok(true)
             })?;
-            lua.globals().set("_learnon_thread_kill", kill)?;
+            lua.globals().set("_onrouter_thread_kill", kill)?;
         }
 
         let thread_mod: LuaFunction = lua
@@ -2238,7 +2238,7 @@ impl LuaEngine {
                     function t.spawn(func, ...)
                         assert(type(func) == 'function', "bad spawn argument type")
                         local args = table.pack(...)
-                        local tid = _learnon_thread_spawn(func, args)
+                        local tid = _onrouter_thread_spawn(func, args)
                         return { _thread_tid = tid }
                     end
                     -- wait：任一给定线程先完成即返回 ok, ret...；让出等调度器投递 sink。
@@ -2252,18 +2252,18 @@ impl LuaEngine {
                             end
                             tids[i] = th._thread_tid
                         end
-                        return coroutine.yield(_learnon_thread_wait(tids))
+                        return coroutine.yield(_onrouter_thread_wait(tids))
                     end
                     -- yield：主动让出，让同 VM 的其它协程获得一次调度。
                     function t.yield()
-                        return coroutine.yield(_learnon_thread_yield())
+                        return coroutine.yield(_onrouter_thread_yield())
                     end
                     -- kill：中止指定线程（已结束的线程为 no-op）。
                     function t.kill(thread)
                         if type(thread) ~= 'table' or not thread._thread_tid then
                             return nil, "not a light thread object"
                         end
-                        _learnon_thread_kill(thread._thread_tid)
+                        _onrouter_thread_kill(thread._thread_tid)
                         return true
                     end
                     return t
@@ -2912,13 +2912,13 @@ impl LuaEngine {
         worker.set("count", lua.create_function(|_, ()| Ok(1i64))?)?;
         ngx.set("worker", worker)?;
 
-        // ngx.config —— 版本信息（服务器品牌：LearnON）
+        // ngx.config —— 版本信息（服务器品牌：ONRouter）
         let config_tbl = lua.create_table()?;
-        config_tbl.set("server", "LearnON")?;
+        config_tbl.set("server", "ONRouter")?;
         config_tbl.set("server_version", env!("CARGO_PKG_VERSION"))?;
         config_tbl.set("nginx_version", "1.27.0-compatible")?;
         config_tbl.set("ngx_lua_version", "0.10.28-compatible")?;
-        config_tbl.set("learnon_version", env!("CARGO_PKG_VERSION"))?;
+        config_tbl.set("onrouter_version", env!("CARGO_PKG_VERSION"))?;
         config_tbl.set("subsystem", "http")?;
         config_tbl.set("no_debug", true)?;
         // ngx.config.prefix() —— 返回工作目录（对标 nginx `-p` 前缀）
@@ -3247,7 +3247,7 @@ impl LuaEngine {
                             ready.push_back(co_id);
                         }
                         Err(e) => {
-                            eprintln!("[learnon] {phase_name} 脚本编译失败: {e}");
+                            eprintln!("[onrouter] {phase_name} 脚本编译失败: {e}");
                             let _ = reply.send(Err(AppError::Lua(e)));
                         }
                     }
@@ -3273,7 +3273,7 @@ impl LuaEngine {
                     let ctx_table_key = match table_res.and_then(|ct| lua.create_registry_value(ct)) {
                         Ok(k) => k,
                         Err(e) => {
-                            eprintln!("[learnon] thread 共享 ctx 失败: {e}");
+                            eprintln!("[onrouter] thread 共享 ctx 失败: {e}");
                             let _ = lua.remove_registry_value(thread_key);
                             continue;
                         }
@@ -3405,7 +3405,7 @@ impl LuaEngine {
 
                     match resume_result {
                         Err(e) => {
-                            eprintln!("[learnon] 脚本错误: {e}");
+                            eprintln!("[onrouter] 脚本错误: {e}");
                             if is_child {
                                 thread_complete(
                                     lua, &mut states, &mut waiting, &mut done, &mut tid_waitop,
@@ -3474,7 +3474,7 @@ impl LuaEngine {
                                 }
                                 None => {
                                     // 非受支持让出（yield 出的不是 op id）：无法唤醒，按错误回传避免悬挂
-                                    eprintln!("[learnon] 协程 yield 了非 op id 值，无法恢复");
+                                    eprintln!("[onrouter] 协程 yield 了非 op id 值，无法恢复");
                                     let msg = AppError::Other(
                                         "attempt to yield from outside a supported operation".into(),
                                     );
@@ -3835,7 +3835,7 @@ impl LuaUserData for crate::shared_dict::SharedZone {
         methods.add_method("free_space", |_, this, ()| Ok(this.free_space()));
 
         // ---------- Batch 2：补齐 OpenResty ngx.shared.DICT 方法面 ----------
-        // d:get_plus(key) -> value, flags（LearnON 存无类型字节，flags 恒 0=string）
+        // d:get_plus(key) -> value, flags（ONRouter 存无类型字节，flags 恒 0=string）
         methods.add_method("get_plus", |lua, this, key: String| {
             let v = match this.get(&key) {
                 Some(b) => LuaValue::String(lua.create_string(&b)?),
@@ -4074,7 +4074,7 @@ mod tests {
     #[test]
     fn thread_module_exposes_api() {
         let lua = mlua::Lua::new();
-        // 桩：真实 _learnon_thread_* 在请求期由 install_api 注入，此处仅需工厂闭包可成功构造表。
+        // 桩：真实 _onrouter_thread_* 在请求期由 install_api 注入，此处仅需工厂闭包可成功构造表。
         let factory: mlua::Function = lua
             .load(
                 r#"return function()

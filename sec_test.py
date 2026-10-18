@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LearnON 安全测试：拉起网关（conf/compat_nginx.conf），覆盖路径穿越/请求走私/CRLF 注入/畸形请求等。"""
+"""ONRouter 安全测试：拉起网关（conf/compat_nginx.conf），覆盖路径穿越/请求走私/CRLF 注入/畸形请求等。"""
 import subprocess, sys, time, os, socket
 import urllib.request, urllib.error
 
@@ -60,7 +60,7 @@ def check(name, ok, detail=""):
     print(("PASS" if ok else "FAIL"), name, detail if not ok else "")
 
 def main():
-    exe = os.path.join(RUST, "target", "release", "learnon.exe")
+    exe = os.path.join(RUST, "target", "release", "onrouter.exe")
     gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "compat_nginx.conf")],
                           cwd=RUST, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
@@ -72,16 +72,16 @@ def main():
 
         # ============ 1. 路径穿越 ============
         traversals = [
-            ("基础 ../ 穿越", "/static/../../conf/learnon.conf"),
-            ("多级 .. 穿越", "/static/../../../../conf/learnon.conf"),
-            ("根下 ../ 穿越", "/../conf/learnon.conf"),
-            ("URL 编码穿越 %2e%2e%2f", "/static/%2e%2e%2fconf/learnon.conf"),
-            ("编码斜杠 ..%2f", "/static/..%2fconf%2flearnon.conf"),
-            ("双编码 %252e%252e", "/static/%252e%252e%252fconf/learnon.conf"),
-            ("反斜杠 ..%5c", "/static/..%5cconf%5clearnon.conf"),
-            ("混合编码", "/static/.%2e/%2e%2e/conf/learnon.conf"),
-            ("绝对路径穿越", "//conf/learnon.conf"),
-            ("空字节 %00", "/static/..%00/conf/learnon.conf"),
+            ("基础 ../ 穿越", "/static/../../conf/onrouter.conf"),
+            ("多级 .. 穿越", "/static/../../../../conf/onrouter.conf"),
+            ("根下 ../ 穿越", "/../conf/onrouter.conf"),
+            ("URL 编码穿越 %2e%2e%2f", "/static/%2e%2e%2fconf/onrouter.conf"),
+            ("编码斜杠 ..%2f", "/static/..%2fconf%2fonrouter.conf"),
+            ("双编码 %252e%252e", "/static/%252e%252e%252fconf/onrouter.conf"),
+            ("反斜杠 ..%5c", "/static/..%5cconf%5conrouter.conf"),
+            ("混合编码", "/static/.%2e/%2e%2e/conf/onrouter.conf"),
+            ("绝对路径穿越", "//conf/onrouter.conf"),
+            ("空字节 %00", "/static/..%00/conf/onrouter.conf"),
         ]
         for name, path in traversals:
             st, hd, b = req("GET", path)
@@ -155,7 +155,7 @@ def main():
         hd_l = {k.lower(): v for k, v in hd.items()}
         check("404 带 Content-Type text/html", hd_l.get("content-type", "").startswith("text/html"), str(hd))
         check("404 带 Content-Length", "content-length" in hd_l, str(hd))
-        check("Server 头为 LearnON", "learnon" in hd_l.get("server", "").lower(), str(hd))
+        check("Server 头为 ONRouter", "onrouter" in hd_l.get("server", "").lower(), str(hd))
         # 错误页不回显用户输入
         st, _, b = req("GET", "/nonexistent-<script>alert(1)</script>")
         check("错误页不回显原始输入", b"<script>alert(1)</script>" not in b, b[:120])

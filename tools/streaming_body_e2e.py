@@ -13,7 +13,7 @@
 # Integrity is checked too: the backend echoes the sha256 of the bytes it received, which
 # must match what the client sent, for BOTH paths.
 #
-#   cargo build -p learnon-server --bin learnon && python tools/streaming_body_e2e.py
+#   cargo build -p onrouter-server --bin onrouter && python tools/streaming_body_e2e.py
 import hashlib
 import json
 import os
@@ -28,10 +28,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONF = os.path.join(ROOT, "conf", "streaming_body.conf")
 BACKEND_PORT = 18115
-LON_PORT = 18103
+ORR_PORT = 18103
 
 BACKEND_HOST, BACKEND_PORT_ = "127.0.0.1", BACKEND_PORT
-LON_HOST, LON_PORT_ = "127.0.0.1", LON_PORT
+ORR_HOST, ORR_PORT_ = "127.0.0.1", ORR_PORT
 
 _server = None
 _threads = []
@@ -92,7 +92,7 @@ def start_backend():
 def http_post_dribble(path, data, chunk, delay):
     """Raw-socket POST that writes `data` in `chunk`-sized pieces with `delay` between them,
     then reads the full HTTP response. Returns (parsed_json, client_send_ms)."""
-    s = socket.create_connection((LON_HOST, LON_PORT_), timeout=30)
+    s = socket.create_connection((ORR_HOST, ORR_PORT_), timeout=30)
     head = (
         f"POST {path} HTTP/1.1\r\n"
         f"Host: stream.local\r\n"
@@ -132,7 +132,7 @@ def wait_ready(timeout=20):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            r = socket.create_connection((LON_HOST, LON_PORT_), timeout=1)
+            r = socket.create_connection((ORR_HOST, ORR_PORT_), timeout=1)
             r.close()
             return True
         except OSError:
@@ -141,11 +141,11 @@ def wait_ready(timeout=20):
 
 
 def find_binary():
-    for name in ("learnon.exe", "learnon"):
+    for name in ("onrouter.exe", "onrouter"):
         p = os.path.join(ROOT, "target", "debug", name)
         if os.path.exists(p):
             return p
-    raise SystemExit("!! build first: cargo build -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build -p onrouter-server --bin onrouter")
 
 
 def main():
@@ -159,7 +159,7 @@ def main():
     proc = subprocess.Popen([binp, "-c", CONF],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if not wait_ready():
-        proc.kill(); raise SystemExit("!! learnon never became ready")
+        proc.kill(); raise SystemExit("!! onrouter never became ready")
 
     passed = failed = 0
     def check(name, cond, detail):

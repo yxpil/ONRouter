@@ -1,8 +1,10 @@
-LearnON 仓库时间戳公证（OpenTimestamps）
+ONRouter 仓库时间戳公证（OpenTimestamps）
 =============================================
 
 公证对象
   GitHub 仓库   : https://github.com/yxpil/LearnON
+                  （仓库于 2026-10-18 更名为 https://github.com/yxpil/ONRouter，
+                   此处保留存证当时的原始仓库名与 URL，不做改写）
   Commit SHA-1 : bd2059e049a078c54b2df8ecb2e3491e4bb4d61c
   摘要 (sha256(commit id)) : 969d22186808850fe8a018e8ca97c806277b1efad375679081fe67e2c54c53eb
 
@@ -27,3 +29,7 @@ LearnON 仓库时间戳公证（OpenTimestamps）
 时间
   本地公证发起时间：2026-10-13T20:57+08:00（UTC+8）
   GitHub 首次提交可追溯至本仓库首个 commit 的服务器时间戳。
+
+更名说明
+  存证绑定的是 commit SHA-1 的摘要，与仓库名无关；改名后上述 4 份回执与验证
+  方法依旧有效，摘要与 commit id 均保持原值。

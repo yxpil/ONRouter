@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 
-use learnon_config::Directive;
+use onrouter_config::Directive;
 
 use crate::AppError;
 

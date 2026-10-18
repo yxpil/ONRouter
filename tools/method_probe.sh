@@ -1,7 +1,7 @@
 #!/bin/bash
-# 在单个 Bash 调用内启动 LearnON、探测、关闭
+# 在单个 Bash 调用内启动 ONRouter、探测、关闭
 cd /c/Users/User/Desktop/LearnON || exit 1
-./target/debug/learnon.exe -p C:/tmp/lsmoke2/ -c nginx.conf -g "pid C:/tmp/lsmoke2/nginx.pid;" >/dev/null 2>&1 &
+./target/debug/onrouter.exe -p C:/tmp/lsmoke2/ -c nginx.conf -g "pid C:/tmp/lsmoke2/nginx.pid;" >/dev/null 2>&1 &
 LP=$!
 ok=0
 for k in $(seq 1 20); do

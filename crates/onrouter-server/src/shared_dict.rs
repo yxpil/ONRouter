@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use learnon_config::Config;
+use onrouter_config::Config;
 
 use crate::router::parse_size;
 use crate::AppError;

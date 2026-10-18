@@ -1,10 +1,10 @@
-# LearnON vs OpenResty - Gap Analysis
+# ONRouter vs OpenResty - Gap Analysis
 
-This document analyzes what LearnON is missing compared to OpenResty and identifies areas for improvement.
+This document analyzes what ONRouter is missing compared to OpenResty and identifies areas for improvement.
 
 ## Executive Summary
 
-**OpenResty** is a mature, production-grade Web platform based on Nginx + LuaJIT with extensive ecosystem. **LearnON** is a Rust-based gateway inspired by Nginx/OpenResty architecture but still in early development.
+**OpenResty** is a mature, production-grade Web platform based on Nginx + LuaJIT with extensive ecosystem. **ONRouter** is a Rust-based gateway inspired by Nginx/OpenResty architecture but still in early development.
 
 ### Current Status
 - ✅ **Core Architecture**: Event-driven model, request lifecycle phases (implemented)
@@ -21,7 +21,7 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 - `body_filter_by_lua` - Stream response body modification
 - `header_filter_by_lua` - Response header manipulation
 
-**LearnON status:** ❌ Not implemented
+**ONRouter status:** ❌ Not implemented
 
 **Impact:** Cannot do real-time response transformation, compression, or content injection.
 
@@ -30,7 +30,7 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 - `ngx.location.capture()` - Make internal subrequests
 - `ngx.location.capture_multi()` - Parallel subrequests
 
-**LearnON status:** ❌ Not implemented
+**ONRouter status:** ❌ Not implemented
 
 **Impact:** Cannot compose responses from multiple backends, implement aggregation patterns.
 
@@ -39,7 +39,7 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 - `resty.socket` - Non-blocking TCP/UDP sockets
 - `resty.redis`, `resty.mysql`, `resty.http` - Async database/HTTP clients
 
-**LearnON status:** ❌ Not implemented
+**ONRouter status:** ❌ Not implemented
 
 **Impact:** Lua scripts cannot make async calls to Redis/MySQL/external APIs without blocking workers.
 
@@ -49,7 +49,7 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 - `ngx.timer.every(interval, callback)` - Periodic timers
 - Background tasks independent of requests
 
-**LearnON status:** ❌ Not implemented
+**ONRouter status:** ❌ Not implemented
 
 **Impact:** Cannot run periodic cleanup, health checks, cache warming in background.
 
@@ -58,7 +58,7 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 - `resty.lock` - Distributed locks using shared memory
 - Mutex primitives for cross-worker coordination
 
-**LearnON status:** ❌ Not implemented (only shared_dict exists)
+**ONRouter status:** ❌ Not implemented (only shared_dict exists)
 
 **Impact:** Cannot implement distributed rate limiting, leader election, or coordinated operations.
 
@@ -68,7 +68,7 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 
 ### 2.1 Advanced Lua APIs
 
-| OpenResty API | LearnON Status | Description |
+| OpenResty API | ONRouter Status | Description |
 |--------------|----------------|-------------|
 | `ngx.req.set_body_data()` | ❌ | Modify request body |
 | `ngx.req.discard_body()` | ❌ | Discard request body |
@@ -86,7 +86,7 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 - `stream-lua-nginx-module` - TCP/UDP proxying with Lua
 - `stream_by_lua*` directives
 
-**LearnON status:** ❌ Only HTTP supported
+**ONRouter status:** ❌ Only HTTP supported
 
 **Impact:** Cannot proxy databases, custom protocols, WebSocket upgrades properly.
 
@@ -96,7 +96,7 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 - `package.path` customization
 - Dynamic code compilation
 
-**LearnON status:** ⚠️ File mtime cache only (no hot reload)
+**ONRouter status:** ⚠️ File mtime cache only (no hot reload)
 
 ### 2.4 SSL/TLS Session Management
 **OpenResty has:**
@@ -104,7 +104,7 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 - `ssl_session_store_by_lua` - Custom session storage
 - OCSP stapling support
 
-**LearnON status:** ⚠️ Static cert loading only
+**ONRouter status:** ⚠️ Static cert loading only
 
 ### 2.5 DNS Resolver
 **OpenResty has:**
@@ -112,7 +112,7 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 - Dynamic upstream discovery
 - SRV record support
 
-**LearnON status:** ❌ Static config only
+**ONRouter status:** ❌ Static config only
 
 ---
 
@@ -120,9 +120,9 @@ This document analyzes what LearnON is missing compared to OpenResty and identif
 
 ### 3.1 Missing lua-resty-* Libraries
 
-OpenResty provides these official libraries that LearnON lacks:
+OpenResty provides these official libraries that ONRouter lacks:
 
-| Library | Purpose | LearnON Alternative |
+| Library | Purpose | ONRouter Alternative |
 |---------|---------|---------------------|
 | `lua-resty-redis` | Async Redis client | ❌ None |
 | `lua-resty-mysql` | Async MySQL client | ❌ None |
@@ -139,7 +139,7 @@ OpenResty provides these official libraries that LearnON lacks:
 
 ### 3.2 Third-party Module Compatibility
 
-OpenResty supports these Nginx modules that LearnON doesn't:
+OpenResty supports these Nginx modules that ONRouter doesn't:
 
 - `echo-nginx-module` - Debug/testing commands
 - `headers-more-nginx-module` - Advanced header manipulation
@@ -155,25 +155,25 @@ OpenResty supports these Nginx modules that LearnON doesn't:
 
 ### 4.1 Worker Model Differences
 
-| Feature | OpenResty | LearnON |
+| Feature | OpenResty | ONRouter |
 |---------|-----------|---------|
 | Workers | Multi-process (one per CPU) | Single process with thread pool |
 | VM per worker | Yes (isolated) | Pool of VMs (shared) |
 | IPC | Shared memory + Unix socket | Shared memory only |
 | Graceful reload | `kill -HUP` (zero downtime) | ❌ Requires restart |
 
-**Impact:** LearnON cannot achieve zero-downtime reloads like OpenResty.
+**Impact:** ONRouter cannot achieve zero-downtime reloads like OpenResty.
 
 ### 4.2 LuaJIT vs mlua
 
-| Aspect | OpenResty (LuaJIT) | LearnON (mlua/Lua 5.4) |
+| Aspect | OpenResty (LuaJIT) | ONRouter (mlua/Lua 5.4) |
 |--------|-------------------|------------------------|
 | Performance | JIT compiled (~10x faster) | Interpreted |
 | FFI | Yes (call C directly) | Limited |
 | Coroutine | Native support | Via mlua |
 | GC tuning | Advanced options | Standard Lua GC |
 
-**Impact:** Lua scripts in LearnON will be significantly slower than OpenResty.
+**Impact:** Lua scripts in ONRouter will be significantly slower than OpenResty.
 
 ---
 
@@ -187,7 +187,7 @@ OpenResty supports these Nginx modules that LearnON doesn't:
 - Detailed error logging with stack traces
 - Admin API for runtime inspection
 
-**LearnON status:** ❌ Basic access/error logs only
+**ONRouter status:** ❌ Basic access/error logs only
 
 ### 5.2 Configuration Management
 
@@ -196,7 +196,7 @@ OpenResty supports these Nginx modules that LearnON doesn't:
 - Configuration versioning
 - Blue-green deployment support
 
-**LearnON status:** ❌ File-based config only (requires restart)
+**ONRouter status:** ❌ File-based config only (requires restart)
 
 ### 5.3 Testing Framework
 
@@ -205,7 +205,7 @@ OpenResty supports these Nginx modules that LearnON doesn't:
 - Built-in mock servers
 - Traffic replay tools
 
-**LearnON status:** ⚠️ Basic Rust unit tests only
+**ONRouter status:** ⚠️ Basic Rust unit tests only
 
 ---
 
@@ -218,7 +218,7 @@ OpenResty supports these Nginx modules that LearnON doesn't:
 - `lua-resty-waf` - Rule-based filtering
 - SQL injection/XSS detection libraries
 
-**LearnON status:** ❌ No WAF capabilities
+**ONRouter status:** ❌ No WAF capabilities
 
 ### 6.2 Rate Limiting
 
@@ -227,7 +227,7 @@ OpenResty supports these Nginx modules that LearnON doesn't:
 - Sliding window counters
 - Distributed rate limiting with Redis
 
-**LearnON status:** ⚠️ Basic leaky bucket only
+**ONRouter status:** ⚠️ Basic leaky bucket only
 
 ### 6.3 Authentication
 
@@ -237,7 +237,7 @@ OpenResty supports these Nginx modules that LearnON doesn't:
 - SAML support
 - API key management
 
-**LearnON status:** ❌ No built-in auth
+**ONRouter status:** ❌ No built-in auth
 
 ---
 
@@ -280,9 +280,9 @@ OpenResty supports these Nginx modules that LearnON doesn't:
 
 ---
 
-## 8. Competitive Advantages of LearnON
+## 8. Competitive Advantages of ONRouter
 
-Despite gaps, LearnON has unique strengths:
+Despite gaps, ONRouter has unique strengths:
 
 1. **Memory Safety**: Rust prevents entire classes of bugs (buffer overflows, use-after-free)
 2. **Modern Tooling**: Cargo ecosystem, easy dependency management
@@ -295,7 +295,7 @@ Despite gaps, LearnON has unique strengths:
 
 ## 9. Conclusion
 
-**LearnON is approximately 30-40% feature-complete compared to OpenResty.**
+**ONRouter is approximately 30-40% feature-complete compared to OpenResty.**
 
 The core gateway functionality is solid, but the rich ecosystem of async libraries, advanced Lua APIs, and operational tooling are missing. Focus should be on:
 

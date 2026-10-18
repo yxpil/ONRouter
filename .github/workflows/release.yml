@@ -49,21 +49,21 @@ jobs:
           
       - name: Build
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin learnon
-          cargo build --release --target ${{ matrix.target }} --bin lon-gencert
+          cargo build --release --target ${{ matrix.target }} --bin onrouter
+          cargo build --release --target ${{ matrix.target }} --bin orr-gencert
       
       - name: Create archive
         run: |
           mkdir -p dist
           cd target/${{ matrix.target }}/release
           if [[ "${{ matrix.archive }}" == "tar.gz" ]]; then
-            tar czf ../../../dist/learnon-${{ github.ref_name }}-${{ matrix.target }}.tar.gz learnon lon-gencert
+            tar czf ../../../dist/onrouter-${{ github.ref_name }}-${{ matrix.target }}.tar.gz onrouter orr-gencert
           fi
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: learnon-linux-${{ matrix.target }}
+          name: onrouter-linux-${{ matrix.target }}
           path: dist/*.tar.gz
   
   # macOS builds (Intel + Apple Silicon)
@@ -86,19 +86,19 @@ jobs:
       
       - name: Build
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin learnon
-          cargo build --release --target ${{ matrix.target }} --bin lon-gencert
+          cargo build --release --target ${{ matrix.target }} --bin onrouter
+          cargo build --release --target ${{ matrix.target }} --bin orr-gencert
       
       - name: Create archive
         run: |
           mkdir -p dist
           cd target/${{ matrix.target }}/release
-          zip ../../../dist/learnon-${{ github.ref_name }}-${{ matrix.target }}.zip learnon lon-gencert
+          zip ../../../dist/onrouter-${{ github.ref_name }}-${{ matrix.target }}.zip onrouter orr-gencert
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: learnon-macos-${{ matrix.target }}
+          name: onrouter-macos-${{ matrix.target }}
           path: dist/*.zip
   
   # Windows builds (x86_64, aarch64)
@@ -122,19 +122,19 @@ jobs:
       
       - name: Build
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin learnon
-          cargo build --release --target ${{ matrix.target }} --bin lon-gencert
+          cargo build --release --target ${{ matrix.target }} --bin onrouter
+          cargo build --release --target ${{ matrix.target }} --bin orr-gencert
       
       - name: Create archive
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
-          Compress-Archive -Path "target/${{ matrix.target }}/release/learnon${{ matrix.ext }}","target/${{ matrix.target }}/release/lon-gencert${{ matrix.ext }}" -DestinationPath "dist/learnon-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/onrouter${{ matrix.ext }}","target/${{ matrix.target }}/release/orr-gencert${{ matrix.ext }}" -DestinationPath "dist/onrouter-${{ github.ref_name }}-${{ matrix.target }}.zip"
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: learnon-windows-${{ matrix.target }}
+          name: onrouter-windows-${{ matrix.target }}
           path: dist/*.zip
   
   # Create GitHub Release

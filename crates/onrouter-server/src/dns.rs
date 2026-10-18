@@ -3,7 +3,7 @@
 //! nginx 默认在 worker 里用 getaddrinfo（同步、阻塞）解析 proxy_pass 的域名；
 //! 配了 `resolver` 后改用非阻塞的异步解析，配合 `valid=` 缓存，避免解析卡住事件循环。
 //!
-//! LearnON 采用同样的思路：这里实现一个纯 Rust 的 UDP DNS 存根解析器（A/AAAA，
+//! ONRouter 采用同样的思路：这里实现一个纯 Rust 的 UDP DNS 存根解析器（A/AAAA，
 //! 标准 RFC1035 报文，支持压缩指针），带 TTL 缓存；proxy 转发与 Upgrade 隧道在
 //! 连接后端前用它把域名换成 IP 字面量，从而绕过阻塞式 getaddrinfo。
 //!
@@ -67,7 +67,7 @@ pub struct DnsResolver {
 impl DnsResolver {
     /// 从配置读取 `resolver` 指令；没有该指令（或名字服务器非法）时返回 None，
     /// proxy 继续走默认 getaddrinfo 路径（保持无 resolver 配置时的既有行为）。
-    pub fn from_config(config: &learnon_config::Config) -> Option<Arc<DnsResolver>> {
+    pub fn from_config(config: &onrouter_config::Config) -> Option<Arc<DnsResolver>> {
         let d = config.find("resolver")?;
         let mut cfg = ResolverConfig::default();
         for arg in &d.args {
@@ -520,9 +520,9 @@ mod tests {
 
     #[test]
     fn resolver_from_config_requires_nameserver() {
-        let cfg = learnon_config::Config::parse("").unwrap();
+        let cfg = onrouter_config::Config::parse("").unwrap();
         assert!(DnsResolver::from_config(&cfg).is_none());
-        let cfg = learnon_config::Config::parse("resolver 127.0.0.1:5553 valid=30s;").unwrap();
+        let cfg = onrouter_config::Config::parse("resolver 127.0.0.1:5553 valid=30s;").unwrap();
         let r = DnsResolver::from_config(&cfg).unwrap();
         assert_eq!(r.config.nameservers.len(), 1);
         assert_eq!(r.config.valid, Duration::from_secs(30));

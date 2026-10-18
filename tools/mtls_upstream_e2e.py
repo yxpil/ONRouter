@@ -7,7 +7,7 @@
 #      网关 502。这条负例证明成功完全取决于客户端证书本身。
 #   4) 负例后 /ping 仍 200 → 网关进程存活。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/mtls_upstream_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/mtls_upstream_e2e.py
 import os
 import socket
 import ssl
@@ -27,7 +27,7 @@ BACKEND_PORT = 18454
 GW_HOST, GW_PORT = "127.0.0.1", 18455
 BASE = f"http://{GW_HOST}:{GW_PORT}"
 
-CLIENT_CN = "learnon-mtls-client"
+CLIENT_CN = "onrouter-mtls-client"
 
 results = []
 tls_hits = {}
@@ -42,11 +42,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -83,7 +83,7 @@ def gen_certs():
 
     # 根 CA
     run(["req", "-x509", "-newkey", "rsa:2048", "-keyout", "ca.key", "-out", "ca.crt",
-         "-days", "3650", "-nodes", "-subj", "/CN=LearnON-mTLS-CA",
+         "-days", "3650", "-nodes", "-subj", "/CN=ONRouter-mTLS-CA",
          "-addext", "basicConstraints=critical,CA:TRUE"])
     # 服务端证书（SAN localhost + serverAuth），供网关 proxy_ssl_name/verify 校验
     run(["req", "-newkey", "rsa:2048", "-keyout", "server.key", "-out", "server.csr",
@@ -227,7 +227,7 @@ def main():
                 pass
             time.sleep(0.2)
         if not ready:
-            raise SystemExit("!! learnon 未就绪（端口 18455/18454 被占用？看 logs/mtls_upstream_out.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18455/18454 被占用？看 logs/mtls_upstream_out.log）")
 
         # 1) mTLS GET：握手成功 + 后端校验到的客户端证书 CN 被回显
         before = sum(tls_hits.values())

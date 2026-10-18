@@ -5,7 +5,7 @@
 #   /echo：map 目标写进 proxy_set_header，经真实代理转发到回显后端，后端把收到的
 #          X-Kind / X-Conn / X-Secure 原样打回，证明 config 字符串插值路径也解析了 map。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/map_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/map_e2e.py
 import os
 import socket
 import subprocess
@@ -34,11 +34,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def get(path, headers=None):
@@ -100,7 +100,7 @@ def main():
     proc = subprocess.Popen([exe, CONF], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
     try:
         if not wait_ready():
-            check("server-start", False, "learnon 未监听 18168")
+            check("server-start", False, "onrouter 未监听 18168")
             return
         check("server-start", True)
 

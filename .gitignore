@@ -2,7 +2,7 @@
 /target/
 **/*.rs.bk
 
-# 本地生成的测试证书（用 lon-gencert 重新生成）
+# 本地生成的测试证书（用 orr-gencert 重新生成）
 /certs/
 /certs_scenario/
 /certs_https/

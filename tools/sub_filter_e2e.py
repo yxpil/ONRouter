@@ -2,7 +2,7 @@
 # nginx `sub_filter` 响应体替换 E2E —— 用真实 HTTP 流量证明字面/正则/once/类型门控
 # 以及三条输出路径（proxy / content_by_lua / 静态，含 Range 不改写）都正确落地。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/sub_filter_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/sub_filter_e2e.py
 import os
 import socket
 import subprocess
@@ -32,11 +32,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def get(path, headers=None):
@@ -100,7 +100,7 @@ def main():
     proc = subprocess.Popen([exe, CONF], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
     try:
         if not wait_ready():
-            check("server-start", False, "learnon 未监听 18174")
+            check("server-start", False, "onrouter 未监听 18174")
             return
         check("server-start", True)
 

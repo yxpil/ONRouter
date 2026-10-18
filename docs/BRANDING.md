@@ -1,8 +1,8 @@
-# LearnON Branding Guide
+# ONRouter Branding Guide
 
 ## Logo Assets
 
-The official LearnON logo is located at `public/logo.png`.
+The official ONRouter logo is located at `public/logo.png`.
 
 ### Logo Specifications
 - **File**: `public/logo.png`
@@ -22,7 +22,7 @@ COPY public/logo.png /app/assets/logo.png
 Use the logo in README and documentation:
 ```markdown
 <p align="center">
-  <img src="public/logo.png" alt="LearnON logo" width="180">
+  <img src="public/logo.png" alt="ONRouter logo" width="180">
 </p>
 ```
 
@@ -40,18 +40,28 @@ Based on the logo design:
 
 ### Typography
 
-For "LearnON" text accompanying the logo:
+For "ONRouter" text accompanying the logo:
 - **Font**: Modern sans-serif (Inter, Roboto, or system default)
 - **Weight**: Bold or Semi-bold
-- **Case**: Title case ("LearnON")
+- **Case**: `ONRouter` — "ON" all caps + "Router" capitalised. Never `ONROUTER`, `Onrouter` or `OnRouter`.
+
+### Name Forms (post-rename from "LearnON", 2026-10-18)
+
+| Context | Form | Example |
+|---------|------|---------|
+| Prose / brand / `Server:` header | `ONRouter` | `Server: ONRouter/0.3.0`, `ngx.config.server` |
+| Crate, binary, config file, log prefix, metric names | `onrouter` | `onrouter-server`, `conf/onrouter.conf`, `onrouter_http_requests_total` |
+| Env var prefix | `ONROUTER_` | `ONROUTER_CONFIG`, `ONROUTER_SKIP_BUILD` |
+| Auxiliary tool binaries | `orr-*` | `orr-gencert`, `orr-h3check` |
+| Tool-local env / script vars | `ORR_` | `ORR_H3_CERT`, `ORR_HOST`, `ORR_PORT` |
 
 ### Examples
 
 #### GitHub Profile/Repository
 ```html
 <div align="center">
-  <img src="public/logo.png" width="200" alt="LearnON Gateway">
-  <h1>LearnON</h1>
+  <img src="public/logo.png" width="200" alt="ONRouter Gateway">
+  <h1>ONRouter</h1>
   <p>High-performance gateway server like Nginx, 100% in Rust</p>
 </div>
 ```
@@ -61,7 +71,7 @@ Use the logo as the repository avatar and include in description.
 
 #### Documentation Headers
 ```markdown
-# LearnON Gateway
+# ONRouter Gateway
 
 <img src="../public/logo.png" align="right" width="100">
 ```
@@ -96,4 +106,4 @@ For branding questions or high-resolution assets, contact: yxpil
 
 ---
 
-*Last updated: 2026-10-14*
+*Last updated: 2026-10-18（仓库由 "LearnON" 更名为 "ONRouter"）*

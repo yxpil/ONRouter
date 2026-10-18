@@ -1,7 +1,7 @@
-//! LearnON — 用 Rust 从零实现的 OpenResty / Nginx 风格网关服务器。
+//! ONRouter — 用 Rust 从零实现的 OpenResty / Nginx 风格网关服务器。
 //!
 //! 功能对照（逐项翻译自 Nginx / OpenResty）：
-//! | Nginx / OpenResty            | LearnON (Rust)                              |
+//! | Nginx / OpenResty            | ONRouter (Rust)                              |
 //! |------------------------------|---------------------------------------------|
 //! | master/worker 事件循环        | tokio 多线程运行时 + 连接额度信号量           |
 //! | nginx.conf                   | 自研 Nginx 风格配置解析器                     |
@@ -16,7 +16,7 @@
 //! | worker_connections / 超时     | settings.rs + server.rs                       |
 //! | quit / reopen_logs 信号      | SIGTERM/SIGINT 优雅停机，SIGHUP/SIGUSR1 重开日志 |
 //!
-//! 用法：`learnon [-t] [-V] [path/to/learnon.conf]`
+//! 用法：`onrouter [-t] [-V] [path/to/onrouter.conf]`
 
 mod access_log;
 mod access;
@@ -47,7 +47,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use learnon_config::Config;
+use onrouter_config::Config;
 use tokio::sync::watch;
 
 use engine::HandlerRegistry;
@@ -62,7 +62,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("config error: {0}")]
-    Config(#[from] learnon_config::ConfigError),
+    Config(#[from] onrouter_config::ConfigError),
     #[error("lua error: {0}")]
     Lua(#[from] mlua::Error),
     #[error("{0}")]
@@ -90,11 +90,11 @@ struct Args {
 }
 
 const USAGE: &str = "\
-learnon —— Rust 版 Nginx/OpenResty 风格网关
+onrouter —— Rust 版 Nginx/OpenResty 风格网关
 
-用法: learnon [选项] [配置文件]
+用法: onrouter [选项] [配置文件]
 
-  -c <file>      指定配置文件（默认 conf/learnon.conf）
+  -c <file>      指定配置文件（默认 conf/onrouter.conf）
   -p <dir>       前缀目录，配置内相对路径以此为基准（nginx 兼容）
   -g <directives> 命令行全局指令，如 -g 'pid run.pid; error_log err.log warn;'
   -e <file>      错误日志覆盖（接受并忽略，error_log 由 -g/conf 控制）
@@ -114,7 +114,7 @@ fn parse_args() -> Result<Args, String> {
         match argv[i].as_str() {
             "-t" | "--test" => test = true,
             "-V" | "--version" => {
-                println!("learnon/{} (Rust, OpenResty-compatible)", VERSION);
+                println!("ONRouter/{} (Rust, OpenResty-compatible)", VERSION);
                 std::process::exit(0);
             }
             "-h" | "--help" => {
@@ -162,7 +162,7 @@ fn parse_args() -> Result<Args, String> {
         i += 1;
     }
     Ok(Args {
-        conf: conf.unwrap_or_else(|| PathBuf::from("conf/learnon.conf")),
+        conf: conf.unwrap_or_else(|| PathBuf::from("conf/onrouter.conf")),
         test,
         prefix,
         globals,
@@ -193,7 +193,7 @@ fn main() {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("[learnon] {e}\n\n{USAGE}");
+            eprintln!("[onrouter] {e}\n\n{USAGE}");
             std::process::exit(2);
         }
     };
@@ -218,12 +218,12 @@ fn main() {
     let mut config = match Config::load(&conf_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[learnon] 配置加载失败 {conf_path:?}: {e}");
+            eprintln!("[onrouter] 配置加载失败 {conf_path:?}: {e}");
             std::process::exit(1);
         }
     };
     if let Err(e) = merge_globals(&mut config, &args.globals) {
-        eprintln!("[learnon] {e}");
+        eprintln!("[onrouter] {e}");
         std::process::exit(1);
     }
 
@@ -243,7 +243,7 @@ fn main() {
         Ok(r) => r,
         Err(e) => {
             log_error!("路由构建失败: {e}");
-            eprintln!("[learnon] 路由构建失败: {e}");
+            eprintln!("[onrouter] 路由构建失败: {e}");
             std::process::exit(1);
         }
     };
@@ -260,7 +260,7 @@ fn main() {
         std::process::exit(match check(&router, &settings) {
             Ok(()) => 0,
             Err(e) => {
-                eprintln!("[learnon] {e}");
+                eprintln!("[onrouter] {e}");
                 1
             }
         });
@@ -271,7 +271,7 @@ fn main() {
         .unwrap_or(4);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
-        .thread_name("learnon-worker")
+        .thread_name("onrouter-worker")
         .enable_all()
         .build()
         .expect("tokio 运行时创建失败");
@@ -287,7 +287,7 @@ fn main() {
         pid_path,
     )) {
         log_error!("启动失败: {e}");
-        eprintln!("[learnon] 启动失败: {e}");
+        eprintln!("[onrouter] 启动失败: {e}");
         std::process::exit(1);
     }
 }
@@ -333,7 +333,7 @@ async fn run(
     let lua = Arc::new(LuaEngine::new(&config, &base_dir)?);
     let proxy = match dns::DnsResolver::from_config(&config) {
         Some(r) => {
-            println!("[learnon] 异步 DNS 解析器就绪：nameserver {:?}", r.nameservers());
+            println!("[onrouter] 异步 DNS 解析器就绪：nameserver {:?}", r.nameservers());
             Arc::new(ProxyEngine::new(Arc::clone(&pool)).with_resolver(r))
         }
         None => Arc::new(ProxyEngine::new(Arc::clone(&pool))),
@@ -462,7 +462,7 @@ async fn run(
     }
 
     println!(
-        "[learnon] 启动完成：{} 个监听（含 {} 个 stream），{workers} 个 worker 线程，配置 {conf_display}",
+        "[onrouter] 启动完成：{} 个监听（含 {} 个 stream），{workers} 个 worker 线程，配置 {conf_display}",
         listener_specs.len() + stream_specs.len(),
         stream_specs.len()
     );
@@ -596,7 +596,7 @@ fn do_reload(
     base_dir: &PathBuf,
     listeners: &[router::Listener],
 ) {
-    match learnon_config::Config::load(conf_path) {
+    match onrouter_config::Config::load(conf_path) {
         Err(e) => log_error!("热重载失败：配置解析出错，保持旧配置继续服务: {e}"),
         Ok(cfg) => match router::Router::rebuild_routing(&cfg, base_dir, listeners) {
             Err(e) => log_error!("热重载失败：路由构建出错，保持旧配置继续服务: {e}"),

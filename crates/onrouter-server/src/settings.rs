@@ -21,7 +21,7 @@
 
 use std::time::Duration;
 
-use learnon_config::Config;
+use onrouter_config::Config;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -66,7 +66,7 @@ pub struct GzipSettings {
 /// nginx 内置始终压缩的类型，无法通过 gzip_types 移除
 pub const GZIP_ALWAYS: &str = "text/html";
 
-/// LearnON 开箱即用的默认压缩类型集合（nginx 默认只有 text/html，这里给一份实用超集）
+/// ONRouter 开箱即用的默认压缩类型集合（nginx 默认只有 text/html，这里给一份实用超集）
 fn default_gzip_types() -> Vec<String> {
     [
         GZIP_ALWAYS,

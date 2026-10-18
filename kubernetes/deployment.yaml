@@ -1,16 +1,16 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: learnon-gateway
+  name: onrouter-gateway
   namespace: default
   labels:
-    app: learnon
+    app: onrouter
     component: gateway
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: learnon
+      app: onrouter
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -19,7 +19,7 @@ spec:
   template:
     metadata:
       labels:
-        app: learnon
+        app: onrouter
         component: gateway
       annotations:
         prometheus.io/scrape: "true"
@@ -27,8 +27,8 @@ spec:
     spec:
       terminationGracePeriodSeconds: 30
       containers:
-        - name: learnon
-          image: yxpil/learnon:latest
+        - name: onrouter
+          image: yxpil/onrouter:latest
           imagePullPolicy: Always
           ports:
             - name: http
@@ -75,19 +75,19 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: learnon-config
+            name: onrouter-config
         - name: certs
           secret:
-            secretName: learnon-certs
+            secretName: onrouter-certs
         - name: logs
           emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: learnon-gateway
+  name: onrouter-gateway
   labels:
-    app: learnon
+    app: onrouter
 spec:
   type: LoadBalancer
   ports:
@@ -100,15 +100,15 @@ spec:
       targetPort: 443
       protocol: TCP
   selector:
-    app: learnon
+    app: onrouter
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: learnon-config
+  name: onrouter-config
 data:
-  learnon.conf: |
-    # LearnON Gateway Configuration
+  onrouter.conf: |
+    # ONRouter Gateway Configuration
     worker_connections 10240;
     
     events {

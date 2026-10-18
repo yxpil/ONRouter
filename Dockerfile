@@ -1,4 +1,4 @@
-# LearnON Gateway - Production Docker Image
+# ONRouter Gateway - Production Docker Image
 FROM rust:1.98-slim-bookworm AS builder
 
 WORKDIR /app
@@ -14,16 +14,16 @@ RUN apt-get update && apt-get install -y \
 COPY . .
 
 # Build in release mode
-RUN cargo build --release --bin learnon
+RUN cargo build --release --bin onrouter
 
 # Production stage - minimal image
 FROM debian:bookworm-slim
 
 LABEL maintainer="yxpil"
-LABEL description="LearnON: High-performance gateway server like Nginx, 100% in Rust"
+LABEL description="ONRouter: High-performance gateway server like Nginx, 100% in Rust"
 LABEL version="0.2.0"
-LABEL org.opencontainers.image.source="https://github.com/yxpil/LearnON"
-LABEL org.opencontainers.image.description="LearnON Gateway Server"
+LABEL org.opencontainers.image.source="https://github.com/yxpil/ONRouter"
+LABEL org.opencontainers.image.description="ONRouter Gateway Server"
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
@@ -31,19 +31,19 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     curl \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd -r learnon && useradd -r -g learnon -d /app -s /sbin/nologin learnon
+    && groupadd -r onrouter && useradd -r -g onrouter -d /app -s /sbin/nologin onrouter
 
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /app/target/release/learnon /usr/local/bin/learnon
+COPY --from=builder /app/target/release/onrouter /usr/local/bin/onrouter
 
 # Copy branding assets
 COPY public/logo.png /app/assets/logo.png
 
 # Create necessary directories
 RUN mkdir -p /app/conf /app/logs /app/certs /app/assets && \
-    chown -R learnon:learnon /app
+    chown -R onrouter:onrouter /app
 
 # Expose ports
 EXPOSE 80/tcp 443/tcp
@@ -53,7 +53,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:80/ || exit 1
 
 # Switch to non-root user
-USER learnon
+USER onrouter
 
-ENTRYPOINT ["learnon"]
-CMD ["-c", "/app/conf/learnon.conf"]
+ENTRYPOINT ["onrouter"]
+CMD ["-c", "/app/conf/onrouter.conf"]

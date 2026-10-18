@@ -20,9 +20,9 @@ def check(name, ok, detail=""):
     print(("PASS" if ok else "FAIL"), name, "" if ok else detail)
 
 def main():
-    exe = os.path.join(RUST, "target", "debug", "learnon.exe")
+    exe = os.path.join(RUST, "target", "debug", "onrouter.exe")
     logf = open(os.path.join(RUST, "timer_e2e.log"), "wb")
-    gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "learnon.conf")],
+    gw = subprocess.Popen([exe, os.path.join(RUST, "conf", "onrouter.conf")],
                           cwd=RUST, stdout=logf, stderr=subprocess.STDOUT)
     try:
         for _ in range(50):

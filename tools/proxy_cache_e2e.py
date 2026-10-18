@@ -6,7 +6,7 @@
 #   * 上游 Cache-Control: no-store → 不缓存（BYPASS）
 #   * 未启缓存的对照 location → 不带 X-Cache-Status 头，且每次回源
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/proxy_cache_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/proxy_cache_e2e.py
 import os
 import subprocess
 import sys
@@ -38,11 +38,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -132,7 +132,7 @@ def main():
                 pass
             time.sleep(0.2)
         if not ready:
-            raise SystemExit("!! learnon 未就绪（端口 18123/18122 被占用？看 logs/proxy_cache_out.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18123/18122 被占用？看 logs/proxy_cache_out.log）")
 
         # 1) 首次 MISS
         st, hs, body = request("/c/count")

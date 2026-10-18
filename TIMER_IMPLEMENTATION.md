@@ -2,7 +2,7 @@
 
 ## Overview
 
-Implemented OpenResty-compatible background timer APIs for LearnON. The implementation was **analyzed against the official
+Implemented OpenResty-compatible background timer APIs for ONRouter. The implementation was **analyzed against the official
 lua-nginx-module test suite** (cloned to `vendor/lua-nginx-module/t/`, 193 E2E files) and reworked to match the semantics
 asserted by `t/106-timer.t`, `t/152-timer-every.t`, `t/107-timer-errors.t`.
 
@@ -69,6 +69,6 @@ PASS x11 -> 11/11 通过
 ## Running the Official Suite (reference)
 
 Full `.t` files require Test::Nginx (Perl: `Test::Base`, `Test::LongString`) **and an OpenResty binary** as
-`TEST_NGINX_BINARY`; they cannot execute against LearnON today because they also rely on `*_by_lua_block` config syntax,
+`TEST_NGINX_BINARY`; they cannot execute against ONRouter today because they also rely on `*_by_lua_block` config syntax,
 the `echo` directive, and Unix signals. The suite is vendored under `vendor/lua-nginx-module/` (gitignored) as the
 canonical semantics reference for porting more cases.

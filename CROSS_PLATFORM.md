@@ -1,6 +1,6 @@
-# LearnON Cross-Platform Build Guide
+# ONRouter Cross-Platform Build Guide
 
-This guide covers building LearnON for all major operating systems and CPU architectures.
+This guide covers building ONRouter for all major operating systems and CPU architectures.
 
 ## Supported Platforms
 
@@ -111,9 +111,9 @@ cargo build --release --target aarch64-apple-darwin
 
 # Combine into universal binary
 lipo -create \
-  target/x86_64-apple-darwin/release/learnon \
-  target/aarch64-apple-darwin/release/learnon \
-  -output learnon-universal
+  target/x86_64-apple-darwin/release/onrouter \
+  target/aarch64-apple-darwin/release/onrouter \
+  -output onrouter-universal
 ```
 
 ### Windows
@@ -162,7 +162,7 @@ Use our multi-platform Docker builds:
 docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 .
 
 # Run specific architecture
-docker run --platform linux/arm64 yxpil/learnon:latest
+docker run --platform linux/arm64 yxpil/onrouter:latest
 ```
 
 ## GitHub Actions (Automated)
@@ -183,13 +183,13 @@ After building, verify the binary:
 
 ```bash
 # Check file type
-file target/release/learnon
+file target/release/onrouter
 
 # Example output:
-# learnon: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked
+# onrouter: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked
 
 # Check version
-./target/release/learnon --version
+./target/release/onrouter --version
 ```
 
 ## Distribution Packages
@@ -197,26 +197,26 @@ file target/release/learnon
 ### Debian/Ubuntu (.deb)
 ```bash
 # After building
-mkdir -p learnon/usr/local/bin
-cp target/release/learnon learnon/usr/local/bin/
-dpkg-deb --build learnon
+mkdir -p onrouter/usr/local/bin
+cp target/release/onrouter onrouter/usr/local/bin/
+dpkg-deb --build onrouter
 ```
 
 ### RPM (CentOS/Fedora)
 ```bash
-rpmbuild -ba learnon.spec
+rpmbuild -ba onrouter.spec
 ```
 
 ### Homebrew (macOS)
 ```ruby
 # Formula will be available at:
-# brew install yxpil/tap/learnon
+# brew install yxpil/tap/onrouter
 ```
 
 ### Chocolatey (Windows)
 ```powershell
 # Package will be available at:
-# choco install learnon
+# choco install onrouter
 ```
 
 ## Troubleshooting
@@ -272,7 +272,7 @@ cargo build --release -j 1
 ## Support
 
 For platform-specific issues, please open an issue at:
-https://github.com/yxpil/LearnON/issues
+https://github.com/yxpil/ONRouter/issues
 
 Include:
 - Your platform (`uname -a` or `systeminfo`)

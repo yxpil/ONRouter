@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # nginx realip 模块 E2E —— 用真实流量证明 $remote_addr 被真实客户端 IP 覆盖，且 geo 等下游派生变量随之前移。
-#   cargo build --release -p learnon-server --bin learnon && python tools/real_ip_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/real_ip_e2e.py
 #
 #   所有连接都来自 127.0.0.1，用不同端口=不同 server（不同 set_real_ip_from）区分可信/不可信对端。
 import os
@@ -31,11 +31,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -80,7 +80,7 @@ def main():
     try:
         for p in (P_REALIP_TRUSTED, P_REALIP_UNTRUSTED, P_XFF_OFF, P_XFF_ON):
             if not wait_ready(p):
-                raise SystemExit(f"!! learnon 未就绪（端口 {p} 被占用？看 logs/real_ip_e2e_out.log）")
+                raise SystemExit(f"!! onrouter 未就绪（端口 {p} 被占用？看 logs/real_ip_e2e_out.log）")
 
         # 1) 可信对端 + X-Real-IP：改写 + geo 命中改写后 IP 的网段
         st, body = get(P_REALIP_TRUSTED, headers={"X-Real-IP": "203.0.113.9"})

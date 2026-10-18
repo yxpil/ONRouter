@@ -1,13 +1,13 @@
-//! lon-h3check —— 自研 HTTP/3 客户端探针（quinn + h3）。
+//! orr-h3check —— 自研 HTTP/3 客户端探针（quinn + h3）。
 //!
-//! 本机 curl/Node 均不支持 HTTP/3，故用与 LearnON 服务端相同的 h3/quinn 栈做真实流量验证：
+//! 本机 curl/Node 均不支持 HTTP/3，故用与 ONRouter 服务端相同的 h3/quinn 栈做真实流量验证：
 //! 真握手（QUIC over UDP + TLS1.3/ALPN h3）、真收发请求流、真读响应体，而非代码审查。
 //!
-//! 用法：`lon-h3check <ip:port> <sni> <path> <mode> [n]`
+//! 用法：`orr-h3check <ip:port> <sni> <path> <mode> [n]`
 //!   mode=single  -> GET 一次，打印 STATUS= / PROTO= / BODY=
 //!   mode=streams -> 同一连接并发开 n 个请求流，打印 STREAMS=<HTTP 200 的数量>
 //!
-//! 证书：通过环境变量 `LON_H3_CERT`（默认 `certs_scenario/server.pem`）把服务端自签名证书
+//! 证书：通过环境变量 `ORR_H3_CERT`（默认 `certs_scenario/server.pem`）把服务端自签名证书
 //! 作为受信根加载；SAN 必须含 <sni>，否则握手期证书校验失败。
 
 use std::net::SocketAddr;
@@ -32,7 +32,7 @@ fn load_roots(pem_path: &str) -> rustls::RootCertStore {
 fn client_endpoint(sni: &str) -> quinn::Endpoint {
     let _ = sni;
     let cert_env =
-        std::env::var("LON_H3_CERT").unwrap_or_else(|_| "certs_scenario/server.pem".into());
+        std::env::var("ORR_H3_CERT").unwrap_or_else(|_| "certs_scenario/server.pem".into());
     let roots = load_roots(&cert_env);
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -85,7 +85,7 @@ async fn do_request(send_req: &mut SendReq, sni: &str, path: &str) -> Option<(u1
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 4 {
-        eprintln!("用法: lon-h3check <ip:port> <sni> <path> <single|streams> [n]");
+        eprintln!("用法: orr-h3check <ip:port> <sni> <path> <single|streams> [n]");
         std::process::exit(2);
     }
     let addr: SocketAddr = args[0].parse().expect("addr 需为 ip:port");

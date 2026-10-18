@@ -5,12 +5,12 @@
 #  connection get reaped between spaced-out requests, so the backend sees a new TCP
 #  connection every time. The fake backend reports a cumulative connection counter.
 #
-#   cargo build -p learnon-server --bin learnon && bash tools/keepalive_e2e.sh
+#   cargo build -p onrouter-server --bin onrouter && bash tools/keepalive_e2e.sh
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
-if [ -x ./target/debug/learnon.exe ]; then BIN=./target/debug/learnon.exe; else BIN=./target/debug/learnon; fi
-[ -x "$BIN" ] || { echo "!! $BIN missing; run cargo build -p learnon-server --bin learnon"; exit 2; }
+if [ -x ./target/debug/onrouter.exe ]; then BIN=./target/debug/onrouter.exe; else BIN=./target/debug/onrouter; fi
+[ -x "$BIN" ] || { echo "!! $BIN missing; run cargo build -p onrouter-server --bin onrouter"; exit 2; }
 PY=$(command -v python || command -v python3)
 [ -n "$PY" ] || { echo "!! python not found"; exit 2; }
 
@@ -37,13 +37,13 @@ conn_of() { grep -oE '"conn_id":[[:space:]]*[0-9]+' | grep -oE '[0-9]+$'; }
 # total_conns is inflated before the measured window. Reuse shows up as all four
 # requests landing on the SAME backend connection; a reaped pool shows four
 # DIFFERENT connections.
-run_phase() { # name  backend_port  conf  learnon_port  gap  expect_distinct
+run_phase() { # name  backend_port  conf  onrouter_port  gap  expect_distinct
   local name=$1 bp=$2 conf=$3 lp=$4 gap=$5 expect=$6
-  echo "== [$name] backend :$bp  learnon :$lp  conf=$conf  gap=${gap}s =="
+  echo "== [$name] backend :$bp  onrouter :$lp  conf=$conf  gap=${gap}s =="
   start_bg "$PY" tools/keepalive_backend.py "$bp" >/dev/null
   wait_http "http://127.0.0.1:${bp}/" 30 || { bad "$name: backend never came up"; return; }
   start_bg "$BIN" -c "$conf" >/dev/null
-  wait_http "http://127.0.0.1:${lp}/" 40 || { bad "$name: learnon never became ready"; return; }
+  wait_http "http://127.0.0.1:${lp}/" 40 || { bad "$name: onrouter never became ready"; return; }
 
   local ids=""
   for i in 1 2 3 4; do

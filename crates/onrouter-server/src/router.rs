@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use learnon_config::{Config, Directive};
+use onrouter_config::{Config, Directive};
 
 use crate::certs::{CertSpec, TlsOptions, TlsProtocols, TlsVersion};
 use crate::engine::{

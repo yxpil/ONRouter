@@ -162,7 +162,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_frame_round_trips() {
-        let text = "Hello, LearnON! ".repeat(500);
+        let text = "Hello, ONRouter! ".repeat(500);
         let inner = crate::server::full_body(Bytes::from(text.clone()));
         let collected = GzipBody::new(inner, 6).collect().await.unwrap().to_bytes();
         assert_eq!(&collected[..2], &[0x1f, 0x8b], "gzip 魔数");

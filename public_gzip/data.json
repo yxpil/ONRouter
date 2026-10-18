@@ -1,1 +1,1 @@
-{"service":"learnon","feature":"gzip","items":["alpha","beta","gamma","delta","epsilon","zeta","eta","theta","iota","kappa"],"message":"application/json should be compressed when listed in gzip_types"}
+{"service":"onrouter","feature":"gzip","items":["alpha","beta","gamma","delta","epsilon","zeta","eta","theta","iota","kappa"],"message":"application/json should be compressed when listed in gzip_types"}

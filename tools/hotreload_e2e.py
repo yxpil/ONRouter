@@ -10,7 +10,7 @@
 #      随后写入 v3 又能生效 —— 说明坏配置被安全拒绝、旧配置继续服务。
 #   4) pid 文件内容 == 子进程 pid 且服务进程全程存活 —— 说明这是**进程内热替换**，不是重启。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/hotreload_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/hotreload_e2e.py
 import http.client
 import os
 import socket
@@ -34,11 +34,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def emit_conf(body):
@@ -156,7 +156,7 @@ def main():
                 pass
             time.sleep(0.2)
         if not ready:
-            raise SystemExit("!! learnon 未就绪（端口 %d 被占用？看 logs/hotreload_out.log）" % PORT)
+            raise SystemExit("!! onrouter 未就绪（端口 %d 被占用？看 logs/hotreload_out.log）" % PORT)
 
         # 启动持续流量：一条永不重连的长连接 + 每 40ms 新建连接
         t_cont = threading.Thread(target=continuity_thread, args=(stop, clog, cerrors), daemon=True)

@@ -1,23 +1,23 @@
 [package]
-name = "learnon-server"
-description = "LearnON: a gateway server like Nginx, 100% in Rust (reverse proxy, load balancing, rewrite, virtual hosts)"
+name = "onrouter-server"
+description = "ONRouter: a gateway server like Nginx, 100% in Rust (reverse proxy, load balancing, rewrite, virtual hosts)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "learnon"
+name = "onrouter"
 path = "src/main.rs"
 
-# 自签名证书签发工具：cargo run --bin lon-gencert -- cert.pem key.pem
+# 自签名证书签发工具：cargo run --bin orr-gencert -- cert.pem key.pem
 [[bin]]
-name = "lon-gencert"
+name = "orr-gencert"
 path = "src/gencert.rs"
 
 # HTTP/3 客户端探针（自研，因本机 curl/node 无 h3）：
-#   cargo run --bin lon-h3check -- <ip:port> <sni> <path> <mode=single|streams> [n]
+#   cargo run --bin orr-h3check -- <ip:port> <sni> <path> <mode=single|streams> [n]
 [[bin]]
-name = "lon-h3check"
+name = "orr-h3check"
 path = "src/h3check.rs"
 
 [features]
@@ -28,7 +28,7 @@ default = []
 native-tls = ["dep:native-tls", "dep:tokio-native-tls"]
 
 [dependencies]
-learnon-config = { path = "../learnon-config" }
+onrouter-config = { path = "../onrouter-config" }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

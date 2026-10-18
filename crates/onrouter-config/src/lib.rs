@@ -1,4 +1,4 @@
-//! LearnON configuration: Nginx 风格配置的词法器与解析器。
+//! ONRouter configuration: Nginx 风格配置的词法器与解析器。
 //!
 //! 语法示例：
 //! ```text
@@ -48,8 +48,8 @@ pub struct Config {
     pub root: Directive,
 }
 
-/// nginx 完整布局兼容：顶层 http{} 的内容展平到根（LearnON 原生写法没有 http 包装），
-/// events{} 无对应语义直接丢弃。学习/迁移 nginx.conf 时二者可原样喂给 LearnON。
+/// nginx 完整布局兼容：顶层 http{} 的内容展平到根（ONRouter 原生写法没有 http 包装），
+/// events{} 无对应语义直接丢弃。学习/迁移 nginx.conf 时二者可原样喂给 ONRouter。
 fn flatten_nginx_wrapper(block: Vec<Directive>) -> Vec<Directive> {
     let mut out: Vec<Directive> = Vec::with_capacity(block.len());
     for d in block {
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn include_splices_single_file_and_glob() {
         // 建一个临时目录：<tmp>/main.conf + <tmp>/parts/{one,two}.conf + skipped.txt
-        let unique = format!("learnon-include-test-{}-{}", std::process::id(), line!());
+        let unique = format!("onrouter-include-test-{}-{}", std::process::id(), line!());
         let dir = std::env::temp_dir().join(unique);
         let parts = dir.join("parts");
         std::fs::create_dir_all(&parts).unwrap();
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn include_missing_single_file_errors() {
-        let unique = format!("learnon-include-missing-{}", line!());
+        let unique = format!("onrouter-include-missing-{}", line!());
         let dir = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("main.conf"), "include nope.conf;\n").unwrap();

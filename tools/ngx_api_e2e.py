@@ -3,7 +3,7 @@
 #   摘要/CRC 与 RFC1321/RFC2202/CRC32 已知向量逐字节一致；时间格式化/解析往返；
 #   worker/config/get_phase/is_subrequest；req.* 体读写与方法读写与 POST 参数；resp.get_headers。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/ngx_api_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/ngx_api_e2e.py
 import os
 import subprocess
 import sys
@@ -28,11 +28,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def req(path, data=None, method=None):
@@ -72,7 +72,7 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18131 被占用？看 logs/ngx_api_err.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18131 被占用？看 logs/ngx_api_err.log）")
 
         # === 摘要 / CRC（与已知向量逐字节一致）===
         st, body = req("/digest")
@@ -105,7 +105,7 @@ def main():
         check("ngx.worker.id()==0（单进程反应器）", mt.get("wid") == "0", f"wid={mt.get('wid')}")
         check("ngx.worker.count()==1", mt.get("wcount") == "1", f"count={mt.get('wcount')}")
         check("ngx.config.subsystem=='http'", mt.get("subsystem") == "http", f"subsystem={mt.get('subsystem')}")
-        check("ngx.config.server=='LearnON'", mt.get("server") == "LearnON", f"server={mt.get('server')}")
+        check("ngx.config.server=='ONRouter'", mt.get("server") == "ONRouter", f"server={mt.get('server')}")
         check("ngx.config.prefix() 非空", mt.get("prefix_nonempty") == "true", f"prefix={mt.get('prefix_nonempty')}")
 
         # === 阶段 / 子请求 ===

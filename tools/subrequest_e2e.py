@@ -8,7 +8,7 @@
 #   * 自循环触发深度护栏（不死锁、逐级回传）
 #   * 外部直接访问 internal location → 404（仅子请求可穿透 internal）
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/subrequest_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/subrequest_e2e.py
 import os
 import subprocess
 import sys
@@ -32,11 +32,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -65,7 +65,7 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18115 被占用？看 conf/logs/subrequest_err.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18115 被占用？看 conf/logs/subrequest_err.log）")
 
         # 1) 捕获 Lua content 子请求：status/body/header 全对齐
         st, body = get("/cap_lua")

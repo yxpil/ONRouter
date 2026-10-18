@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn builds_config_from_two_certs_and_prefers_exact_then_wildcard() {
-        let dir = std::env::temp_dir().join(format!("learnon-certs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("onrouter-certs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (c1, k1) = write_pair(&dir, &["*.example.com", "example.com"]);
         let (c2, k2) = write_pair(&dir, &["api.other.com"]);
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn chooses_cert_by_sni_with_default_fallback() {
-        let dir = std::env::temp_dir().join(format!("learnon-certs-sni-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("onrouter-certs-sni-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (c1, k1) = write_pair(&dir, &["example.com"]);
         let (c2, k2) = write_pair(&dir, &["*.spec.io"]);
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn server_config_sets_alpn_by_http2_flag() {
-        let dir = std::env::temp_dir().join(format!("learnon-certs-alpn-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("onrouter-certs-alpn-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (c, k) = write_pair(&dir, &["localhost"]);
         let spec = CertSpec {
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn legacy_only_protocols_rejected_by_rustls_backend() {
-        let dir = std::env::temp_dir().join(format!("learnon-certs-legacy-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("onrouter-certs-legacy-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (c, k) = write_pair(&dir, &["localhost"]);
         let err = build_server_config(&TlsOptions {
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn quic_config_pins_tls13_and_alpn_h3() {
-        let dir = std::env::temp_dir().join(format!("learnon-certs-quic-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("onrouter-certs-quic-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (c, k) = write_pair(&dir, &["localhost"]);
         let cfg = build_quic_server_config(&[CertSpec {

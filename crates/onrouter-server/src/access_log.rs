@@ -20,7 +20,7 @@ use crossbeam_channel::{bounded, Sender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use learnon_config::Config;
+use onrouter_config::Config;
 
 use crate::log::FileWriter;
 use crate::router::parse_size;
@@ -185,7 +185,7 @@ impl AccessLog {
                         // 打不开就退回回显：宁可刷屏也不要静默丢掉全部访问日志
                         let _ = writeln!(
                             std::io::stderr(),
-                            "[learnon] access_log 无法写入 {}，改为回显 stdout",
+                            "[onrouter] access_log 无法写入 {}，改为回显 stdout",
                             p.display()
                         );
                         None
@@ -202,7 +202,7 @@ impl AccessLog {
         if let Some(f) = file {
             let d2 = Arc::clone(&dropped);
             worker = std::thread::Builder::new()
-                .name("learnon-access-log".into())
+                .name("onrouter-access-log".into())
                 .spawn(move || {
                     let mut writer = f;
                     let mut reported = 0u64;
@@ -220,7 +220,7 @@ impl AccessLog {
                             reported = d;
                             let _ = writeln!(
                                 std::io::stderr(),
-                                "[learnon] access_log 队列已满，累计丢弃 {d} 条"
+                                "[onrouter] access_log 队列已满，累计丢弃 {d} 条"
                             );
                         }
                         let mut shutdown = false;

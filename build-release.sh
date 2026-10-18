@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# LearnON Cross-Platform Build Script
+# ONRouter Cross-Platform Build Script
 # Supports: Linux, macOS, Windows, ARM, RISC-V
 
 COLOR_GREEN='\033[0;32m'
@@ -68,16 +68,16 @@ build_target() {
     mkdir -p "$output_dir"
     
     # Build binaries
-    cargo build --release --target "$target" --bin learnon
-    cargo build --release --target "$target" --bin lon-gencert
+    cargo build --release --target "$target" --bin onrouter
+    cargo build --release --target "$target" --bin orr-gencert
     
     # Copy binaries to output directory
     if [[ "$target" == *"-windows-"* ]]; then
-        cp "target/$target/release/learnon.exe" "$output_dir/" 2>/dev/null || true
-        cp "target/$target/release/lon-gencert.exe" "$output_dir/" 2>/dev/null || true
+        cp "target/$target/release/onrouter.exe" "$output_dir/" 2>/dev/null || true
+        cp "target/$target/release/orr-gencert.exe" "$output_dir/" 2>/dev/null || true
     else
-        cp "target/$target/release/learnon" "$output_dir/" 2>/dev/null || true
-        cp "target/$target/release/lon-gencert" "$output_dir/" 2>/dev/null || true
+        cp "target/$target/release/onrouter" "$output_dir/" 2>/dev/null || true
+        cp "target/$target/release/orr-gencert" "$output_dir/" 2>/dev/null || true
     fi
     
     log_success "Built for $target"
@@ -87,7 +87,7 @@ build_target() {
 create_archive() {
     local target=$1
     local output_dir="$BUILD_DIR/$target"
-    local archive_name="learnon-${VERSION}-${target}"
+    local archive_name="onrouter-${VERSION}-${target}"
     
     log_info "Creating archive for $target..."
     
@@ -97,7 +97,7 @@ create_archive() {
         # Windows: ZIP format
         if command -v zip &> /dev/null; then
             cd "$output_dir"
-            zip "../../archives/${archive_name}.zip" learnon.exe lon-gencert.exe 2>/dev/null || \
+            zip "../../archives/${archive_name}.zip" onrouter.exe orr-gencert.exe 2>/dev/null || \
             zip "../../archives/${archive_name}.zip" *.exe
             cd - > /dev/null
         else
@@ -133,7 +133,7 @@ clean() {
 # Show build matrix
 show_matrix() {
     echo ""
-    echo "=== LearnON Build Matrix ==="
+    echo "=== ONRouter Build Matrix ==="
     echo ""
     echo "Operating Systems:"
     echo "  ✓ Linux (x86_64, aarch64, armv7, riscv64)"

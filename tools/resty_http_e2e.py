@@ -3,7 +3,7 @@
 # 用真实流量证明 GET/HEAD/POST、Content-Length 与 chunked 体解析、204、自定义头、query 编码、
 # keepalive 连接池复用、以及错误路径全部可用。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/resty_http_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/resty_http_e2e.py
 import os
 import subprocess
 import sys
@@ -31,11 +31,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def get(path):
@@ -130,7 +130,7 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18145 被占用？看 logs/resty_http_err.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18145 被占用？看 logs/resty_http_err.log）")
 
         st, body = get("/get_plain")
         b = kv(body)

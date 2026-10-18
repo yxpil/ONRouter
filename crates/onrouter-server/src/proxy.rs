@@ -260,7 +260,7 @@ impl ProxyEngine {
             headers.insert(name, HeaderValue::try_from(val).map_err(|e| e.to_string())?);
         }
         if !headers.contains_key(HOST) {
-            // nginx 默认把 Host 改写成后端主机名；LearnON 保留客户端 Host（后端虚拟主机更常用），
+            // nginx 默认把 Host 改写成后端主机名；ONRouter 保留客户端 Host（后端虚拟主机更常用），
             // 需要 nginx 行为时显式写 `proxy_set_header Host <后端名>;`
             if let Some(h) = &ctx.host {
                 headers.insert(HOST, HeaderValue::try_from(h.as_str()).unwrap());

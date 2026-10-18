@@ -2,7 +2,7 @@
 # log_by_lua E2E —— 用真实流量证明响应成形后 LOG 阶段会运行，能读到最终 ngx.status
 # （含 5xx）与请求信息，并写入共享字典跨请求累计；同时证明 LOG 阶段不会回灌/篡改已发送响应。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/log_by_lua_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/log_by_lua_e2e.py
 import os
 import subprocess
 import sys
@@ -26,11 +26,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def get(path, timeout=8):
@@ -65,7 +65,7 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18109 被占用？看 logs/lua_log_err.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18109 被占用？看 logs/lua_log_err.log）")
 
         get("/reset")
 

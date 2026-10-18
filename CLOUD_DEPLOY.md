@@ -1,6 +1,6 @@
-# LearnON Cloud Deployment Guide
+# ONRouter Cloud Deployment Guide
 
-This guide covers deploying LearnON Gateway to various cloud platforms.
+This guide covers deploying ONRouter Gateway to various cloud platforms.
 
 ## Table of Contents
 - [Docker](#docker)
@@ -14,18 +14,18 @@ This guide covers deploying LearnON Gateway to various cloud platforms.
 
 ### Build Image
 ```bash
-docker build -t yxpil/learnon:latest .
+docker build -t yxpil/onrouter:latest .
 ```
 
 ### Run Container
 ```bash
 docker run -d \
-  --name learnon-gateway \
+  --name onrouter-gateway \
   -p 80:80 \
   -p 443:443 \
   -v $(pwd)/conf:/app/conf:ro \
   -v $(pwd)/certs:/app/certs:ro \
-  yxpil/learnon:latest
+  yxpil/onrouter:latest
 ```
 
 ## Docker Compose
@@ -39,14 +39,14 @@ docker run -d \
 docker-compose up -d
 
 # View logs
-docker-compose logs -f learnon
+docker-compose logs -f onrouter
 
 # Stop
 docker-compose down
 ```
 
 ### Configuration
-Edit `conf/learnon.conf` before deployment. See `conf/learnon.conf.example` for reference.
+Edit `conf/onrouter.conf` before deployment. See `conf/onrouter.conf.example` for reference.
 
 ## Kubernetes
 
@@ -56,27 +56,27 @@ Edit `conf/learnon.conf` before deployment. See `conf/learnon.conf.example` for 
 kubectl apply -f kubernetes/deployment.yaml
 
 # Check status
-kubectl get pods -l app=learnon
-kubectl get svc learnon-gateway
+kubectl get pods -l app=onrouter
+kubectl get svc onrouter-gateway
 
 # View logs
-kubectl logs -f deployment/learnon-gateway
+kubectl logs -f deployment/onrouter-gateway
 ```
 
 ### Scale
 ```bash
-kubectl scale deployment learnon-gateway --replicas=5
+kubectl scale deployment onrouter-gateway --replicas=5
 ```
 
 ### Update
 ```bash
-kubectl set image deployment/learnon-gateway learnon=yxpil/learnon:latest
-kubectl rollout status deployment/learnon-gateway
+kubectl set image deployment/onrouter-gateway onrouter=yxpil/onrouter:latest
+kubectl rollout status deployment/onrouter-gateway
 ```
 
 ### Rollback
 ```bash
-kubectl rollout undo deployment/learnon-gateway
+kubectl rollout undo deployment/onrouter-gateway
 ```
 
 ## AWS
@@ -86,8 +86,8 @@ kubectl rollout undo deployment/learnon-gateway
 1. Push image to ECR:
 ```bash
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
-docker tag yxpil/learnon:latest <account>.dkr.ecr.us-east-1.amazonaws.com/learnon:latest
-docker push <account>.dkr.ecr.us-east-1.amazonaws.com/learnon:latest
+docker tag yxpil/onrouter:latest <account>.dkr.ecr.us-east-1.amazonaws.com/onrouter:latest
+docker push <account>.dkr.ecr.us-east-1.amazonaws.com/onrouter:latest
 ```
 
 2. Create task definition and service using AWS Console or CLI
@@ -114,9 +114,9 @@ kubectl apply -f kubernetes/deployment.yaml
 ```bash
 az container create \
   --resource-group myResourceGroup \
-  --name learnon-gateway \
-  --image yxpil/learnon:latest \
-  --dns-name-label learnon-gateway \
+  --name onrouter-gateway \
+  --image yxpil/onrouter:latest \
+  --dns-name-label onrouter-gateway \
   --ports 80 443
 ```
 
@@ -126,7 +126,7 @@ az container create \
 
 1. Connect to cluster:
 ```bash
-gcloud container clusters get-credentials learnon-cluster --zone us-central1-a
+gcloud container clusters get-credentials onrouter-cluster --zone us-central1-a
 ```
 
 2. Deploy:
@@ -136,8 +136,8 @@ kubectl apply -f kubernetes/deployment.yaml
 
 ### Cloud Run
 ```bash
-gcloud run deploy learnon-gateway \
-  --image yxpil/learnon:latest \
+gcloud run deploy onrouter-gateway \
+  --image yxpil/onrouter:latest \
   --platform managed \
   --port 80 \
   --allow-unauthenticated
@@ -146,7 +146,7 @@ gcloud run deploy learnon-gateway \
 ## Monitoring
 
 ### Prometheus Metrics
-LearnON exposes metrics at `/metrics` endpoint. Configure your monitoring solution to scrape this endpoint.
+ONRouter exposes metrics at `/metrics` endpoint. Configure your monitoring solution to scrape this endpoint.
 
 ### Health Checks
 - HTTP health check: `GET /health`
@@ -163,7 +163,7 @@ Configure log rotation in production environments.
 
 1. **TLS Certificates**: Mount certificates securely
    ```bash
-   kubectl create secret tls learnon-certs --cert=cert.pem --key=key.pem
+   kubectl create secret tls onrouter-certs --cert=cert.pem --key=key.pem
    ```
 
 2. **Non-root User**: The container runs as non-root user by default
@@ -178,12 +178,12 @@ Configure log rotation in production environments.
 
 ### Container won't start
 ```bash
-docker logs learnon-gateway
+docker logs onrouter-gateway
 ```
 
 ### Check configuration syntax
 ```bash
-docker run --rm -v $(pwd)/conf:/app/conf:ro yxpil/learnon:latest -t
+docker run --rm -v $(pwd)/conf:/app/conf:ro yxpil/onrouter:latest -t
 ```
 
 ### Kubernetes pod issues
@@ -195,4 +195,4 @@ kubectl logs <pod-name>
 ## Support
 
 For issues and feature requests, please visit:
-https://github.com/yxpil/LearnON/issues
+https://github.com/yxpil/ONRouter/issues

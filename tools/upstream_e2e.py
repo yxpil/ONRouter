@@ -5,7 +5,7 @@
 #   * 后端返 503：透传给客户端，且 $upstream_status 记录 503（对照 nginx）；
 #   * 慢后端睡 0.6s：$upstream_header_time ≥ ~0.55，证明记录的是真实后端往返而非零。
 #
-#   cargo build --release -p learnon-server --bin learnon && python tools/upstream_e2e.py
+#   cargo build --release -p onrouter-server --bin onrouter && python tools/upstream_e2e.py
 import os
 import re
 import subprocess
@@ -33,11 +33,11 @@ def check(name, ok, detail=""):
 
 def find_binary():
     for profile in ("release", "debug"):
-        for name in ("learnon.exe", "learnon"):
+        for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
             if os.path.exists(p):
                 return p
-    raise SystemExit("!! build first: cargo build --release -p learnon-server --bin learnon")
+    raise SystemExit("!! build first: cargo build --release -p onrouter-server --bin onrouter")
 
 
 def req(path, headers=None):
@@ -117,7 +117,7 @@ def main():
                 pass
             time.sleep(0.2)
         else:
-            raise SystemExit("!! learnon 未就绪（端口 18156 被占用？看 logs/upstream_e2e_err.log）")
+            raise SystemExit("!! onrouter 未就绪（端口 18156 被占用？看 logs/upstream_e2e_err.log）")
 
         check("/ping pong", req("/ping")[1].strip() == "pong")
 
