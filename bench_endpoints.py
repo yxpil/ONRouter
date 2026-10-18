@@ -4,7 +4,7 @@ import subprocess, sys, time, os, threading
 import socket
 import http.client
 
-RUST = r"C:\Users\User\Desktop\LearnON\rust"
+RUST = os.path.dirname(os.path.abspath(__file__))
 PORT = 8080
 
 BACKEND_SRC = """

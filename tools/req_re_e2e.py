@@ -106,6 +106,8 @@ def main():
         check("/re gsub 全替→'a_b_c/2'", d.get("gsub") == "a_b_c/2", f"got {d.get('gsub')!r}")
         check("/re 回调替换→'x[1]y[2]/2'", d.get("cb") == "x[1]y[2]/2", f"got {d.get('cb')!r}")
         check("/re opt 句柄复用→'*1*/2'", d.get("opt") == "*1*/2", f"got {d.get('opt')!r}")
+        check("/re match cap[0] 为整体匹配", d.get("match") == "abc-123/abc/123", f"got {d.get('match')!r}")
+        check("/re find 返回 1-based 起止", d.get("find") == "4,5", f"got {d.get('find')!r}")
 
         # ---- ngx.req.get_headers 读回改写 ----
         st, body = get("/hdr", headers={"User-Agent": "curl/probe"})

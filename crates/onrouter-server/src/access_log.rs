@@ -1,8 +1,9 @@
-//! access_log：Nginx combined 格式 + `$request_time`。
+//! access_log：Nginx combined 格式 + `$request_time` + `$upstream_addr`/`$upstream_status`/
+//! `$upstream_header_time`。
 //!
 //! ```text
 //! $remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent
-//!  "$http_referer" "$http_user_agent" $request_time
+//!  "$http_referer" "$http_user_agent" $request_time "$upstream_addr" $upstream_status $upstream_header_time
 //! ```
 //!
 //! 工程要点（对照 nginx 的差异都写在注释里）：
@@ -49,10 +50,21 @@ pub struct AccessLog {
 
 static INSTANCE: OnceLock<Arc<AccessLog>> = OnceLock::new();
 
+/// 本请求最终命中的上游（换节点重试后为最后一次尝试）。
+struct UpstreamLog {
+    addr: String,
+    status: u16,
+    header_time: f64,
+}
+
 /// 一条请求的记账信息；响应体结束时通过 `emit` 落日志
 pub struct LogRecord {
     pub started: Instant,
-    pub remote: String,
+    /// realip 在请求入口之后才改写客户端地址，日志要记录改写后的 `$remote_addr`，
+    /// 故此处用可写单元格而非只读 String（请求内先被读取用于初始化 ctx）。
+    remote: std::sync::RwLock<String>,
+    /// 处理结束前回填一次；之后 emit 只读，用 OnceLock 免掉每请求的锁开销。
+    upstream: OnceLock<UpstreamLog>,
     pub method: String,
     pub uri: String,
     pub proto: String,
@@ -76,7 +88,8 @@ impl LogRecord {
     ) -> Arc<Self> {
         Arc::new(LogRecord {
             started: Instant::now(),
-            remote,
+            remote: std::sync::RwLock::new(remote),
+            upstream: OnceLock::new(),
             method,
             uri,
             proto,
@@ -87,6 +100,31 @@ impl LogRecord {
             wrapped: AtomicBool::new(false),
             emitted: AtomicBool::new(false),
         })
+    }
+
+    /// 当前记录的客户端地址（realip 改写后为真实客户端 IP）
+    pub fn remote(&self) -> String {
+        self.remote
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// realip 生效后同步访问日志的 `$remote_addr`。
+    pub fn set_remote(&self, remote: String) {
+        *self.remote.write().unwrap_or_else(|p| p.into_inner()) = remote;
+    }
+
+    /// 记录本请求最终命中的上游；无上游（静态文件/缓存命中）时保持未设置。
+    pub fn set_upstream(&self, addr: String, status: u16, header_time: f64) {
+        if addr.is_empty() {
+            return;
+        }
+        let _ = self.upstream.set(UpstreamLog {
+            addr,
+            status,
+            header_time,
+        });
     }
 
     pub fn set_status(&self, status: u16) {
@@ -111,6 +149,11 @@ impl LogRecord {
         if self.emitted.swap(true, Ordering::AcqRel) {
             return;
         }
+        log.write(self.line());
+    }
+
+    /// 组装一行 combined + request_time + upstream 三元组。
+    fn line(&self) -> String {
         // 状态码为 0 说明响应还没生成就断了：nginx 用 499 记这类客户端提前关闭
         let status = match self.status.load(Ordering::Relaxed) {
             0 => 499,
@@ -118,9 +161,18 @@ impl LogRecord {
         };
         let secs = self.started.elapsed().as_secs_f64();
         let time = chrono::Local::now().format("%d/%b/%Y:%H:%M:%S %z");
-        let line = format!(
-            "{} - - [{}] \"{} {} {}\" {} {} \"{}\" \"{}\" {:.3}",
-            field(&self.remote),
+        let (up_addr, up_status, up_time) = match self.upstream.get() {
+            Some(u) if u.status != 0 => (
+                format!("\"{}\"", field(&u.addr)),
+                u.status.to_string(),
+                format!("{:.3}", u.header_time),
+            ),
+            Some(u) => (format!("\"{}\"", field(&u.addr)), "-".to_string(), "-".to_string()),
+            None => ("-".to_string(), "-".to_string(), "-".to_string()),
+        };
+        format!(
+            "{} - - [{}] \"{} {} {}\" {} {} \"{}\" \"{}\" {:.3} {} {} {}",
+            field(&self.remote()),
             time,
             field(&self.method),
             field(&self.uri),
@@ -129,9 +181,11 @@ impl LogRecord {
             self.bytes_sent(),
             field(&self.referer),
             field(&self.user_agent),
-            secs
-        );
-        log.write(line);
+            secs,
+            up_addr,
+            up_status,
+            up_time
+        )
     }
 }
 
@@ -268,6 +322,7 @@ impl AccessLog {
         if let Some(tx) = &self.tx {
             if let Err(TrySendError::Full(_)) = tx.try_send(Cmd::Line(line)) {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
+                crate::metrics::get().on_access_log_dropped();
             }
         }
     }
@@ -350,8 +405,32 @@ mod tests {
         );
         rec.add_bytes(1234);
         assert_eq!(rec.bytes_sent(), 1234);
+        rec.set_upstream("127.0.0.1:9000".into(), 200, 0.012);
+        let line = rec.line();
+        assert!(line.contains("\"127.0.0.1:9000\" 200 0.012"), "{line}");
         rec.emit(&log);
         rec.emit(&log); // 第二次必须被吞掉
         assert!(!rec.mark_wrapped(), "首次 mark 应返回 false");
+    }
+
+    #[test]
+    fn line_marks_missing_upstream_with_dashes() {
+        let log = AccessLog {
+            tx: None,
+            worker: Mutex::new(None),
+            dropped: Arc::new(AtomicU64::new(0)),
+            echo: false,
+        };
+        let rec = log.record(
+            "1.2.3.4".into(),
+            "GET".into(),
+            "/static.css".into(),
+            "HTTP/1.1".into(),
+            "-".into(),
+            "curl".into(),
+        );
+        rec.set_status(200);
+        let line = rec.line();
+        assert!(line.ends_with(" - - -"), "无上游时末尾应为三个占位符: {line}");
     }
 }

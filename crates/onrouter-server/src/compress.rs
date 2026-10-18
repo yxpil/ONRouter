@@ -39,8 +39,8 @@ pub fn accepts_gzip(header: &str) -> bool {
 ///
 /// 采用 `GzEncoder<Vec<u8>>`：每帧 `write_all`+`flush` 后把累加的压缩字节 `take`
 /// 出来作为一帧下发；内层耗尽时 `try_finish` 追加 gzip 尾（CRC32 + ISIZE）。
-/// Vec 作为 sink 的写入不可能失败，故压缩路径自身不产生 `hyper::Error`——
-/// 只有内层体的错误会原样透传（`hyper::Error` 无公开构造器，无法新建）。
+/// Vec 作为 sink 的写入不可能失败，故压缩路径自身不产生错误——
+/// 只有内层体的错误会原样透传（`RespBody` 的错误类型是盒装错误）。
 pub struct GzipBody {
     inner: RespBody,
     enc: GzEncoder<Vec<u8>>,
@@ -60,7 +60,7 @@ impl GzipBody {
 
 impl Body for GzipBody {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = crate::proxy::BoxError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -128,12 +128,12 @@ mod tests {
         out
     }
 
-    /// 测试用：把一组 Bytes 逐帧下发的响应体（Error 与 RespBody 一致 = hyper::Error）。
+    /// 测试用：把一组 Bytes 逐帧下发的响应体（Error 与 RespBody 一致 = BoxError）。
     struct Chunks(VecDeque<Bytes>);
 
     impl Body for Chunks {
         type Data = Bytes;
-        type Error = hyper::Error;
+        type Error = crate::proxy::BoxError;
 
         fn poll_frame(
             mut self: Pin<&mut Self>,

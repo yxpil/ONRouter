@@ -3,10 +3,14 @@
 #   * proxy_pass 指向一个"死" upstream(18999)，无 balancer 时必然 502（对照组 /dead）；
 #   * balancer_by_lua 用 set_current_peer 把连接改到真实后端，按查询串/请求头分流到 A/B；
 #   * set_timeouts 覆盖读超时：慢后端睡 3s，但读超时压到 400ms → ~0.4s 内 502；
+#   * set_timeouts 覆盖写超时：sink 不收请求体，8MB 在 300ms 内写不动 → 快速 502；
+#   * Upgrade + balancer：WebSocket 101 与隧道回显只经 set_current_peer 指定的后端；
 #   * 服务发现风格轮转：共享字典计数器在 A/B 间均分真实请求。
 #
 #   cargo build --release -p onrouter-server --bin onrouter && python tools/balancer_e2e.py
 import os
+import socket
+import socketserver
 import subprocess
 import sys
 import threading
@@ -23,6 +27,8 @@ BASE = f"http://{HOST}:{PORT}"
 
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 results = []
+sink_hits = [0]
+ws_hits = [0]
 
 
 def check(name, ok, detail=""):
@@ -49,7 +55,47 @@ def get(path, headers=None):
         return e.code, e.read().decode(errors="replace"), time.time() - t0
 
 
-# ------------------- 三个真实后端 -------------------
+def post(path, data, timeout=20):
+    r = urllib.request.Request(BASE + path, data=data, method="POST")
+    t0 = time.time()
+    try:
+        resp = _opener.open(r, timeout=timeout)
+        return resp.status, resp.read().decode(errors="replace"), time.time() - t0
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace"), time.time() - t0
+    except Exception as e:
+        return None, repr(e), time.time() - t0
+
+
+def ws_probe():
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    req = (
+        b"GET /ws HTTP/1.1\r\nHost: balancer.local\r\nUpgrade: websocket\r\n"
+        b"Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        b"Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    s.sendall(req)
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        resp += chunk
+    if not resp.startswith(b"HTTP/1.1 101"):
+        s.close()
+        return resp.split(b"\r\n", 1)[0], b""
+    s.sendall(b"hello-ws")
+    echo = b""
+    while len(echo) < 8:
+        chunk = s.recv(64)
+        if not chunk:
+            break
+        echo += chunk
+    s.close()
+    return resp.split(b"\r\n", 1)[0], echo
+
+
+# ------------------- 真实后端 -------------------
 def make_backend(tag, port, sleep=0.0):
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -70,11 +116,50 @@ def make_backend(tag, port, sleep=0.0):
     return srv
 
 
+class SinkHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def do_POST(self):
+        sink_hits[0] += 1
+        time.sleep(30)
+
+    def log_message(self, *a):
+        pass
+
+
+class WsHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = self.request.recv(4096)
+            if not chunk:
+                return
+            data += chunk
+        ws_hits[0] += 1
+        self.request.sendall(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        )
+        while True:
+            chunk = self.request.recv(4096)
+            if not chunk:
+                return
+            self.request.sendall(chunk)
+
+
+class WsServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 def main():
     os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
     a = make_backend("A", 18151)
     b = make_backend("B", 18152)
     slow = make_backend("SLOW", 18153, sleep=3.0)
+    sink = ThreadingHTTPServer(("127.0.0.1", 18154), SinkHandler)
+    threading.Thread(target=sink.serve_forever, daemon=True).start()
+    ws = WsServer(("127.0.0.1", 18155), WsHandler)
+    threading.Thread(target=ws.serve_forever, daemon=True).start()
 
     exe = find_binary()
     logf = open(os.path.join(ROOT, "logs", "balancer_out.log"), "wb")
@@ -116,6 +201,18 @@ def main():
         check("/to 502(read timeout)", st == 502, f"st={st}")
         check("/to 挂钟≈400ms(<1.2s)证明 set_timeouts 生效", el < 1.2, f"elapsed={el:.2f}s")
 
+        # set_timeouts 覆盖写超时：sink 只收头部不收 body，8MB 写 300ms 后断开
+        st, body, el = post("/to-send", b"x" * (8 * 1024 * 1024))
+        check("/to-send 502(send timeout)", st == 502, f"st={st} body={body!r}")
+        check("/to-send 快速失败(<1.5s)证明 set_timeouts 写超时生效", el < 1.5, f"elapsed={el:.2f}s")
+        check("/to-send 确实到达 sink", sink_hits[0] == 1, f"hits={sink_hits[0]}")
+
+        # Upgrade + balancer：deadpool 是死端口，101/回显成功只能来自 set_current_peer
+        status_line, echo = ws_probe()
+        check("/ws Upgrade→101（balancer 在 Upgrade 阶段生效）", b" 101 " in status_line, f"line={status_line!r}")
+        check("/ws 隧道双向回显", echo == b"hello-ws", f"echo={echo!r}")
+        check("/ws 只命中 balancer 指定后端", ws_hits[0] == 1, f"hits={ws_hits[0]}")
+
         # 服务发现轮转：10 次请求应在 A/B 间精确均分（顺序请求，计数器 1..10 奇偶各半）
         ca = cb = 0
         for _ in range(10):
@@ -134,7 +231,7 @@ def main():
         except subprocess.TimeoutExpired:
             proc.kill()
         logf.close()
-        for s in (a, b, slow):
+        for s in (a, b, slow, sink, ws):
             s.shutdown()
 
     passed = sum(1 for _, ok in results if ok)

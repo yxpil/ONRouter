@@ -20,11 +20,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use bytes::Bytes;
 use mlua::prelude::*;
-use mlua::{AnyUserData, RegistryKey, Thread, ThreadStatus, Variadic};
+use mlua::{AnyUserData, Function, RegistryKey, Thread, ThreadStatus, Variadic};
 use std::pin::Pin;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -38,12 +39,159 @@ use crate::engine::RequestCtx;
 use crate::shared_dict::SharedDicts;
 use crate::{resolve_path, AppError};
 
+/// 进程级退出标志：收到 SIGTERM/SIGINT（或 Windows Ctrl-C）后置位，
+/// 供 `ngx.worker.exiting()` 在脚本里感知优雅停机。
+static WORKER_EXITING: AtomicBool = AtomicBool::new(false);
+
+/// 信号处理器调用：标记 worker 进入退出流程
+pub fn mark_worker_exiting() {
+    WORKER_EXITING.store(true, Ordering::SeqCst);
+}
+
+/// 进程是否正在退出
+pub fn worker_exiting() -> bool {
+    WORKER_EXITING.load(Ordering::SeqCst)
+}
+
 /// 请求句柄 userdata：Lua 里所有 ngx.* 都通过它操作当前请求
 #[derive(Clone)]
 struct CtxHandle(Arc<Mutex<RequestCtx>>);
 
 
 impl LuaUserData for CtxHandle {}
+
+/// ngx.req.socket() 返回的请求体读取器。请求体在进入内容阶段前已整体缓冲，
+/// 这里是对内存缓冲的顺序读取；游标由 socket 对象与 receiveuntil 迭代器共享。
+struct ReqSocket {
+    cursor: Arc<Mutex<ReqSocketCursor>>,
+}
+
+#[derive(Default)]
+struct ReqSocketCursor {
+    pos: usize,
+    closed: bool,
+}
+
+/// 从当前协程的 registry 里取请求 ctx（与 install_api 内的 get_ctx 同源）。
+fn current_ctx(lua: &Lua) -> LuaResult<Arc<Mutex<RequestCtx>>> {
+    let ud: AnyUserData = lua.named_registry_value("__ctx")?;
+    let h = ud.borrow::<CtxHandle>()?;
+    Ok(Arc::clone(&h.0))
+}
+
+/// ngx.ssl.parse_pem_cert 的返回值：一条或多条 DER 证书（链）
+struct SslCertChain(Vec<Vec<u8>>);
+
+impl LuaUserData for SslCertChain {}
+
+/// ngx.ssl.parse_pem_priv_key 的返回值：DER 私钥（格式由 set_cert_and_key 时探测）
+struct SslPrivKey(Vec<u8>);
+
+impl LuaUserData for SslPrivKey {}
+
+fn ssl_cert_from_value(v: &LuaValue) -> Result<Vec<Vec<u8>>, String> {
+    match v {
+        LuaValue::String(s) => Ok(vec![s.as_bytes().to_vec()]),
+        LuaValue::UserData(u) => u
+            .borrow::<SslCertChain>()
+            .map(|c| c.0.clone())
+            .map_err(|e| format!("证书参数不是 parse_pem_cert() 的返回值: {e}")),
+        _ => Err("证书必须是 DER 字符串或 parse_pem_cert() 的返回值".to_string()),
+    }
+}
+
+fn ssl_key_from_value(v: &LuaValue) -> Result<Vec<u8>, String> {
+    match v {
+        LuaValue::String(s) => Ok(s.as_bytes().to_vec()),
+        LuaValue::UserData(u) => u
+            .borrow::<SslPrivKey>()
+            .map(|k| k.0.clone())
+            .map_err(|e| format!("私钥参数不是 parse_pem_priv_key() 的返回值: {e}")),
+        _ => Err("私钥必须是 DER 字符串或 parse_pem_priv_key() 的返回值".to_string()),
+    }
+}
+
+impl LuaUserData for ReqSocket {
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        // receive([size]) -> data | nil, err。读到体尾返回 nil, "closed"（对齐 OpenResty）。
+        methods.add_method("receive", |lua, this, size: Option<usize>| {
+            let shared = current_ctx(lua)?;
+            let ctx = shared.lock().unwrap();
+            let mut cur = this.cursor.lock().unwrap();
+            if cur.closed || cur.pos >= ctx.req_body.len() {
+                return Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string("closed")?),
+                ));
+            }
+            let remaining = ctx.req_body.len() - cur.pos;
+            let n = size.unwrap_or(remaining).min(remaining);
+            let data = lua.create_string(&ctx.req_body[cur.pos..cur.pos + n])?;
+            cur.pos += n;
+            Ok((LuaValue::String(data), LuaValue::Nil))
+        });
+
+        // receiveuntil(delim [, opts]) -> iterator；opts.inclusive=false 时丢弃分隔符。
+        // 分隔符在体尾之前找不到时消费剩余数据并返回 nil, "closed"。
+        methods.add_method(
+            "receiveuntil",
+            |lua, this, (delim, opts): (LuaString, Option<LuaTable>)| {
+                let delim = delim.as_bytes().to_vec();
+                if delim.is_empty() {
+                    return Err(mlua::Error::external(
+                        "receiveuntil: delimiter must not be empty",
+                    ));
+                }
+                let inclusive = opts
+                    .as_ref()
+                    .and_then(|t| t.get::<Option<bool>>("inclusive").ok().flatten())
+                    .unwrap_or(true);
+                let cursor = Arc::clone(&this.cursor);
+                let iter = lua.create_function(move |lua, ()| {
+                    let shared = current_ctx(lua)?;
+                    let ctx = shared.lock().unwrap();
+                    let mut cur = cursor.lock().unwrap();
+                    if cur.closed || cur.pos >= ctx.req_body.len() {
+                        return Ok((
+                            LuaValue::Nil,
+                            LuaValue::String(lua.create_string("closed")?),
+                        ));
+                    }
+                    let rest = &ctx.req_body[cur.pos..];
+                    match find_subslice(rest, &delim) {
+                        Some(idx) => {
+                            let end = cur.pos + idx + delim.len();
+                            let data_end = if inclusive { end } else { cur.pos + idx };
+                            let chunk = lua.create_string(&ctx.req_body[cur.pos..data_end])?;
+                            cur.pos = end;
+                            Ok((LuaValue::String(chunk), LuaValue::Nil))
+                        }
+                        None => {
+                            cur.pos = ctx.req_body.len();
+                            Ok((
+                                LuaValue::Nil,
+                                LuaValue::String(lua.create_string("closed")?),
+                            ))
+                        }
+                    }
+                })?;
+                Ok(iter)
+            },
+        );
+
+        // 请求体已在内存，超时设置无实际作用；保留接口以兼容现有脚本。
+        methods.add_method("settimeout", |_, _, _ms: u64| Ok(()));
+        methods.add_method(
+            "settimeouts",
+            |_, _, (_c, _s, _r): (Option<u64>, Option<u64>, Option<u64>)| Ok(()),
+        );
+        methods.add_method("close", |_, this, ()| {
+            this.cursor.lock().unwrap().closed = true;
+            Ok(1)
+        });
+        methods.add_method("getreusedtimes", |_, _, ()| Ok(0i64));
+    }
+}
 
 /// 阶段脚本来源：内联代码（content_by_lua "code"）或文件（content_by_lua_file "path"）
 #[derive(Debug, Clone)]
@@ -52,18 +200,22 @@ pub enum LuaSource {
     File(PathBuf),
 }
 
-/// Lua 脚本文件全局缓存：文件内容只在首次请求时读盘，后续通过 mtime 检测变更自动失效
-#[derive(Clone)]
+/// Lua 脚本文件全局缓存：内容只在首次请求时读盘，此后请求路径**零 syscall**；
+/// 失效完全交给后台定期自检（main.rs 的 reload 任务调用 recheck_cached_files）。
 struct CachedLua {
     content: Arc<str>,
     mtime: std::time::SystemTime,
 }
 
+/// 后台自检的节拍：每 1 秒 stat 一遍已缓存的 .lua，mtime 变了才重读并换掉内容。
+/// 与主配置自己的 `reload <interval>;` 轮询解耦：.lua 自检常开，编辑后最多 1 秒生效。
+pub const LUA_FILE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 static FILE_CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<PathBuf, CachedLua>>> =
     std::sync::OnceLock::new();
 
 // ngx.re 的进程级正则缓存（对齐 ngx.re 的 o/预编译缓存语义）：opt() 把编译结果存入，
-// 返回一个 __lon_re 句柄；match 家族可用句柄复用，避免热路径反复编译。
+// 返回一个 __orr_re 句柄；match 家族可用句柄复用，避免热路径反复编译。
 static RE_CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<regex::Regex>>> =
     std::sync::OnceLock::new();
 
@@ -84,41 +236,130 @@ fn regex_to_cache(r: regex::Regex) -> usize {
     c.len() - 1
 }
 
-fn load_file_cached(p: &PathBuf) -> Result<Arc<str>, AppError> {
-    let cache = FILE_CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
-    
-    // 检查缓存并验证 mtime
+/// 不带 opt() 句柄的 ngx.re 调用的透明编译缓存：pattern -> 按 i/s/m 标志位分槽。
+/// OpenResty 的 `o` 是显式缓存；这里对反复出现的同一模式也缓存（限量、溢出整表清空），
+/// 避免热路径每个请求重新编译正则。命中路径只做一次 HashMap 借用查询，不再分配 pattern。
+static RE_COMPILED: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, [Option<regex::Regex>; 8]>>,
+> = std::sync::OnceLock::new();
+const RE_COMPILED_MAX: usize = 256;
+
+fn re_compiled() -> &'static std::sync::Mutex<HashMap<String, [Option<regex::Regex>; 8]>> {
+    RE_COMPILED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn re_flag_bits(flags: Option<&str>) -> usize {
+    let mut bits = 0;
+    if let Some(f) = flags {
+        if f.contains('i') {
+            bits |= 1;
+        }
+        if f.contains('s') {
+            bits |= 2;
+        }
+        if f.contains('m') {
+            bits |= 4;
+        }
+    }
+    bits
+}
+
+fn build_regex_uncached(pattern: &str, flags: Option<&str>) -> LuaResult<regex::Regex> {
+    let mut builder = regex::RegexBuilder::new(pattern);
+    if let Some(f) = flags {
+        // 对齐 PCRE/OpenResty 常用标志：i 忽略大小写、s 单行(. 匹配换行)、m 多行(^$ 逐行)
+        if f.contains('i') {
+            builder.case_insensitive(true);
+        }
+        if f.contains('s') {
+            builder.dot_matches_new_line(true);
+        }
+        if f.contains('m') {
+            builder.multi_line(true);
+        }
+    }
+    builder.build().map_err(mlua::Error::external)
+}
+
+/// ngx.re 的编译入口：同一 (pattern, i/s/m) 只编译一次。
+fn build_regex_cached(pattern: &str, flags: Option<&str>) -> LuaResult<regex::Regex> {
+    let bits = re_flag_bits(flags);
     {
-        let guard = cache.read().unwrap();
-        if let Some(cached) = guard.get(p) {
-            // 读取当前文件的 mtime
-            if let Ok(meta) = std::fs::metadata(p) {
-                if let Ok(current_mtime) = meta.modified() {
-                    if current_mtime == cached.mtime {
-                        return Ok(Arc::clone(&cached.content));
-                    }
-                }
+        let cache = re_compiled().lock().unwrap();
+        if let Some(slots) = cache.get(pattern) {
+            if let Some(re) = &slots[bits] {
+                return Ok(re.clone());
             }
         }
     }
-    
-    // 缓存未命中或文件已修改，重新加载
+    let built = build_regex_uncached(pattern, flags)?;
+    let mut cache = re_compiled().lock().unwrap();
+    if cache.len() >= RE_COMPILED_MAX && !cache.contains_key(pattern) {
+        cache.clear();
+    }
+    let slots = cache
+        .entry(pattern.to_string())
+        .or_insert_with(|| std::array::from_fn(|_| None));
+    slots[bits] = Some(built.clone());
+    Ok(built)
+}
+
+/// 请求路径取脚本内容：命中即返回，零 syscall；未命中才读盘一次并登记，
+/// 之后文件的变更全部由后台 `recheck_cached_files` 发现。
+fn load_file_cached(p: &PathBuf) -> Result<Arc<str>, AppError> {
+    let cache = FILE_CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    if let Some(cached) = cache.read().unwrap().get(p) {
+        return Ok(Arc::clone(&cached.content));
+    }
+    let (content, mtime) = read_lua_file(p)?;
+    cache
+        .write()
+        .unwrap()
+        .insert(p.clone(), CachedLua { content: Arc::clone(&content), mtime });
+    Ok(content)
+}
+
+fn read_lua_file(p: &PathBuf) -> Result<(Arc<str>, std::time::SystemTime), AppError> {
     let s: Arc<str> = std::fs::read_to_string(p)
         .map_err(|e| AppError::Other(format!("读取 Lua 文件失败 {}: {e}", p.display())))?
         .into();
     let mtime = std::fs::metadata(p)
-        .ok()
-        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.modified())
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    
-    cache.write().unwrap().insert(
-        p.clone(),
-        CachedLua {
-            content: Arc::clone(&s),
-            mtime,
-        },
-    );
-    Ok(s)
+    Ok((s, mtime))
+}
+
+/// 定期自检：stat 一遍已缓存的 .lua，mtime 变了才重读；文件消失则移出缓存。
+/// 返回本轮真正发生变更的文件，供调用方记日志。请求路径不会走到这里。
+pub fn recheck_cached_files() -> Vec<PathBuf> {
+    let cache = FILE_CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    let snap: Vec<(PathBuf, std::time::SystemTime)> = cache
+        .read()
+        .unwrap()
+        .iter()
+        .map(|(p, c)| (p.clone(), c.mtime))
+        .collect();
+    let mut changed = Vec::new();
+    for (p, old_mtime) in snap {
+        let Ok(meta) = std::fs::metadata(&p) else {
+            cache.write().unwrap().remove(&p);
+            changed.push(p);
+            continue;
+        };
+        if meta.modified().ok() == Some(old_mtime) {
+            continue;
+        }
+        // 读失败（例如编辑器刚 truncate）则保留旧内容，下一轮再试：
+        // 半成品文件不该把正在服务的请求打成 500。
+        if let Ok((content, mtime)) = read_lua_file(&p) {
+            cache
+                .write()
+                .unwrap()
+                .insert(p.clone(), CachedLua { content, mtime });
+            changed.push(p);
+        }
+    }
+    changed
 }
 
 impl LuaSource {
@@ -199,6 +440,8 @@ pub struct Cosocket {
     size_cap: Arc<std::sync::atomic::AtomicUsize>,
     /// 当前连接的对端 (host, port)，供 setkeepalive 回池与 reconnect 复用。
     peer: Arc<std::sync::Mutex<Option<(String, u16)>>>,
+    /// 当前连接是否来自 keepalive 池（`getreusedtimes()`：1=复用，0=新建）
+    reused: Arc<AtomicUsize>,
     op_counter: Arc<AtomicU64>,
     ev_tx: mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>,
 }
@@ -218,6 +461,7 @@ impl Cosocket {
             timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(5000)),
             size_cap: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             peer: Arc::new(std::sync::Mutex::new(None)),
+            reused: Arc::new(AtomicUsize::new(0)),
             op_counter,
             ev_tx,
         }
@@ -397,10 +641,12 @@ impl LuaUserData for Cosocket {
             let stream = Arc::clone(&this.stream);
             let buf = Arc::clone(&this.buf);
             let peer = Arc::clone(&this.peer);
+            let reused = Arc::clone(&this.reused);
             let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
             let key = format!("{host}:{port}");
             if let Some((s, leftover)) = crate::sockpool::take(&key) {
                 // 命中池：接管已连接流与其残留缓冲，记录 peer，无需握手。
+                reused.store(1, Ordering::Relaxed);
                 let payload = vec![
                     ResumeVal::Int(1),
                     ResumeVal::Str("reused".into()),
@@ -415,6 +661,7 @@ impl LuaUserData for Cosocket {
                 });
                 return Ok(id);
             }
+            reused.store(0, Ordering::Relaxed);
             let host2 = host.clone();
             tokio::spawn(async move {
                 let payload = match tokio::time::timeout(dur, TcpStream::connect((host.as_str(), port))).await {
@@ -521,6 +768,11 @@ impl LuaUserData for Cosocket {
         methods.add_method("_setsize", |_lua, this, bytes: usize| {
             this.size_cap.store(bytes, Ordering::Relaxed);
             Ok(1u64)
+        });
+
+        // _getreusedtimes() -> 0|1：当前连接是否来自 keepalive 池
+        methods.add_method("_getreusedtimes", |_lua, this, ()| {
+            Ok(this.reused.load(Ordering::Relaxed) as i64)
         });
 
         // _start_receiveany(min, max?) -> op id；成功 [data]，失败 [nil, err, partial]
@@ -1021,12 +1273,35 @@ const MAX_RUNNING_TIMERS: isize = 4096;
 /// 一次请求阶段作业：由 run_phase 提交给所属 VM 的调度器协程执行。
 /// 调度器把 code 编译进一个新 Lua 协程（thread），与其它在途请求在同一 VM 上
 /// 交错 resume；协程 Finished 时通过 reply 回传结果（保持 run_phase 原契约）。
-struct Job {
-    co_id: u64,
-    phase_name: String,
-    code: Arc<str>,
-    ctx: Arc<Mutex<RequestCtx>>,
-    reply: oneshot::Sender<Result<(), AppError>>,
+enum Job {
+    Start {
+        co_id: u64,
+        phase_name: String,
+        code: Arc<str>,
+        ctx: Arc<Mutex<RequestCtx>>,
+        reply: oneshot::Sender<Result<(), AppError>>,
+    },
+    /// 快速路径首段已在连接任务里跑过并让出：把挂起的协程连同 registry 句柄移交给调度器，
+    /// 由它登记等待（op 结果可能已在线路上）并在事件到达后恢复。
+    Adopt {
+        co_id: u64,
+        phase_name: String,
+        ctx: Arc<Mutex<RequestCtx>>,
+        thread_key: RegistryKey,
+        ctx_table_key: RegistryKey,
+        op_id: u64,
+        reply: oneshot::Sender<Result<(), AppError>>,
+    },
+    /// 定时器回调：与请求协程一样由调度器 resume，因此回调里可以使用 ngx.sleep /
+    /// cosocket / ngx.location.capture / ngx.thread.*（走同一套 yield-op 唤醒机制）。
+    /// 线程与游离 ctx 表已在 tokio 定时器任务里持 VM 锁建好。
+    Timer {
+        co_id: u64,
+        thread_key: RegistryKey,
+        ctx_table_key: RegistryKey,
+        ctx: Arc<Mutex<RequestCtx>>,
+        done: oneshot::Sender<Result<bool, String>>,
+    },
 }
 
 /// VM 槽位：提交作业的发端（run_phase 用）+ 每 VM 的协程 id 计数。
@@ -1035,6 +1310,12 @@ struct Job {
 struct VmSlot {
     job_tx: mpsc::UnboundedSender<Job>,
     co_counter: Arc<AtomicU64>,
+    /// 快速路径入口：VM 锁空闲时由当前请求任务直接持锁执行首段（省掉两次任务跳转）
+    vm: Arc<VM>,
+    /// 每 VM 一份编译缓存：调度器与快速路径共用，避免两条路径各编译一次
+    chunks: Arc<std::sync::Mutex<ChunkCache>>,
+    /// ngx.thread.spawn 的跨锁信箱：快速路径结束时要清掉本请求未启动的子线程
+    sched_ctl: SharedCtl,
 }
 
 /// 调度器在协程让出后、重新 resume 时回传给协程的值（纯 Rust，跨 await 安全）。
@@ -1054,6 +1335,18 @@ enum ResumeVal {
         body: Vec<u8>,
     },
 }
+
+/// 每 VM 一份的已编译代码块缓存：阶段名 -> 源码 -> registry 里的函数原型句柄。
+/// 对标 OpenResty 的 `lua_code_cache on`：一段源码只在该 VM 里编译一次，之后每个请求只做
+/// 一次 registry 取回 + `create_thread`。编译一个 chunk 是 10µs 量级，与整条 content_by_lua
+/// 请求路径同量级，每请求重编译会让 Lua 端点慢于 OpenResty（实测 c=1 时 0.74x）。
+/// 用 RegistryKey 而非 Function：mlua 的 Function/Table 是 `!Send`，必须靠 registry 句柄跨 await。
+/// 键取自配置里的 LuaSource，稳态下条目数就等于指令数。定期自检改写脚本内容会新增一个源码键，
+/// 旧版本靠下面的桶上限淘汰（每阶段最多这么多份不同源码），不会无界增长。
+type ChunkCache = HashMap<String, HashMap<Arc<str>, RegistryKey>>;
+
+/// 单个阶段桶允许共存的不同源码份数：正常配置远达不到，只有反复编辑脚本才会触发淘汰。
+const CHUNK_CACHE_MAX_PER_PHASE: usize = 16;
 
 /// 调度器内部：一个在途协程的 Rust 侧状态。
 /// thread_key / ctx_table_key 指向 registry 里持有的 mlua 句柄（Send 安全，跨 await 存活）。
@@ -1075,6 +1368,9 @@ struct CoState {
     /// 若为 Some(tid)，本次 resume 用 Lua 侧 `__thread_sink[tid]` 的打包结果作唤醒值喂回
     /// （ngx.thread.wait 命中已完成线程时经调度器投递）。resume 前消费并清空。
     wake_tid: Option<u64>,
+    /// 定时器回调：完成后把 `Ok(return_false)` / `Err(错误)` 回执给发起任务的 tokio 定时器，
+    /// 由它决定 `ngx.timer.every` 是否继续下一轮并维护 running 计数。普通请求为 None。
+    timer_done: Option<oneshot::Sender<Result<bool, String>>>,
 }
 
 /// ngx.thread.* 的跨锁信箱：请求协程内的 spawn/wait/kill 原语把「意图」写在这里，
@@ -1101,6 +1397,69 @@ struct WaitReq {
 
 type SharedCtl = Arc<std::sync::Mutex<SchedCtl>>;
 
+/// 快速路径首段的执行结果
+enum InlineOutcome {
+    Finished,
+    Yielded {
+        op_id: u64,
+        thread_key: RegistryKey,
+        ctx_table_key: RegistryKey,
+    },
+}
+
+/// 请求已结束但 ngx.thread.spawn 的子协程还没被调度器登记：直接丢弃（对标请求结束即回收）。
+fn drop_unstarted_spawns(ctl: &SharedCtl, owner: u64) {
+    let mut c = ctl.lock().unwrap();
+    c.spawns.retain(|s| s.owner != owner);
+}
+
+/// 登记一次协程让出：等待 op 完成事件；若等的是 ngx.thread.wait 且目标已结束则立即唤醒。
+/// 调度器恢复路径与 Adopt（快速路径移交）路径共用，保证两边的等待语义一致。
+fn park_yielded(
+    co_id: u64,
+    sid: u64,
+    states: &mut HashMap<u64, CoState>,
+    pending: &mut VecDeque<u64>,
+    waiting: &mut HashMap<u64, u64>,
+    ctl: &SharedCtl,
+    done: &HashSet<u64>,
+    tid_waitop: &mut HashMap<u64, u64>,
+    wait_group: &mut HashMap<u64, Vec<u64>>,
+) {
+    if sid == THREAD_YIELD_MARK {
+        // ngx.thread.yield：主动让出，本轮重排再跑
+        pending.push_back(co_id);
+        return;
+    }
+    let waited = {
+        let mut c = ctl.lock().unwrap();
+        match c.waits.iter().position(|w| w.op == sid) {
+            Some(i) => Some(c.waits.remove(i).tids),
+            None => None,
+        }
+    };
+    match waited {
+        Some(tids) => {
+            if let Some(hit) = tids.iter().find(|t| done.contains(t)).copied() {
+                if let Some(st) = states.get_mut(&co_id) {
+                    st.wake_tid = Some(hit);
+                }
+                pending.push_back(co_id);
+            } else {
+                waiting.insert(sid, co_id);
+                for t in &tids {
+                    tid_waitop.insert(*t, sid);
+                }
+                wait_group.insert(sid, tids);
+            }
+        }
+        None => {
+            // 普通 sleep / cosocket / 子请求让出
+            waiting.insert(sid, co_id);
+        }
+    }
+}
+
 /// ngx.thread.yield() 让出后「重排再跑」的哨兵 op id（对应 Lua 整数 i64::MAX）：
 /// 调度器认出它即把本协程重新入队，不登记 waiting（真实 op id 从 1 递增，永达不到此值）。
 const THREAD_YIELD_MARK: u64 = i64::MAX as u64;
@@ -1114,6 +1473,8 @@ pub struct LuaEngine {
     /// 子请求用的 AppState 晚绑定槽：LuaEngine 在 AppState 之前构造，故捕获
     /// Weak<AppState> 只能在 main 建好 state 后回填（见 `bind_app_state`）。
     subreq_slot: SubreqSlot,
+    /// init_worker_by_lua*：调度器就绪后由 `run_init_workers()` 在每个 VM 各执行一次
+    worker_inits: Vec<(String, LuaSource)>,
 }
 
 /// 子请求晚句柄：安装 API 时各 VM 捕获其克隆，运行期升级成 `Arc<AppState>` 跑 run_capture。
@@ -1387,6 +1748,15 @@ fn parse_http_time(s: &str) -> Option<i64> {
         .map(|n| n.and_utc().timestamp())
 }
 
+/// 改写/构造请求体后同步 Content-Length；Transfer-Encoding 与之冲突，一并移除。
+fn set_request_content_length(ctx: &mut crate::engine::RequestCtx, len: usize) {
+    ctx.req_headers.retain(|(k, _)| {
+        !k.eq_ignore_ascii_case("content-length") && !k.eq_ignore_ascii_case("transfer-encoding")
+    });
+    ctx.req_headers
+        .push(("content-length".to_string(), len.to_string()));
+}
+
 
 /// 参数值：字符串或布尔标志
 pub enum LuaArgValue {
@@ -1403,6 +1773,21 @@ fn push_args_table(lua: &Lua, args: Vec<(String, LuaArgValue)>) -> LuaResult<Lua
         }
     }
     Ok(t)
+}
+
+/// OpenResty lua_package_path 的占位符语义：`$prefix`/`${prefix}` 替换为前缀目录，
+/// `;;` 替换为 `;` + Lua 默认路径（`;;` 的两个分号分别充当分隔与占位）；
+/// 未写 `;;` 时默认路径被整体替换。
+fn expand_package_path(raw: &str, default: &str, prefix: &str) -> String {
+    let s = raw.replace("${prefix}", prefix).replace("$prefix", prefix);
+    let mut expanded = s.replace(";;", &format!(";{default};"));
+    if s.starts_with(";;") {
+        expanded = expanded.trim_start_matches(';').to_string();
+    }
+    if s.ends_with(";;") {
+        expanded = expanded.trim_end_matches(';').to_string();
+    }
+    expanded
 }
 
 impl LuaEngine {
@@ -1429,6 +1814,32 @@ impl LuaEngine {
             }
         }
 
+        // init_worker_by_lua*：不在 new 里同步执行——脚本里的 ngx.sleep / ngx.timer.at /
+        // cosocket 都依赖 VM 调度器，必须等调度器任务起来后由 run_init_workers() 提交。
+        let mut worker_inits: Vec<(String, LuaSource)> = Vec::new();
+        for name in ["init_worker_by_lua", "init_worker_by_lua_file"] {
+            if let Some(d) = config.find(name) {
+                if let Some(src) = LuaSource::from_directive(d, base_dir) {
+                    // _file 在启动阶段就读一次：路径错误直接让启动失败，而不是静默跳过
+                    src.load()?;
+                    worker_inits.push((name.to_string(), src));
+                }
+            }
+        }
+
+        // lua_package_path：可多次出现，按声明顺序用 ';' 拼接；`$prefix` 与 `;;` 在应用时展开
+        let raw_package_path = {
+            let mut vals: Vec<String> = Vec::new();
+            for d in &config.root.block {
+                if d.name == "lua_package_path" {
+                    if let Some(a) = d.arg(0) {
+                        vals.push(a.to_string());
+                    }
+                }
+            }
+            (!vals.is_empty()).then(|| vals.join(";"))
+        };
+
         // VM 数量 = CPU 核心数（1~16 封顶）
         let n = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -1439,6 +1850,7 @@ impl LuaEngine {
         let timer_running = Arc::new(AtomicIsize::new(0));
         let subreq_slot: SubreqSlot = Arc::new(std::sync::OnceLock::new());
         let mut vms: Vec<Arc<VmSlot>> = Vec::with_capacity(n);
+        let mut applied_path: Option<String> = None;
         for _ in 0..n {
             let vm = Arc::new(VM::new(Lua::new()));
             let vm_ref = Arc::downgrade(&vm);
@@ -1469,28 +1881,51 @@ impl LuaEngine {
                     &subreq_slot,
                     &co_counter,
                     &sched_ctl,
+                    &job_tx,
                 )?;
                 crate::lua_resty::install_modules(&guard)
                     .map_err(|e| AppError::Other(format!("注册 resty.* 模块失败: {e}")))?;
+                if let Some(raw) = &raw_package_path {
+                    let applied = Self::set_package_path(&guard, raw, base_dir)?;
+                    if applied_path.is_none() {
+                        applied_path = Some(applied);
+                    }
+                }
                 for (name, code) in &inits {
                     guard.load(code).set_name(name).exec()?;
                 }
             }
             // ev_tx 的存活副本此刻已冻结进 ngx.sleep 的 Rust 闭包里；调度器只持有 ev_rx
             // 调度器任务持有 VM 的强引用：引擎存活期间 job_tx 不 drop，调度器不退出，VM 随之存活
+            let chunks: Arc<std::sync::Mutex<ChunkCache>> =
+                Arc::new(std::sync::Mutex::new(HashMap::new()));
             tokio::spawn(Self::run_scheduler(
                 vm.clone(),
                 job_rx,
                 ev_rx,
                 Arc::clone(&sched_ctl),
+                Arc::clone(&chunks),
             ));
             vms.push(Arc::new(VmSlot {
                 job_tx,
                 co_counter,
+                vm,
+                chunks,
+                sched_ctl,
             }));
         }
         for (name, _) in &inits {
             println!("[onrouter] 已执行 {name}（x{n} VM）");
+        }
+        if let Some(path) = &applied_path {
+            println!("[onrouter] lua_package_path 已应用（package.path）：{path}");
+        }
+        if !worker_inits.is_empty() {
+            let names: Vec<&str> = worker_inits.iter().map(|(n, _)| n.as_str()).collect();
+            println!(
+                "[onrouter] init_worker 脚本待执行：{}（调度器就绪后每 VM 一次）",
+                names.join(", ")
+            );
         }
         println!(
             "[onrouter] Lua VM 池就绪：{n} 个实例（每核心一个，VM 内协程并发多条在途请求）"
@@ -1499,6 +1934,7 @@ impl LuaEngine {
             vms,
             counter: AtomicUsize::new(0),
             subreq_slot,
+            worker_inits,
         })
     }
 
@@ -1506,6 +1942,41 @@ impl LuaEngine {
     /// 之前 capture 调用会安全地返回 status=0（LuaEngine 不可能在 state 就绪前收到请求）。
     pub fn bind_app_state(&self, state: &Arc<crate::server::AppState>) {
         let _ = self.subreq_slot.set(Arc::downgrade(state));
+    }
+
+    /// 应用 lua_package_path：`$prefix`/`${prefix}` 展开为配置基准目录，
+    /// `;;` 展开为 Lua 默认路径（与 OpenResty 一致：写了 `;;` 才保留默认搜索路径）。
+    fn set_package_path(lua: &Lua, raw: &str, base_dir: &PathBuf) -> Result<String, AppError> {
+        let package: LuaTable = lua.globals().get("package")?;
+        let default: String = package.get("path")?;
+        let expanded = expand_package_path(raw, &default, &base_dir.to_string_lossy());
+        package.set("path", expanded.as_str())?;
+        Ok(expanded)
+    }
+
+    /// 在每个 VM 上各执行一次 init_worker_by_lua*（对标 OpenResty 每个 worker 执行一次）。
+    /// 必须等调度器任务启动后调用：脚本里的 ngx.sleep / cosocket / ngx.timer.at 依赖它。
+    pub async fn run_init_workers(&self) -> Result<(), AppError> {
+        for (name, src) in &self.worker_inits {
+            let code = src.load()?;
+            for (idx, slot) in self.vms.iter().enumerate() {
+                Self::run_on_slot(
+                    slot,
+                    name,
+                    Arc::clone(&code),
+                    Arc::new(Mutex::new(RequestCtx::detached())),
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Other(format!("{name} 在第 {} 个 VM 执行失败: {e}", idx + 1))
+                })?;
+            }
+            println!(
+                "[onrouter] 已执行 {name}（x{} VM，每 VM 一次）",
+                self.vms.len()
+            );
+        }
+        Ok(())
     }
 
     fn install_api(
@@ -1519,6 +1990,7 @@ impl LuaEngine {
         subreq_slot: &SubreqSlot,
         co_counter: &Arc<AtomicU64>,
         sched_ctl: &SharedCtl,
+        job_tx: &mpsc::UnboundedSender<Job>,
     ) -> Result<(), AppError> {
         let get_ctx = |lua: &Lua| -> LuaResult<CtxHandle> {
             let ud: AnyUserData = lua.named_registry_value("__ctx")?;
@@ -1528,31 +2000,66 @@ impl LuaEngine {
 
         let ngx = lua.create_table()?;
 
-        // ngx.say(...) / ngx.print(...) —— 追加响应体（say 换行，print 不换）
+        // ngx.say(...) / ngx.print(...) —— 追加响应体（say 换行，print 不换）。
+        // 多个参数之间不加分隔、按序直拼，与 OpenResty 一致（早期实现插了空格，
+        // 同一句脚本会比 OpenResty 多出 n-1 个字节）。
         for (fname, newline) in [("say", true), ("print", false)] {
             let f = lua.create_function(move |lua, args: Variadic<LuaValue>| {
                 let h = get_ctx(lua)?;
                 let mut ctx = h.0.lock().unwrap();
-                for (i, v) in args.iter().enumerate() {
-                    if i > 0 {
-                        ctx.body.get_or_insert_with(Vec::new).push(b' ');
-                    }
+                for v in args.iter() {
                     let text: Vec<u8> = match v {
                         LuaValue::String(s) => s.as_bytes().to_vec(),
                         LuaValue::Integer(n) => n.to_string().into_bytes(),
                         LuaValue::Number(n) => n.to_string().into_bytes(),
+                        LuaValue::Boolean(b) => {
+                            if *b { b"true".to_vec() } else { b"false".to_vec() }
+                        }
                         LuaValue::Nil => b"nil".to_vec(),
                         other => format!("{other:?}").into_bytes(),
                     };
-                    ctx.body.get_or_insert_with(Vec::new).extend_from_slice(&text);
+                    ctx.lua_output(&text);
                 }
                 if newline {
-                    ctx.body.get_or_insert_with(Vec::new).push(b'\n');
+                    ctx.lua_output(b"\n");
                 }
                 Ok(())
             })?;
             ngx.set(fname, f)?;
         }
+
+        // ngx.flush([wait]) —— 把已缓冲的响应体推给客户端。流式模式下立刻发头/发数据；
+        // 缓冲模式（未启用流式，或处在 rewrite/access/log 等阶段）退化为 no-op，
+        // 返回值恒为 1（OpenResty 的 wait 语义是等内核写出去，本实现队列化即返回）。
+        let flush = lua.create_function(move |lua, _wait: Option<bool>| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            if ctx.stream.is_some() {
+                let _ = ctx.flush_stream();
+            }
+            Ok(1)
+        })?;
+        ngx.set("flush", flush)?;
+
+        // ngx.send_headers() —— 立即发送响应头（流式模式下首帧 Head；缓冲模式退化为
+        // 标记性 no-op，脚本结束时统一发送）。恒返回 1，对齐 OpenResty 的成功语义。
+        let send_headers = lua.create_function(move |lua, ()| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            if ctx.stream.is_some() {
+                let _ = ctx.flush_stream();
+            }
+            Ok(1)
+        })?;
+        ngx.set("send_headers", send_headers)?;
+
+        // ngx.eof() —— 结束响应输出：之后的 ngx.print/say 全部丢弃，流式响应立即收尾。
+        let eof = lua.create_function(move |lua, ()| {
+            let h = get_ctx(lua)?;
+            h.0.lock().unwrap().eof_stream();
+            Ok(1)
+        })?;
+        ngx.set("eof", eof)?;
 
         // ngx.log(level, msg...) —— 映射到 error_log 分级日志
         let log = lua.create_function(|_lua, args: Variadic<LuaValue>| {
@@ -1609,12 +2116,18 @@ impl LuaEngine {
         })?;
         ngx.set("log", log)?;
 
-        // ngx.exit(status) —— 结束请求
-        let exit = lua.create_function(move |lua, code: Option<u16>| {
+        // ngx.exit(status) —— 结束请求。负数（如 ngx.ERROR）在 SSL 握手阶段表示中止握手。
+        let exit = lua.create_function(move |lua, code: Option<i64>| {
             let h = get_ctx(lua)?;
             let mut ctx = h.0.lock().unwrap();
             if let Some(c) = code {
-                ctx.status = c;
+                if c < 0 {
+                    if let Some(ssl) = ctx.ssl.as_mut() {
+                        ssl.aborted = true;
+                    }
+                } else if c <= u16::MAX as i64 {
+                    ctx.status = c as u16;
+                }
             }
             ctx.done = true;
             Ok(())
@@ -1680,16 +2193,26 @@ impl LuaEngine {
             .load("return function(f, premature, args) return f(premature, table.unpack(args, 1, args.n or 0)) end")
             .eval()?;
         lua.set_named_registry_value("__timer_dispatch", dispatch)?;
+        // 定时器回调必须作为纯 Lua 闭包进协程：Lua 5.4 不允许 yield 跨 C 调用边界，
+        // 若在 Rust 帧里 call 用户回调，回调里的 ngx.sleep/cosocket 会直接报错。
+        let make_runner: LuaFunction = lua
+            .load(
+                "return function(dispatch, cb, args) return function() return dispatch(cb, false, args) end end",
+            )
+            .eval()?;
+        lua.set_named_registry_value("__timer_make_runner", make_runner)?;
 
         let timer = lua.create_table()?;
 
         // ngx.timer.at(delay_sec, callback, ...) -> ok, err
         // 语义对齐 lua-nginx-module t/106-timer.t：秒（可浮点）、premature 首参、
-        // 变参转发、失败返回 (nil, err)、回调在所属 VM 锁内执行且不碰请求 ctx
+        // 变参转发、失败返回 (nil, err)、回调跑在调度器托管的协程里（可用 yield 类 API）
         {
             let vm_ref = vm_ref.clone();
             let pending = Arc::clone(timer_pending);
             let running = Arc::clone(timer_running);
+            let co_counter = Arc::clone(co_counter);
+            let job_tx = job_tx.clone();
             let timer_at = lua.create_function(move |lua_ctx, (delay, callback, args): (LuaValue, LuaValue, Variadic<LuaValue>)| {
                 let delay_secs = match &delay {
                     LuaValue::Number(n) => *n as f64,
@@ -1715,10 +2238,21 @@ impl LuaEngine {
                     args_table.raw_set(n, v)?;
                 }
                 args_table.raw_set("n", n)?;
+                // 注册时绑定成无参 Lua 闭包，触发后由调度器建成协程 resume
+                let runner_key = match Self::bind_timer_runner(lua_ctx, cb, args_table) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        pending.fetch_sub(1, Ordering::SeqCst);
+                        return Err(e);
+                    }
+                };
+                let base_ctx = Self::timer_ctx_base(lua_ctx);
 
                 let vm_ref = vm_ref.clone();
                 let pending = Arc::clone(&pending);
                 let running = Arc::clone(&running);
+                let co_counter = Arc::clone(&co_counter);
+                let job_tx = job_tx.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs_f64(delay_secs)).await;
                     let Some(vm) = vm_ref.upgrade() else {
@@ -1729,26 +2263,25 @@ impl LuaEngine {
                     if running.fetch_add(1, Ordering::SeqCst) >= MAX_RUNNING_TIMERS {
                         running.fetch_sub(1, Ordering::SeqCst);
                         eprintln!("[timer] too many running timers");
+                        let guard = vm.lock().await;
+                        let _ = guard.remove_registry_value(runner_key);
                         return;
                     }
-                    // 关键：持所属 VM 锁执行，且挂上游离 __ctx
-                    // （对标 OpenResty fake request client，防止读到复用该 VM 的后续请求上下文）
-                    let guard = vm.lock().await;
-                    let _ = guard.set_named_registry_value(
-                        "__ctx",
-                        CtxHandle(Arc::new(Mutex::new(RequestCtx::detached()))),
-                    );
-                    if let Ok(ngx_t) = guard.globals().get::<LuaTable>("ngx") {
-                        let _ = ngx_t.raw_set("ctx", guard.create_table().unwrap());
-                    }
-                    let run = (|| -> mlua::Result<LuaValue> {
-                        let dispatch: LuaFunction = guard.named_registry_value("__timer_dispatch")?;
-                        dispatch.call((cb.clone(), LuaValue::Boolean(false), args_table.clone()))
-                    })();
-                    if let Err(e) = run {
+                    // 回调协程与请求协程同权：ngx.sleep / cosocket / subrequest / ngx.thread.*
+                    // 都走调度器的 yield-op 唤醒机制；__ctx 由调度器挂上游离 ctx。
+                    let res = Self::dispatch_timer_job(
+                        &vm,
+                        &runner_key,
+                        &base_ctx,
+                        &co_counter,
+                        &job_tx,
+                    )
+                    .await;
+                    if let Err(e) = &res {
                         eprintln!("[timer] 回调执行失败: {e}");
                     }
-                    let _ = guard.unset_named_registry_value("__ctx");
+                    let guard = vm.lock().await;
+                    let _ = guard.remove_registry_value(runner_key);
                     drop(guard);
                     running.fetch_sub(1, Ordering::SeqCst);
                 });
@@ -1764,6 +2297,8 @@ impl LuaEngine {
             let vm_ref = vm_ref.clone();
             let pending = Arc::clone(timer_pending);
             let running = Arc::clone(timer_running);
+            let co_counter = Arc::clone(co_counter);
+            let job_tx = job_tx.clone();
             let timer_every = lua.create_function(move |lua_ctx, (interval, callback, args): (LuaValue, LuaValue, Variadic<LuaValue>)| {
                 let interval_secs = match &interval {
                     LuaValue::Number(n) => *n as f64,
@@ -1788,10 +2323,20 @@ impl LuaEngine {
                     args_table.raw_set(n, v)?;
                 }
                 args_table.raw_set("n", n)?;
+                let runner_key = match Self::bind_timer_runner(lua_ctx, cb, args_table) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        pending.fetch_sub(1, Ordering::SeqCst);
+                        return Err(e);
+                    }
+                };
+                let base_ctx = Self::timer_ctx_base(lua_ctx);
 
                 let vm_ref = vm_ref.clone();
                 let pending = Arc::clone(&pending);
                 let running = Arc::clone(&running);
+                let co_counter = Arc::clone(&co_counter);
+                let job_tx = job_tx.clone();
                 tokio::spawn(async move {
                     let duration = std::time::Duration::from_secs_f64(interval_secs);
                     loop {
@@ -1805,33 +2350,31 @@ impl LuaEngine {
                         if running.fetch_add(1, Ordering::SeqCst) >= MAX_RUNNING_TIMERS {
                             running.fetch_sub(1, Ordering::SeqCst);
                             eprintln!("[timer] too many running timers");
+                            let guard = vm.lock().await;
+                            let _ = guard.remove_registry_value(runner_key);
                             break;
                         }
-                        let guard = vm.lock().await;
-                        let _ = guard.set_named_registry_value(
-                            "__ctx",
-                            CtxHandle(Arc::new(Mutex::new(RequestCtx::detached()))),
-                        );
-                        if let Ok(ngx_t) = guard.globals().get::<LuaTable>("ngx") {
-                            let _ = ngx_t.raw_set("ctx", guard.create_table().unwrap());
-                        }
-                        let run = (|| -> mlua::Result<LuaValue> {
-                            let dispatch: LuaFunction = guard.named_registry_value("__timer_dispatch")?;
-                            dispatch.call((cb.clone(), LuaValue::Boolean(false), args_table.clone()))
-                        })();
-                        let stop = match run {
+                        let res = Self::dispatch_timer_job(
+                        &vm,
+                        &runner_key,
+                        &base_ctx,
+                        &co_counter,
+                        &job_tx,
+                    )
+                    .await;
+                        let stop = match res {
                             Err(e) => {
                                 eprintln!("[timer] 周期回调执行失败: {e}");
                                 true
                             }
                             // 回调显式 return false -> 终止周期定时器
-                            Ok(LuaValue::Boolean(false)) => true,
-                            Ok(_) => false,
+                            Ok(true) => true,
+                            Ok(false) => false,
                         };
-                        let _ = guard.unset_named_registry_value("__ctx");
-                        drop(guard);
                         running.fetch_sub(1, Ordering::SeqCst);
                         if stop {
+                            let guard = vm.lock().await;
+                            let _ = guard.remove_registry_value(runner_key);
                             break;
                         }
                         pending.fetch_add(1, Ordering::SeqCst);
@@ -1869,6 +2412,15 @@ impl LuaEngine {
                     ctx.resp_headers.push((key, s.to_string_lossy().to_string()));
                 }
                 Some(LuaValue::Integer(n)) => ctx.resp_headers.push((key, n.to_string())),
+                Some(LuaValue::Table(t)) => {
+                    // 表值 = 同名多行（典型：多条 Set-Cookie）
+                    for v in t.sequence_values::<LuaValue>() {
+                        let v = v?;
+                        let bs = lua_value_to_bytes(&v).unwrap_or_default();
+                        ctx.resp_headers
+                            .push((key.clone(), String::from_utf8_lossy(&bs).into_owned()));
+                    }
+                }
                 _ => {} // nil = 删除
             }
             Ok(())
@@ -1889,6 +2441,14 @@ impl LuaEngine {
                 LuaValue::Number(n) => ctx.resp_headers.push((key, n.to_string())),
                 LuaValue::Boolean(b) => ctx.resp_headers.push((key, b.to_string())),
                 LuaValue::Nil => {} // nil = 删除
+                LuaValue::Table(t) => {
+                    // 表值 = 同名多行（典型：多条 Set-Cookie）
+                    for v in t.sequence_values::<LuaValue>() {
+                        let bs = lua_value_to_bytes(&v?).unwrap_or_default();
+                        ctx.resp_headers
+                            .push((key.clone(), String::from_utf8_lossy(&bs).into_owned()));
+                    }
+                }
                 other => {
                     let bs = lua_value_to_bytes(&other).unwrap_or_default();
                     ctx.resp_headers.push((key, String::from_utf8_lossy(&bs).into_owned()));
@@ -1900,9 +2460,23 @@ impl LuaEngine {
             let h = get_ctx(lua)?;
             let ctx = h.0.lock().unwrap();
             let key = name.to_lowercase();
-            match ctx.resp_headers.iter().rfind(|(k, _)| k.to_lowercase() == key) {
-                Some((_, v)) => Ok(LuaValue::String(lua.create_string(v.as_str())?)),
-                None => Ok(LuaValue::Nil),
+            let vals: Vec<&String> = ctx
+                .resp_headers
+                .iter()
+                .filter(|(k, _)| k.to_lowercase() == key)
+                .map(|(_, v)| v)
+                .collect();
+            match vals.len() {
+                0 => Ok(LuaValue::Nil),
+                1 => Ok(LuaValue::String(lua.create_string(vals[0].as_str())?)),
+                // 多行同名头读取为表（OpenResty 语义）
+                _ => {
+                    let t = lua.create_table()?;
+                    for (i, v) in vals.iter().enumerate() {
+                        t.raw_set(i + 1, lua.create_string(v.as_str())?)?;
+                    }
+                    Ok(LuaValue::Table(t))
+                }
             }
         })?;
         header_mt.set("__newindex", header_newindex)?;
@@ -2042,6 +2616,9 @@ impl LuaEngine {
                         local id = self._h:_start_tlshandshake(opts.server_name, opts.verify, opts.ca)
                         return coroutine.yield(id)
                     end
+                    -- 新版命名 sslhandshake 是 tlshandshake 的别名
+                    M.sslhandshake = M.tlshandshake
+                    function M:getreusedtimes() return self._h:_getreusedtimes() end
                     function M:reconnect()
                         if not self._host then return nil, "no peer" end
                         self:close()
@@ -2087,17 +2664,18 @@ impl LuaEngine {
             let ev_tx = ev_tx.clone();
             let counter = Arc::clone(op_counter);
             let slot = Arc::clone(subreq_slot);
-            let capture_start = lua.create_function(move |lua, (uri, method): (String, String)| {
+            let capture_start = lua.create_function(move |lua, (uri, method, body): (String, String, Option<LuaString>)| {
                 let h = get_ctx(lua)?;
                 let parent = h.0.lock().unwrap().clone();
                 let id = counter.fetch_add(1, Ordering::Relaxed);
                 let ev = ev_tx.clone();
                 let slot = Arc::clone(&slot);
+                let body = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
                 tokio::spawn(async move {
                     let payload = match slot.get().and_then(|w| w.upgrade()) {
                         None => vec![ResumeVal::Nil, ResumeVal::Str("subrequests unavailable".into())],
                         Some(state) => {
-                            match crate::server::run_capture(&state, &parent, &uri, &method).await {
+                            match crate::server::run_capture(&state, &parent, &uri, &method, &body).await {
                                 Ok(r) => vec![ResumeVal::SubReq {
                                     status: r.status,
                                     headers: r.headers,
@@ -2118,15 +2696,59 @@ impl LuaEngine {
                 r#"
                 return function()
                     local function capture(uri, opts)
+                        opts = opts or {}
                         local method = "GET"
-                        if opts and opts.method then method = tostring(opts.method) end
-                        local res = coroutine.yield(_onrouter_capture_start(uri, method))
+                        if opts.method then method = tostring(opts.method) end
+                        local target = uri
+                        if opts.args ~= nil then
+                            local args = opts.args
+                            if type(args) == "table" then args = ngx.encode_args(args) end
+                            args = tostring(args)
+                            if args ~= "" then
+                                local base = uri:match("^[^?]*") or uri
+                                target = base .. "?" .. args
+                            end
+                        end
+                        local body = opts.body
+                        if body ~= nil then body = tostring(body) end
+                        local res = coroutine.yield(_onrouter_capture_start(target, method, body))
                         if res == nil then
                             return { status = 0, body = nil, header = {} }
                         end
                         return res
                     end
-                    return { capture = capture }
+                    -- capture_multi：每个子请求跑在独立 light thread 上，真正并发；
+                    -- 返回值的顺序与输入一致（对标 OpenResty 的 capture_multi）。
+                    local function capture_multi(specs)
+                        local threads = {}
+                        local results = {}
+                        for i = 1, #specs do
+                            local spec = specs[i]
+                            local uri, opts
+                            if type(spec) == "table" then
+                                uri, opts = spec[1], spec[2]
+                            else
+                                uri = spec
+                            end
+                            if uri == nil then
+                                results[i] = { status = 0, body = nil, header = {} }
+                            else
+                                threads[i] = ngx.thread.spawn(capture, uri, opts)
+                            end
+                        end
+                        for i = 1, #specs do
+                            if threads[i] then
+                                local ok, res = ngx.thread.wait(threads[i])
+                                if ok then
+                                    results[i] = res
+                                else
+                                    results[i] = { status = 0, body = nil, header = {} }
+                                end
+                            end
+                        end
+                        return table.unpack(results, 1, #specs)
+                    end
+                    return { capture = capture, capture_multi = capture_multi }
                 end
                 "#,
             )
@@ -2502,23 +3124,93 @@ impl LuaEngine {
         // ngx.req.read_body() —— 请求体已由服务层缓冲，保留为幂等兼容占位
         let read_body = lua.create_function(|_, ()| Ok(LuaValue::Nil))?;
         req.set("read_body", read_body)?;
+
+        // ngx.req.socket([raw]) —— 请求体读取器。请求体已整体缓冲在 ctx.req_body，
+        // 这里提供顺序读取视图（receive/receiveuntil/settimeout/close）；
+        // 与上游流式转发（proxy_request_buffering off）互斥，那种场景下体不在内存。
+        let req_socket = lua.create_function(move |lua, _raw: Option<bool>| {
+            let cursor = Arc::new(Mutex::new(ReqSocketCursor::default()));
+            let ud = lua.create_userdata(ReqSocket { cursor })?;
+            Ok((LuaValue::UserData(ud), LuaValue::Nil))
+        })?;
+        req.set("socket", req_socket)?;
         // ngx.req.get_body_file() —— 本实现请求体常驻内存，恒返回 nil（对标 in-memory 情形）
         let get_body_file = lua.create_function(|_, ()| Ok(LuaValue::Nil))?;
         req.set("get_body_file", get_body_file)?;
         // ngx.req.set_body_data(data) —— 用新体覆盖请求体（供 rewrite/exec 后转发）
         let set_body_data = lua.create_function(move |lua, data: LuaString| {
             let h = get_ctx(lua)?;
-            h.0.lock().unwrap().req_body = data.as_bytes().to_vec();
+            let mut ctx = h.0.lock().unwrap();
+            ctx.req_body = Bytes::copy_from_slice(&data.as_bytes());
+            let len = ctx.req_body.len();
+            set_request_content_length(&mut ctx, len);
             Ok(LuaValue::Nil)
         })?;
         req.set("set_body_data", set_body_data)?;
         // ngx.req.discard_body() —— 丢弃请求体
         let discard_body = lua.create_function(move |lua, ()| {
             let h = get_ctx(lua)?;
-            h.0.lock().unwrap().req_body.clear();
+            let mut ctx = h.0.lock().unwrap();
+            ctx.req_body = Bytes::new();
+            ctx.body_builder = None;
+            set_request_content_length(&mut ctx, 0);
             Ok(LuaValue::Nil)
         })?;
         req.set("discard_body", discard_body)?;
+        // ngx.req.start_time() —— 请求到达时间（epoch 秒）
+        let start_time = lua.create_function(move |lua, ()| {
+            let h = get_ctx(lua)?;
+            let t = h.0.lock().unwrap().start_time;
+            Ok(t)
+        })?;
+        req.set("start_time", start_time)?;
+        // ngx.req.http_version() —— 1.0 / 1.1 / 2.0 / 3.0
+        let http_version = lua.create_function(move |lua, ()| {
+            let h = get_ctx(lua)?;
+            let v = h.0.lock().unwrap().http_version;
+            Ok(v)
+        })?;
+        req.set("http_version", http_version)?;
+        // ngx.req.is_internal() —— 是否内部请求（ngx.exec / capture 产物）
+        let is_internal = lua.create_function(move |lua, ()| {
+            let h = get_ctx(lua)?;
+            let v = h.0.lock().unwrap().internal_request;
+            Ok(v)
+        })?;
+        req.set("is_internal", is_internal)?;
+        // ngx.req.init_body / append_body / finish_body —— 构造请求体（对标 ngx_lua）
+        let init_body = lua.create_function(move |lua, size: Option<usize>| {
+            let h = get_ctx(lua)?;
+            h.0.lock().unwrap().body_builder = Some(Vec::with_capacity(size.unwrap_or(0)));
+            Ok(LuaValue::Nil)
+        })?;
+        req.set("init_body", init_body)?;
+        let append_body = lua.create_function(move |lua, data: LuaString| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            match ctx.body_builder.as_mut() {
+                Some(buf) => {
+                    buf.extend_from_slice(&data.as_bytes());
+                    Ok((LuaValue::Nil, LuaValue::Nil))
+                }
+                None => Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string("request body not initialized")?),
+                )),
+            }
+        })?;
+        req.set("append_body", append_body)?;
+        let finish_body = lua.create_function(move |lua, ()| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            if let Some(buf) = ctx.body_builder.take() {
+                let len = buf.len();
+                ctx.req_body = Bytes::from(buf);
+                set_request_content_length(&mut ctx, len);
+            }
+            Ok(LuaValue::Nil)
+        })?;
+        req.set("finish_body", finish_body)?;
         // ngx.req.set_method(method)
         let set_method = lua.create_function(move |lua, m: String| {
             let h = get_ctx(lua)?;
@@ -2544,7 +3236,7 @@ impl LuaEngine {
             }
             s.push_str("\r\n");
             if full.unwrap_or(false) {
-                if let Ok(bs) = lua.create_string(ctx.req_body.as_slice()) {
+                if let Ok(bs) = lua.create_string(&ctx.req_body[..]) {
                     s.push_str(&bs.to_string_lossy());
                 }
             }
@@ -2609,39 +3301,44 @@ impl LuaEngine {
             Ok(t)
         }
 
-        // 解析正则入参：字符串 pattern（配合 options 标志）或 opt() 预编译句柄
+        // 解析正则入参：字符串 pattern（配合 options 标志）或 opt() 预编译句柄。
+        // Pattern 只借用 Lua 字符串，命中编译缓存时不再为模式分配 String。
         enum ReArg {
-            Pattern(String),
+            Pattern(LuaString),
             Cached(usize),
+            /// 非字符串/句柄入参：沿用旧行为，按空模式处理
+            Empty,
         }
         fn parse_re_arg(v: &LuaValue) -> ReArg {
             match v {
-                LuaValue::String(s) => ReArg::Pattern(String::from_utf8_lossy(&s.as_bytes()).into_owned()),
+                LuaValue::String(s) => ReArg::Pattern(s.clone()),
                 LuaValue::Table(t) => {
-                    if let Ok(idx) = t.raw_get::<i64>("__lon_re") {
+                    if let Ok(idx) = t.raw_get::<i64>("__orr_re") {
                         ReArg::Cached(idx as usize)
                     } else {
-                        ReArg::Pattern(String::new())
+                        ReArg::Empty
                     }
                 }
-                _ => ReArg::Pattern(String::new()),
+                _ => ReArg::Empty,
             }
         }
         fn build_from_arg(arg: ReArg, options: Option<String>) -> LuaResult<regex::Regex> {
             match arg {
                 ReArg::Cached(i) => regex_from_cache(i),
-                ReArg::Pattern(p) => build_regex(&p, options),
+                ReArg::Pattern(p) => build_regex_cached(&p.to_string_lossy(), options.as_deref()),
+                ReArg::Empty => build_regex_cached("", options.as_deref()),
             }
         }
 
         // ngx.re.match(s, pattern, flags?) -> {cap1, cap2, ...} | nil
         let re_match = lua.create_function(move |lua, (s, pattern, flags): (String, String, Option<String>)| {
-            let re = build_regex(&pattern, flags)?;
+            let re = build_regex_cached(&pattern, flags.as_deref())?;
             let Some(caps) = re.captures(&s) else {
                 return Ok(LuaValue::Nil);
             };
             let t = lua.create_table()?;
-            for i in 1..caps.len() {
+            // 对齐 OpenResty：cap[0] 是整体匹配，捕获组从 1 开始
+            for i in 0..caps.len() {
                 if let Some(m) = caps.get(i) {
                     t.raw_set(i as i64, m.as_str())?;
                 }
@@ -2652,7 +3349,7 @@ impl LuaEngine {
 
         // ngx.re.find(s, pattern, flags?) -> from, to（1-based；无匹配返回 nil）
         let re_find = lua.create_function(move |_, (s, pattern, flags): (String, String, Option<String>)| {
-            let re = build_regex(&pattern, flags)?;
+            let re = build_regex_cached(&pattern, flags.as_deref())?;
             match re.find(&s) {
                 Some(m) => Ok((Some(m.start() as i64 + 1), Some(m.end() as i64))),
                 None => Ok((None, None)),
@@ -2660,12 +3357,12 @@ impl LuaEngine {
         })?;
         re.set("find", re_find)?;
 
-        // ngx.re.opt(regex, options?) -> 预编译句柄（表 {__lon_re=idx}），可回传给其它 ngx.re.*
+        // ngx.re.opt(regex, options?) -> 预编译句柄（表 {__orr_re=idx}），可回传给其它 ngx.re.*
         let re_opt = lua.create_function(move |lua, (pattern, options): (String, Option<String>)| {
             let built = build_regex(&pattern, options)?;
             let idx = regex_to_cache(built);
             let t = lua.create_table()?;
-            t.raw_set("__lon_re", idx as i64)?;
+            t.raw_set("__orr_re", idx as i64)?;
             Ok(LuaValue::Table(t))
         })?;
         re.set("opt", re_opt)?;
@@ -2905,11 +3602,24 @@ impl LuaEngine {
         })?;
         ngx.set("get_phase", get_phase)?;
 
-        // ngx.worker.* —— 单进程反应器：pid 真实，worker id 恒 0，count 恒 1
+        // ngx.worker.* —— 单进程反应器：pid 真实，worker id 恒 0，count 恒 1；
+        // exiting() 由进程信号处理器置位，pids() 只含当前进程。
         let worker = lua.create_table()?;
         worker.set("pid", lua.create_function(|_, ()| Ok(std::process::id() as i64))?)?;
         worker.set("id", lua.create_function(|_, ()| Ok(0i64))?)?;
         worker.set("count", lua.create_function(|_, ()| Ok(1i64))?)?;
+        worker.set(
+            "exiting",
+            lua.create_function(|_, ()| Ok(worker_exiting()))?,
+        )?;
+        worker.set(
+            "pids",
+            lua.create_function(|lua, ()| {
+                let t = lua.create_table()?;
+                t.raw_set(1, std::process::id() as i64)?;
+                Ok(t)
+            })?,
+        )?;
         ngx.set("worker", worker)?;
 
         // ngx.config —— 版本信息（服务器品牌：ONRouter）
@@ -2958,6 +3668,12 @@ impl LuaEngine {
                     let h = ud.borrow::<CtxHandle>()?;
                     let ctx = h.0.lock().unwrap();
                     Ok(LuaValue::Boolean(ctx.capture_depth > 0))
+                }
+                "headers_sent" => {
+                    let ud: AnyUserData = _lua.named_registry_value("__ctx")?;
+                    let h = ud.borrow::<CtxHandle>()?;
+                    let sent = h.0.lock().unwrap().headers_sent();
+                    Ok(LuaValue::Boolean(sent))
                 }
                 _ => Ok(LuaValue::Nil),
             }
@@ -3143,6 +3859,190 @@ impl LuaEngine {
             ngx.raw_set(name, code)?;
         }
 
+        // ---------- ngx.ssl（ssl_certificate_by_lua 专用） ----------
+        // `require "ngx.ssl"` 走 package.loaded，语义与 OpenResty 的同名模块一致：
+        // 只在 SSL 握手阶段可用；证书/私钥均为 DER，PEM 由 parse_pem_* 转换。
+        let ssl = lua.create_table()?;
+        {
+            let f = lua.create_function(move |lua, ()| {
+                let h = get_ctx(lua)?;
+                let ctx = h.0.lock().unwrap();
+                Ok(match ctx.ssl.as_ref().and_then(|s| s.server_name.clone()) {
+                    Some(n) => LuaValue::String(lua.create_string(n)?),
+                    None => LuaValue::Nil,
+                })
+            })?;
+            ssl.set("server_name", f)?;
+        }
+
+        let parse_pem_cert = lua.create_function(move |lua, pem: LuaString| {
+            let mut reader = std::io::BufReader::new(std::io::Cursor::new(pem.as_bytes()));
+            match rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() {
+                Ok(certs) if !certs.is_empty() => {
+                    let chain: Vec<Vec<u8>> = certs.iter().map(|c| c.as_ref().to_vec()).collect();
+                    let ud = lua.create_userdata(SslCertChain(chain))?;
+                    Ok((LuaValue::UserData(ud), LuaValue::Nil))
+                }
+                Ok(_) => Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string("PEM 中没有证书")?),
+                )),
+                Err(e) => Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string(format!("解析 PEM 证书失败: {e}"))?),
+                )),
+            }
+        })?;
+        ssl.set("parse_pem_cert", parse_pem_cert)?;
+
+        let parse_pem_priv_key = lua.create_function(move |lua, pem: LuaString| {
+            let mut reader = std::io::BufReader::new(std::io::Cursor::new(pem.as_bytes()));
+            match rustls_pemfile::private_key(&mut reader) {
+                Ok(Some(key)) => {
+                    let ud = lua.create_userdata(SslPrivKey(key.secret_der().to_vec()))?;
+                    Ok((LuaValue::UserData(ud), LuaValue::Nil))
+                }
+                Ok(None) => Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string("PEM 中没有私钥")?),
+                )),
+                Err(e) => Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string(format!("解析 PEM 私钥失败: {e}"))?),
+                )),
+            }
+        })?;
+        ssl.set("parse_pem_priv_key", parse_pem_priv_key)?;
+
+        let cert_pem_to_der = lua.create_function(move |lua, pem: LuaString| {
+            let mut reader = std::io::BufReader::new(std::io::Cursor::new(pem.as_bytes()));
+            match rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() {
+                Ok(certs) => {
+                    let mut der = Vec::new();
+                    for c in certs {
+                        der.extend_from_slice(c.as_ref());
+                    }
+                    Ok((LuaValue::String(lua.create_string(der)?), LuaValue::Nil))
+                }
+                Err(e) => Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string(format!("解析 PEM 证书失败: {e}"))?),
+                )),
+            }
+        })?;
+        ssl.set("cert_pem_to_der", cert_pem_to_der)?;
+
+        let priv_key_pem_to_der = lua.create_function(move |lua, pem: LuaString| {
+            let mut reader = std::io::BufReader::new(std::io::Cursor::new(pem.as_bytes()));
+            match rustls_pemfile::private_key(&mut reader) {
+                Ok(Some(key)) => Ok((
+                    LuaValue::String(lua.create_string(key.secret_der())?),
+                    LuaValue::Nil,
+                )),
+                Ok(None) => Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string("PEM 中没有私钥")?),
+                )),
+                Err(e) => Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string(format!("解析 PEM 私钥失败: {e}"))?),
+                )),
+            }
+        })?;
+        ssl.set("priv_key_pem_to_der", priv_key_pem_to_der)?;
+
+        // set_cert_and_key(cert, key) / set_cert(chain) / set_priv_key(key)
+        let set_pair = lua.create_function(
+            move |lua, (cert, key): (LuaValue, LuaValue)| {
+                let chain = match ssl_cert_from_value(&cert) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?)))
+                    }
+                };
+                let key = match ssl_key_from_value(&key) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        return Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?)))
+                    }
+                };
+                if let Err(e) = crate::certs::certified_key_from_der(chain.clone(), key.clone()) {
+                    return Ok((
+                        LuaValue::Nil,
+                        LuaValue::String(lua.create_string(format!("证书/私钥无效: {e}"))?),
+                    ));
+                }
+                let h = get_ctx(lua)?;
+                let mut ctx = h.0.lock().unwrap();
+                let Some(ssl) = ctx.ssl.as_mut() else {
+                    return Ok((
+                        LuaValue::Nil,
+                        LuaValue::String(lua.create_string("不在 SSL 握手阶段")?),
+                    ));
+                };
+                ssl.cert_chain = Some(chain);
+                ssl.priv_key = Some(key);
+                ssl.cleared = false;
+                Ok((LuaValue::Boolean(true), LuaValue::Nil))
+            },
+        )?;
+        ssl.set("set_cert_and_key", set_pair)?;
+
+        // 旧 API：set_cert 与 set_priv_key 分开调用，握手侧成对取用并统一校验
+        let set_cert = lua.create_function(move |lua, cert: LuaValue| {
+            let chain = match ssl_cert_from_value(&cert) {
+                Ok(c) => c,
+                Err(e) => return Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
+            };
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            let Some(ssl) = ctx.ssl.as_mut() else {
+                return Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string("不在 SSL 握手阶段")?),
+                ));
+            };
+            ssl.cert_chain = Some(chain);
+            ssl.cleared = false;
+            Ok((LuaValue::Boolean(true), LuaValue::Nil))
+        })?;
+        ssl.set("set_cert", set_cert)?;
+
+        let set_priv_key = lua.create_function(move |lua, key: LuaValue| {
+            let key_der = match ssl_key_from_value(&key) {
+                Ok(k) => k,
+                Err(e) => return Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
+            };
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            let Some(ssl) = ctx.ssl.as_mut() else {
+                return Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string("不在 SSL 握手阶段")?),
+                ));
+            };
+            ssl.priv_key = Some(key_der);
+            ssl.cleared = false;
+            Ok((LuaValue::Boolean(true), LuaValue::Nil))
+        })?;
+        ssl.set("set_priv_key", set_priv_key)?;
+
+        let clear_certs = lua.create_function(move |lua, ()| {
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            if let Some(ssl) = ctx.ssl.as_mut() {
+                ssl.cert_chain = None;
+                ssl.priv_key = None;
+                ssl.cleared = true;
+            }
+            Ok(true)
+        })?;
+        ssl.set("clear_certs", clear_certs)?;
+
+        let package: LuaTable = lua.globals().get("package")?;
+        let loaded: LuaTable = package.get("loaded")?;
+        loaded.set("ngx.ssl", ssl)?;
+
         lua.globals().set("ngx", ngx)?;
 
         Ok(())
@@ -3159,10 +4059,147 @@ impl LuaEngine {
         let code = src.load()?;
         // 无锁轮询选 VM：VM 之间完全并行，VM 之内由调度器以协程方式并发
         let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.vms.len();
-        let slot = Arc::clone(&self.vms[idx]);
+        Self::run_on_slot(&self.vms[idx], phase_name, code, ctx).await
+    }
+
+    /// 把定时器的 (dispatch, cb, args) 绑成无参纯 Lua 闭包（存入 registry），
+    /// 让回调在协程里执行时没有 Rust 帧挡在中间，yield 才能穿透到调度器。
+    fn bind_timer_runner(lua: &Lua, cb: Function, args_table: LuaTable) -> LuaResult<RegistryKey> {
+        let dispatch: LuaFunction = lua.named_registry_value("__timer_dispatch")?;
+        let make_runner: LuaFunction = lua.named_registry_value("__timer_make_runner")?;
+        let runner: Function = make_runner.call((dispatch, cb, args_table))?;
+        lua.create_registry_value(runner)
+    }
+
+    /// 定时器游离 ctx 的连接画像：继承注册时的 listener/host/scheme 等，让回调里的
+    /// ngx.location.capture 仍能按原 server 的路由表解析；请求态字段保持 detached。
+    fn timer_ctx_base(lua: &Lua) -> RequestCtx {
+        let mut base = RequestCtx::detached();
+        let Ok(ud) = lua.named_registry_value::<AnyUserData>("__ctx") else {
+            return base;
+        };
+        let Ok(h) = ud.borrow::<CtxHandle>() else {
+            return base;
+        };
+        let cur = h.0.lock().unwrap();
+        base.listener = cur.listener;
+        base.host.clone_from(&cur.host);
+        base.scheme.clone_from(&cur.scheme);
+        base.remote_addr.clone_from(&cur.remote_addr);
+        base.remote_port = cur.remote_port;
+        base.server_port = cur.server_port;
+        base.http_version = cur.http_version;
+        base
+    }
+
+    /// 定时器触发：在所属 VM 上建好回调协程，作为 Job 交给调度器 resume，并等它跑完。
+    /// 返回 Ok(回调是否显式 return false)——供 ngx.timer.every 判定是否续期。
+    async fn dispatch_timer_job(
+        vm: &Arc<VM>,
+        runner_key: &RegistryKey,
+        base_ctx: &RequestCtx,
+        co_counter: &Arc<AtomicU64>,
+        job_tx: &mpsc::UnboundedSender<Job>,
+    ) -> Result<bool, String> {
+        let (thread_key, ctx_table_key) = {
+            let guard = vm.lock().await;
+            let built = (|| -> LuaResult<(RegistryKey, RegistryKey)> {
+                let runner: Function = guard.registry_value(runner_key)?;
+                let thread = guard.create_thread(runner)?;
+                let thread_key = guard.create_registry_value(thread)?;
+                let ctx_table = guard.create_table()?;
+                let ctx_table_key = guard.create_registry_value(ctx_table)?;
+                Ok((thread_key, ctx_table_key))
+            })();
+            match built {
+                Ok(keys) => keys,
+                Err(e) => return Err(format!("定时器回调协程创建失败: {e}")),
+            }
+        };
+        let (done, rx) = oneshot::channel();
+        let job = Job::Timer {
+            co_id: co_counter.fetch_add(1, Ordering::Relaxed),
+            thread_key,
+            ctx_table_key,
+            ctx: Arc::new(Mutex::new(base_ctx.clone())),
+            done,
+        };
+        if let Err(e) = job_tx.send(job) {
+            if let Job::Timer {
+                thread_key,
+                ctx_table_key,
+                ..
+            } = e.0
+            {
+                let guard = vm.lock().await;
+                let _ = guard.remove_registry_value(thread_key);
+                let _ = guard.remove_registry_value(ctx_table_key);
+            }
+            return Err("Lua 调度器已停止".into());
+        }
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Err("Lua 调度器在定时器回调完成前退出".into()),
+        }
+    }
+
+    /// 把一段脚本作为作业提交给指定 VM 的调度器并等待完成（请求阶段与 init_worker 共用）。
+    ///
+    /// 低并发快速路径：VM 锁空闲时由当前任务持锁把首段直接跑掉——
+    /// 无让出的脚本（多数 Lua 阶段）完全不经过调度器任务，省掉「连接任务 → 调度器 → 回话」
+    /// 两次任务跳转；一旦脚本让出（sleep/cosocket/subrequest/thread.wait），把挂起的协程
+    /// Adopt 给调度器，后续恢复与其它请求一样由调度器统一驱动。
+    async fn run_on_slot(
+        slot: &Arc<VmSlot>,
+        phase_name: &str,
+        code: Arc<str>,
+        ctx: Arc<Mutex<RequestCtx>>,
+    ) -> Result<(), AppError> {
         let co_id = slot.co_counter.fetch_add(1, Ordering::Relaxed);
+        if let Ok(guard) = slot.vm.try_lock() {
+            let outcome = Self::run_inline_segment(
+                &guard,
+                &slot.chunks,
+                &slot.sched_ctl,
+                co_id,
+                phase_name,
+                &code,
+                &ctx,
+            );
+            drop(guard);
+            match outcome? {
+                InlineOutcome::Finished => {
+                    crate::metrics::get().on_lua_inline();
+                    return Ok(());
+                }
+                InlineOutcome::Yielded {
+                    op_id,
+                    thread_key,
+                    ctx_table_key,
+                } => {
+                    crate::metrics::get().on_lua_adopted();
+                    let (tx, rx) = oneshot::channel();
+                    slot.job_tx
+                        .send(Job::Adopt {
+                            co_id,
+                            phase_name: phase_name.to_string(),
+                            ctx,
+                            thread_key,
+                            ctx_table_key,
+                            op_id,
+                            reply: tx,
+                        })
+                        .map_err(|_| AppError::Other("Lua 调度器已停止".into()))?;
+                    return match rx.await {
+                        Ok(res) => res,
+                        Err(_) => Err(AppError::Other("Lua 调度器在请求完成前退出".into())),
+                    };
+                }
+            }
+        }
         let (tx, rx) = oneshot::channel();
-        let job = Job {
+        crate::metrics::get().on_lua_scheduled();
+        let job = Job::Start {
             co_id,
             phase_name: phase_name.to_string(),
             code,
@@ -3178,10 +4215,106 @@ impl LuaEngine {
         }
     }
 
-    /// 把请求脚本编译进一个新协程（thread），并把协程句柄与「本请求专属」的 ngx.ctx 表
-    /// 各自存入 registry（返回可跨 await 存活的 RegistryKey）。
-    fn co_spawn(lua: &Lua, phase_name: &str, code: &str) -> LuaResult<(RegistryKey, RegistryKey)> {
-        let f = lua.load(code).set_name(phase_name).into_function()?;
+    /// 快速路径：在 VM 锁内同步建协程 + resume 首段。
+    /// Finished 时自行清理（未启动的 spawn 一并丢弃）；让出时把 registry 句柄交还调用方移交调度器。
+    fn run_inline_segment(
+        lua: &Lua,
+        chunks: &Arc<std::sync::Mutex<ChunkCache>>,
+        ctl: &SharedCtl,
+        co_id: u64,
+        phase_name: &str,
+        code: &Arc<str>,
+        ctx: &Arc<Mutex<RequestCtx>>,
+    ) -> Result<InlineOutcome, AppError> {
+        let (thread_key, ctx_table_key) = {
+            let mut cache = chunks.lock().unwrap();
+            Self::co_spawn(lua, &mut cache, phase_name, code)?
+        };
+        let run = (|| -> Result<LuaValue, AppError> {
+            let ngx: LuaTable = lua.globals().get("ngx")?;
+            let ctx_table: LuaTable = lua.registry_value(&ctx_table_key)?;
+            lua.set_named_registry_value("__ctx", CtxHandle(Arc::clone(ctx)))?;
+            lua.set_named_registry_value("__phase", phase_name.to_string())?;
+            lua.set_named_registry_value("__cur_co", co_id as i64)?;
+            lua.set_named_registry_value("__cur_owner", co_id as i64)?;
+            ngx.raw_set("ctx", ctx_table)?;
+            let thread: Thread = lua.registry_value(&thread_key)?;
+            thread.resume::<LuaValue>(()).map_err(AppError::from)
+        })();
+        match run {
+            Err(e) => {
+                let _ = lua.remove_registry_value(thread_key);
+                let _ = lua.remove_registry_value(ctx_table_key);
+                drop_unstarted_spawns(ctl, co_id);
+                Err(e)
+            }
+            Ok(yielded) => {
+                // resume 成功返回后协程要么已结束、要么停在受支持的让出点
+                let thread: Thread = lua.registry_value(&thread_key)?;
+                match thread.status() {
+                    ThreadStatus::Finished => {
+                        let _ = lua.remove_registry_value(thread_key);
+                        let _ = lua.remove_registry_value(ctx_table_key);
+                        // 请求脚本没让出就结束：spawn 出的子线程尚未启动，随请求一起丢弃
+                        drop_unstarted_spawns(ctl, co_id);
+                        Ok(InlineOutcome::Finished)
+                    }
+                    ThreadStatus::Resumable => match op_id_of(&yielded) {
+                        Some(op_id) => Ok(InlineOutcome::Yielded {
+                            op_id,
+                            thread_key,
+                            ctx_table_key,
+                        }),
+                        None => {
+                            let _ = lua.remove_registry_value(thread_key);
+                            let _ = lua.remove_registry_value(ctx_table_key);
+                            drop_unstarted_spawns(ctl, co_id);
+                            Err(AppError::Other(
+                                "attempt to yield from outside a supported operation".into(),
+                            ))
+                        }
+                    },
+                    // 同步 resume 不可能停在 Running；Error 表示协程异常终止
+                    ThreadStatus::Error | ThreadStatus::Running => {
+                        let _ = lua.remove_registry_value(thread_key);
+                        let _ = lua.remove_registry_value(ctx_table_key);
+                        drop_unstarted_spawns(ctl, co_id);
+                        Err(AppError::Other("coroutine aborted".into()))
+                    }
+                }
+            }
+        }
+    }
+
+    /// 为新请求建一个协程，并把协程句柄与「本请求专属」的 ngx.ctx 表各自存入 registry
+    /// （返回可跨 await 存活的 RegistryKey）。脚本源码走 `chunks` 缓存，只在首次出现时编译。
+    fn co_spawn(
+        lua: &Lua,
+        chunks: &mut ChunkCache,
+        phase_name: &str,
+        code: &Arc<str>,
+    ) -> LuaResult<(RegistryKey, RegistryKey)> {
+        // 命中路径不分配：先 get_mut，只有首次见到这个阶段的脚本才付出 String 键的分配
+        if !chunks.contains_key(phase_name) {
+            chunks.insert(phase_name.to_string(), HashMap::new());
+        }
+        let by_code = chunks
+            .get_mut(phase_name)
+            .expect("刚插入的阶段桶一定存在");
+        let f = match by_code.get(code.as_ref()) {
+            Some(key) => lua.registry_value::<Function>(key)?,
+            None => {
+                let compiled: Function = lua.load(code.as_ref()).set_name(phase_name).into_function()?;
+                let key = lua.create_registry_value(compiled.clone())?;
+                // 自检重载过的脚本会以「另一个源码键」留在这个桶里；桶满就整桶清空
+                // （RegistryKey drop 即 lua_unref，Lua 侧引用同步释放），避免长期攒出泄漏。
+                if by_code.len() >= CHUNK_CACHE_MAX_PER_PHASE {
+                    by_code.clear();
+                }
+                by_code.insert(Arc::clone(code), key);
+                compiled
+            }
+        };
         let co = lua.create_thread(f)?;
         let thread_key = lua.create_registry_value(co)?;
         let ctx_table = lua.create_table()?;
@@ -3197,6 +4330,7 @@ impl LuaEngine {
         mut job_rx: mpsc::UnboundedReceiver<Job>,
         mut ev_rx: mpsc::UnboundedReceiver<(u64, Vec<ResumeVal>)>,
         ctl: SharedCtl,
+        chunks: Arc<std::sync::Mutex<ChunkCache>>,
     ) {
         let mut states: HashMap<u64, CoState> = HashMap::new();
         let mut ready: VecDeque<u64> = VecDeque::new();
@@ -3220,16 +4354,54 @@ impl LuaEngine {
                     Err(_) => break, // VM 状态异常，退出
                 };
 
-                // 1) 收下新作业：编译进协程并入队 ready
+                // 1) 收下新作业：编译进协程并入队 ready；Adopt 作业接管快速路径移交的挂起协程
                 let mut jobs: Vec<Job> = Vec::new();
                 jobs.extend(inbox.drain(..));
                 while let Ok(j) = job_rx.try_recv() {
                     jobs.push(j);
                 }
+                let mut adopted: Vec<(u64, u64)> = Vec::new();
                 for job in jobs {
-                    let Job { co_id, phase_name, code, ctx, reply } = job;
-                    match Self::co_spawn(lua, &phase_name, &code) {
-                        Ok((thread_key, ctx_table_key)) => {
+                    match job {
+                        Job::Start { co_id, phase_name, code, ctx, reply } => {
+                            let spawned = {
+                                let mut cache = chunks.lock().unwrap();
+                                Self::co_spawn(lua, &mut cache, &phase_name, &code)
+                            };
+                            match spawned {
+                                Ok((thread_key, ctx_table_key)) => {
+                                    states.insert(
+                                        co_id,
+                                        CoState {
+                                            thread_key,
+                                            ctx_table_key,
+                                            ctx,
+                                            reply,
+                                            wake_args: Vec::new(),
+                                            phase: phase_name,
+                                            is_child: false,
+                                            owner: co_id,
+                                            wake_tid: None,
+                                            timer_done: None,
+                                        },
+                                    );
+                                    ready.push_back(co_id);
+                                }
+                                Err(e) => {
+                                    eprintln!("[onrouter] {phase_name} 脚本编译失败: {e}");
+                                    let _ = reply.send(Err(AppError::Lua(e)));
+                                }
+                            }
+                        }
+                        Job::Adopt {
+                            co_id,
+                            phase_name,
+                            ctx,
+                            thread_key,
+                            ctx_table_key,
+                            op_id,
+                            reply,
+                        } => {
                             states.insert(
                                 co_id,
                                 CoState {
@@ -3242,13 +4414,35 @@ impl LuaEngine {
                                     is_child: false,
                                     owner: co_id,
                                     wake_tid: None,
+                                    timer_done: None,
+                                },
+                            );
+                            adopted.push((co_id, op_id));
+                        }
+                        Job::Timer {
+                            co_id,
+                            thread_key,
+                            ctx_table_key,
+                            ctx,
+                            done,
+                        } => {
+                            let (dummy_tx, _dummy_rx) = oneshot::channel();
+                            states.insert(
+                                co_id,
+                                CoState {
+                                    thread_key,
+                                    ctx_table_key,
+                                    ctx,
+                                    reply: dummy_tx,
+                                    wake_args: Vec::new(),
+                                    phase: "timer".to_string(),
+                                    is_child: false,
+                                    owner: co_id,
+                                    wake_tid: None,
+                                    timer_done: Some(done),
                                 },
                             );
                             ready.push_back(co_id);
-                        }
-                        Err(e) => {
-                            eprintln!("[onrouter] {phase_name} 脚本编译失败: {e}");
-                            let _ = reply.send(Err(AppError::Lua(e)));
                         }
                     }
                 }
@@ -3291,6 +4485,7 @@ impl LuaEngine {
                             is_child: true,
                             owner,
                             wake_tid: None,
+                            timer_done: None,
                         },
                     );
                     owner_children.entry(owner).or_default().push(tid);
@@ -3313,6 +4508,22 @@ impl LuaEngine {
                         &mut states,
                         &mut ready,
                         tid,
+                    );
+                }
+
+                // 1d) 快速路径移交的挂起协程：登记让出等待。必须放在事件处理之前——op 的
+                //     完成事件可能先于 Adopt 作业到达，若此时 waiting 里没有映射，事件会被丢弃。
+                for (co_id, op_id) in adopted {
+                    park_yielded(
+                        co_id,
+                        op_id,
+                        &mut states,
+                        &mut ready,
+                        &mut waiting,
+                        &ctl,
+                        &done,
+                        &mut tid_waitop,
+                        &mut wait_group,
                     );
                 }
 
@@ -3427,6 +4638,17 @@ impl LuaEngine {
                                         lua, &mut states, &mut waiting, &mut done, &mut tid_waitop,
                                         &mut wait_group, &mut ready, co_id, None,
                                     );
+                                } else if states
+                                    .get(&co_id)
+                                    .map_or(false, |st| st.timer_done.is_some())
+                                {
+                                    // 定时器回调：返回值 false 表示 ngx.timer.every 停止续期
+                                    let stop = matches!(yielded, LuaValue::Boolean(false));
+                                    finish_timer(lua, &mut states, &mut waiting, co_id, Ok(stop));
+                                    reap_children(
+                                        lua, &mut states, owner, &mut owner_children, &mut done,
+                                        &mut tid_waitop, &mut wait_group, &mut waiting,
+                                    );
                                 } else {
                                     finish(lua, &mut states, &mut waiting, co_id, Ok(()));
                                     reap_children(
@@ -3436,42 +4658,17 @@ impl LuaEngine {
                                 }
                             }
                             ThreadStatus::Resumable => match op_id_of(&yielded) {
-                                Some(sid) if sid == THREAD_YIELD_MARK => {
-                                    // ngx.thread.yield：主动让出，本轮重排再跑
-                                    pending.push_back(co_id);
-                                }
-                                Some(sid) => {
-                                    // 若本 op 是一次 ngx.thread.wait：先查已完成的线程可即时唤醒
-                                    let waited = {
-                                        let mut c = ctl.lock().unwrap();
-                                        match c.waits.iter().position(|w| w.op == sid) {
-                                            Some(i) => Some(c.waits.remove(i).tids),
-                                            None => None,
-                                        }
-                                    };
-                                    match waited {
-                                        Some(tids) => {
-                                            if let Some(hit) =
-                                                tids.iter().find(|t| done.contains(t)).copied()
-                                            {
-                                                if let Some(st) = states.get_mut(&co_id) {
-                                                    st.wake_tid = Some(hit);
-                                                }
-                                                pending.push_back(co_id);
-                                            } else {
-                                                waiting.insert(sid, co_id);
-                                                for t in &tids {
-                                                    tid_waitop.insert(*t, sid);
-                                                }
-                                                wait_group.insert(sid, tids);
-                                            }
-                                        }
-                                        None => {
-                                            // 普通 sleep / cosocket / 子请求让出
-                                            waiting.insert(sid, co_id);
-                                        }
-                                    }
-                                }
+                                Some(sid) => park_yielded(
+                                    co_id,
+                                    sid,
+                                    &mut states,
+                                    &mut pending,
+                                    &mut waiting,
+                                    &ctl,
+                                    &done,
+                                    &mut tid_waitop,
+                                    &mut wait_group,
+                                ),
                                 None => {
                                     // 非受支持让出（yield 出的不是 op id）：无法唤醒，按错误回传避免悬挂
                                     eprintln!("[onrouter] 协程 yield 了非 op id 值，无法恢复");
@@ -3550,13 +4747,18 @@ impl LuaEngine {
             let _ = lua_guard.remove_registry_value(st.thread_key);
             let _ = lua_guard.remove_registry_value(st.ctx_table_key);
             drop(st.ctx);
-            let _ = st.reply.send(Err(AppError::Other("Lua 调度器已停止".into())));
+            if let Some(tx) = st.timer_done {
+                let _ = tx.send(Err("Lua 调度器已停止".into()));
+            } else {
+                let _ = st.reply.send(Err(AppError::Other("Lua 调度器已停止".into())));
+            }
         }
         drop(lua_guard);
     }
 }
 
 /// 结束一个协程：出栈 states、释放其 registry 句柄、尽早 drop 请求 ctx 引用，再回传结果。
+/// 定时器协程把结果改投给 timer_done（发起任务的 tokio 定时器），普通请求/子线程走 reply。
 fn finish(
     lua: &Lua,
     states: &mut HashMap<u64, CoState>,
@@ -3564,14 +4766,50 @@ fn finish(
     co_id: u64,
     result: Result<(), AppError>,
 ) {
-    if let Some(st) = states.remove(&co_id) {
-        // 清理可能残留的 waiting 映射（此协程已结束）
-        waiting.retain(|_, v| *v != co_id);
-        let _ = lua.remove_registry_value(st.thread_key);
-        let _ = lua.remove_registry_value(st.ctx_table_key);
-        drop(st.ctx);
-        let _ = st.reply.send(result);
+    if let Some((timer_done, reply)) = take_finished_state(lua, states, waiting, co_id) {
+        if let Some(tx) = timer_done {
+            let _ = tx.send(result.map(|_| false).map_err(|e| e.to_string()));
+        } else {
+            let _ = reply.send(result);
+        }
     }
+}
+
+/// 定时器回调正常结束：把「是否 return false」回执给定时器任务。
+fn finish_timer(
+    lua: &Lua,
+    states: &mut HashMap<u64, CoState>,
+    waiting: &mut HashMap<u64, u64>,
+    co_id: u64,
+    result: Result<bool, String>,
+) {
+    if let Some((timer_done, reply)) = take_finished_state(lua, states, waiting, co_id) {
+        if let Some(tx) = timer_done {
+            let _ = tx.send(result);
+        } else {
+            let _ = reply.send(result.map(|_| ()).map_err(AppError::Other));
+        }
+    }
+}
+
+type FinishSenders = (
+    Option<oneshot::Sender<Result<bool, String>>>,
+    oneshot::Sender<Result<(), AppError>>,
+);
+
+fn take_finished_state(
+    lua: &Lua,
+    states: &mut HashMap<u64, CoState>,
+    waiting: &mut HashMap<u64, u64>,
+    co_id: u64,
+) -> Option<FinishSenders> {
+    let st = states.remove(&co_id)?;
+    // 清理可能残留的 waiting 映射（此协程已结束）
+    waiting.retain(|_, v| *v != co_id);
+    let _ = lua.remove_registry_value(st.thread_key);
+    let _ = lua.remove_registry_value(st.ctx_table_key);
+    drop(st.ctx);
+    Some((st.timer_done, st.reply))
 }
 
 /// 回收一个已结束的 ngx.thread 子协程：只清理其 registry 句柄与 waiting 残留，
@@ -3918,6 +5156,19 @@ impl LuaUserData for crate::shared_dict::SharedZone {
                 }
             },
         );
+        // d:get_keys(max?) -> keys, more（默认 1024，与 OpenResty 一致）
+        methods.add_method("get_keys", |lua, this, max: Option<usize>| {
+            let (keys, more) = this.get_keys(max.unwrap_or(1024));
+            let t = lua.create_table()?;
+            for (i, k) in keys.iter().enumerate() {
+                t.raw_set(i + 1, lua.create_string(k)?)?;
+            }
+            Ok((t, LuaValue::Boolean(more)))
+        });
+        // d:expire(key, exptime) -> true | false（key 不存在/已过期）
+        methods.add_method("expire", |_, this, (key, ex): (String, f64)| {
+            Ok(this.expire(&key, ex))
+        });
     }
 }
 
@@ -3935,6 +5186,37 @@ fn lua_value_to_bytes(v: &LuaValue) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 定死 `*_file` 的契约：请求路径只查内存、绝不 stat；发现变更的是后台自检。
+    /// 断言都按本测试的文件过滤，避免与并行用例共用全局 FILE_CACHE 时互相干扰。
+    #[test]
+    fn lua_file_cache_only_refreshed_by_self_check() {
+        let dir = std::env::temp_dir().join(format!("onrouter-luawatch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("watch.lua");
+        let touched = |changed: &[PathBuf]| changed.iter().any(|x| x == &p);
+
+        std::fs::write(&p, "v1").unwrap();
+        assert_eq!(&*load_file_cached(&p).unwrap(), "v1");
+
+        // 留足时间让 mtime 一定变化（NTFS 时间戳粒度约 10ms）
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&p, "v2").unwrap();
+        assert_eq!(
+            &*load_file_cached(&p).unwrap(),
+            "v1",
+            "请求路径不应 stat，编辑后仍返回缓存内容"
+        );
+
+        assert!(touched(&recheck_cached_files()), "自检应发现该文件变更");
+        assert_eq!(&*load_file_cached(&p).unwrap(), "v2");
+        assert!(!touched(&recheck_cached_files()), "内容未再变化时自检应为空操作");
+
+        std::fs::remove_file(&p).unwrap();
+        assert!(touched(&recheck_cached_files()), "文件消失应清掉缓存条目");
+        assert!(load_file_cached(&p).is_err(), "缓存已失效且文件不存在 -> 读取报错");
+        let _ = std::fs::remove_dir(&dir);
+    }
 
     #[test]
     fn md5_matches_rfc1321_vectors() {
@@ -4097,6 +5379,233 @@ mod tests {
         }
     }
 
+    // 低并发快速路径：空闲 VM 在连接任务里内联跑首段；脚本让出后由 Adopt 移交给调度器，
+    // 与走 Job 队列的请求混跑也必须全部完成且不丢唤醒（sleep + ngx.thread 都覆盖）。
+    #[tokio::test]
+    async fn fast_path_inline_and_adopt_mix_with_scheduler_jobs() {
+        let cfg = Config::parse("lua_shared_dict t 1m;").unwrap();
+        let engine = Arc::new(LuaEngine::new(&cfg, &std::path::PathBuf::from(".")).unwrap());
+        let src = LuaSource::Inline(Arc::from(
+            r#"
+            ngx.shared.t:incr("entered", 1, 0)
+            ngx.sleep(0.005)
+            local th = ngx.thread.spawn(function()
+                ngx.sleep(0.002)
+                return "child-ok"
+            end)
+            local ok, v = ngx.thread.wait(th)
+            assert(ok and v == "child-ok", "thread.wait 结果异常")
+            ngx.shared.t:incr("done", 1, 0)
+        "#,
+        ));
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..48 {
+            let engine = Arc::clone(&engine);
+            let src = src.clone();
+            set.spawn(async move {
+                engine
+                    .run_phase(
+                        "content_by_lua",
+                        &src,
+                        Arc::new(Mutex::new(RequestCtx::default())),
+                    )
+                    .await
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            r.expect("任务 panic").expect("Lua 阶段失败");
+        }
+        let probe: Arc<str> = Arc::from(
+            r#"
+            assert(tonumber(ngx.shared.t:get("entered")) == 48, "entered=" .. tostring(ngx.shared.t:get("entered")))
+            assert(tonumber(ngx.shared.t:get("done")) == 48, "done=" .. tostring(ngx.shared.t:get("done")))
+        "#,
+        );
+        engine
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(probe),
+                Arc::new(Mutex::new(RequestCtx::default())),
+            )
+            .await
+            .expect("并发快速路径结果校验失败");
+    }
+
+    // lua_package_path 占位符：`;;` 保留默认路径，不写则整体替换；`$prefix` 两写法等价。
+    #[test]
+    fn package_path_expansion_matches_openresty_semantics() {
+        assert_eq!(
+            expand_package_path("$prefix/lua/?.lua;;", "D1;D2", "/srv/app"),
+            "/srv/app/lua/?.lua;D1;D2"
+        );
+        assert_eq!(
+            expand_package_path("${prefix}/lua/?.lua", "D1;D2", "/srv/app"),
+            "/srv/app/lua/?.lua"
+        );
+        assert_eq!(expand_package_path(";;", "D1", "P"), "D1");
+    }
+
+    // init_worker_by_lua_block：每个 VM 各执行一次；lua_package_path 让 require 从磁盘加载；
+    // init_by_lua 先于 init_worker；脚本里的 ngx.timer.at 真正触发。
+    #[tokio::test]
+    async fn init_worker_runs_per_vm_with_lua_package_path() {
+        let dir = std::env::temp_dir().join(format!("onrouter-initw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("helper.lua"), "return { value = 'loaded-from-disk' }").unwrap();
+        let dir_slash = dir.to_string_lossy().replace('\\', "/");
+        let conf = format!(
+            r#"
+            lua_shared_dict t 1m;
+            lua_package_path "{dir_slash}/?.lua;;";
+            init_by_lua_block {{ ngx.shared.t:set("init", "by-init") }}
+            init_worker_by_lua_block {{
+                assert(ngx.shared.t:get("init") == "by-init", "init_by_lua 必须先执行")
+                local h = require("helper")
+                ngx.shared.t:set("worker_mod", h.value)
+                ngx.shared.t:incr("worker_runs", 1, 0)
+                local ok = ngx.timer.at(0, function(premature)
+                    ngx.shared.t:set("timer", premature and "premature" or "fired")
+                end)
+                assert(ok, "ngx.timer.at 注册失败")
+            }}
+        "#
+        );
+        let cfg = Config::parse(&conf).unwrap();
+        let engine = LuaEngine::new(&cfg, &dir).unwrap();
+        engine.run_init_workers().await.unwrap();
+        // 定时器在调度器里异步触发，给它一个窗口
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let n = engine.vm_count();
+        let probe: Arc<str> = Arc::from(format!(
+            r#"
+            local t = ngx.shared.t
+            assert(t:get("init") == "by-init", "init_by_lua 未执行")
+            assert(t:get("worker_mod") == "loaded-from-disk", "require(helper) 未从 lua_package_path 加载")
+            assert(tonumber(t:get("worker_runs")) == {n}, "init_worker 应每个 VM 执行一次，实际 " .. tostring(t:get("worker_runs")))
+            assert(package.path:find("{dir_slash}/?.lua", 1, true), "package.path 未包含配置目录")
+            assert(t:get("timer") == "fired", "init_worker 里注册的 timer 未触发")
+        "#
+        ));
+        engine
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(probe),
+                Arc::new(Mutex::new(RequestCtx::default())),
+            )
+            .await
+            .expect("init_worker 结果校验失败");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 定时器回调由调度器按协程执行：回调里的 ngx.sleep / ngx.thread.spawn+wait /
+    // 嵌套 ngx.timer.at 都可用；ngx.timer.every 回调 return false 后不再续期。
+    #[tokio::test]
+    async fn timer_callback_runs_as_coroutine_and_every_stops_on_false() {
+        let cfg = Config::parse("lua_shared_dict t 1m;").unwrap();
+        let engine = LuaEngine::new(&cfg, &std::path::PathBuf::from(".")).unwrap();
+        let src: Arc<str> = Arc::from(
+            r#"
+            assert(ngx.timer.at(0.01, function(premature, tag)
+                assert(premature == false, "premature 应为 false")
+                assert(ngx.get_phase() == "timer", "phase=" .. tostring(ngx.get_phase()))
+                ngx.sleep(0.02)
+                ngx.shared.t:set("slept", tag)
+                local th = ngx.thread.spawn(function()
+                    ngx.sleep(0.01)
+                    return "child-timer"
+                end)
+                local ok, v = ngx.thread.wait(th)
+                assert(ok and v == "child-timer", "定时器内 thread.wait 结果异常")
+                ngx.shared.t:set("thread", v)
+                assert(ngx.timer.at(0.01, function()
+                    ngx.sleep(0.01)
+                    ngx.shared.t:set("nested", "ok")
+                end))
+            end, "arg0"))
+
+            assert(ngx.timer.every(0.02, function()
+                ngx.sleep(0.005)
+                local n = (tonumber(ngx.shared.t:get("every_n")) or 0) + 1
+                ngx.shared.t:set("every_n", n)
+                if n >= 2 then return false end
+            end))
+        "#,
+        );
+        engine
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(src),
+                Arc::new(Mutex::new(RequestCtx::default())),
+            )
+            .await
+            .expect("注册定时器失败");
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let probe: Arc<str> = Arc::from(
+            r#"
+            local t = ngx.shared.t
+            assert(t:get("slept") == "arg0", "回调里的 ngx.sleep 未生效")
+            assert(t:get("thread") == "child-timer", "回调里的 ngx.thread 未生效")
+            assert(t:get("nested") == "ok", "回调里注册的嵌套 timer 未触发")
+            assert(tonumber(t:get("every_n")) == 2, "every 次数异常: " .. tostring(t:get("every_n")))
+            t:set("every_seen", tostring(t:get("every_n")))
+        "#,
+        );
+        engine
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(probe),
+                Arc::new(Mutex::new(RequestCtx::default())),
+            )
+            .await
+            .expect("定时器协程结果校验失败");
+
+        // return false 之后不得再续期
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        engine
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(Arc::from(
+                    r#"assert(ngx.shared.t:get("every_seen") == tostring(ngx.shared.t:get("every_n")), "every 未在 return false 后停止")"#,
+                )),
+                Arc::new(Mutex::new(RequestCtx::default())),
+            )
+            .await
+            .expect("every 停止校验失败");
+    }
+
+    // init_worker_by_lua_file：从配置文件解析出的 _file 形式同样每 VM 执行一次；
+    // 文件缺失时启动阶段即失败（而不是静默跳过）。
+    #[tokio::test]
+    async fn init_worker_file_runs_and_missing_file_fails_startup() {
+        let dir = std::env::temp_dir().join(format!("onrouter-initwf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("worker.lua");
+        std::fs::write(&script, r#"ngx.shared.t:set("from_file", "yes")"#).unwrap();
+        let script_slash = script.to_string_lossy().replace('\\', "/");
+        let conf = format!(
+            "lua_shared_dict t 1m;\ninit_worker_by_lua_file \"{script_slash}\";\n"
+        );
+        let cfg = Config::parse(&conf).unwrap();
+        let engine = LuaEngine::new(&cfg, &dir).unwrap();
+        engine.run_init_workers().await.unwrap();
+        engine
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(Arc::from(
+                    r#"assert(ngx.shared.t:get("from_file") == "yes", "init_worker_by_lua_file 未执行")"#,
+                )),
+                Arc::new(Mutex::new(RequestCtx::default())),
+            )
+            .await
+            .expect("_file 形式 init_worker 未生效");
+
+        let bad = Config::parse("init_worker_by_lua_file \"definitely-not-exist.lua\";").unwrap();
+        assert!(LuaEngine::new(&bad, &dir).is_err(), "缺失的 init_worker 文件应在启动时报错");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // balancer_by_lua 端到端（引擎级）：Lua 里 ngx.balancer 的选择结果应落到 RequestCtx，
     // 供 proxy::forward 绕开 upstream 负载均衡直连该节点。
     #[tokio::test]
@@ -4257,6 +5766,155 @@ mod tests {
         assert!(find("x-del").is_empty(), "value=nil 应删除该头");
         assert!(find("user-agent").is_empty(), "clear_header 删除");
         assert_eq!(find("X-Raw-Name"), vec!["kept"], "set_raw_header 保留原始名");
+    }
+
+    // ngx.req.socket：对已缓冲请求体的顺序读取（receive/receiveuntil/close）
+    #[tokio::test]
+    async fn ngx_req_socket_reads_buffered_body() {
+        let cfg = Config::parse("").unwrap();
+        let base = std::path::PathBuf::from(".");
+        let engine = LuaEngine::new(&cfg, &base).unwrap();
+        let mut ctx = RequestCtx::default();
+        ctx.req_body = Bytes::from_static(b"part1\r\n\r\npart2-tail");
+        let shared = Arc::new(Mutex::new(ctx));
+        let code: Arc<str> = r#"
+            local sock = ngx.req.socket()
+            local a = sock:receive(5)
+            local b = sock:receiveuntil("\r\n\r\n")()
+            local c = sock:receive(4)
+            local rest = sock:receive()
+            local d, err = sock:receive(1)
+            ngx.say('a=' .. a)
+            ngx.say('b=' .. b)
+            ngx.say('c=' .. c)
+            ngx.say('rest=' .. rest)
+            ngx.say('d=' .. tostring(d) .. ' err=' .. tostring(err))
+        "#
+        .into();
+        engine
+            .run_phase("content_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .await
+            .expect("req.socket phase 执行失败");
+        let body =
+            String::from_utf8_lossy(shared.lock().unwrap().body.as_deref().unwrap_or(&[])).to_string();
+        assert!(body.contains("a=part1"), "{body}");
+        assert!(body.contains("b=\r\n\r\n"), "{body}");
+        assert!(body.contains("c=part"), "{body}");
+        assert!(body.contains("rest=2-tail"), "{body}");
+        assert!(body.contains("d=nil err=closed"), "{body}");
+    }
+
+    // ngx.flush：立即发 Head + 已缓冲数据；脚本结束后剩余输出由服务层补发
+    #[tokio::test]
+    async fn ngx_flush_emits_head_and_buffered_body() {
+        use crate::engine::{StreamEvent, StreamSink};
+        let cfg = Config::parse("").unwrap();
+        let base = std::path::PathBuf::from(".");
+        let engine = LuaEngine::new(&cfg, &base).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut ctx = RequestCtx::default();
+        ctx.status = 201;
+        ctx.stream = Some(StreamSink::new(
+            tx,
+            vec![("x-extra".to_string(), "1".to_string())],
+        ));
+        let shared = Arc::new(Mutex::new(ctx));
+        let code: Arc<str> = r#"
+            ngx.header["X-Test"] = "yes"
+            ngx.say("first")
+            assert(ngx.flush() == 1)
+            ngx.say("second")
+        "#
+        .into();
+        engine
+            .run_phase("content_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .await
+            .expect("flush phase 执行失败");
+
+        match rx.try_recv().expect("脚本结束前应已收到 Head") {
+            StreamEvent::Head { status, headers } => {
+                assert_eq!(status, 201);
+                assert!(headers
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("x-test") && v == "yes"));
+                assert!(headers
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("x-extra") && v == "1"));
+                assert!(headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-type")));
+            }
+            other => panic!("首帧应为 Head: {other:?}"),
+        }
+        match rx.try_recv().expect("flush 应已发出数据帧") {
+            StreamEvent::Data(b) => assert_eq!(&b[..], b"first\n"),
+            other => panic!("第二帧应为 Data: {other:?}"),
+        }
+
+        // VM 的 registry 还会短暂持有最后一次 resume 的 ctx 句柄，故按服务层的
+        // take_ctx 语义克隆一份来收尾（End 帧保证响应体一定终止）。
+        let mut ctx = shared.lock().unwrap().clone();
+        assert_eq!(ctx.body.as_deref(), Some(&b"second\n"[..]));
+        ctx.drain_and_end_stream().await;
+        match rx.recv().await.expect("补发帧") {
+            StreamEvent::Data(b) => assert_eq!(&b[..], b"second\n"),
+            other => panic!("补发帧应为 Data: {other:?}"),
+        }
+        assert!(matches!(rx.recv().await, Some(StreamEvent::End)));
+    }
+
+    // ngx.ssl：握手阶段读 SNI、解析 PEM、设置证书/私钥；ngx.exit(ngx.ERROR) 标记中止
+    #[tokio::test]
+    async fn ngx_ssl_sets_cert_and_reads_sni() {
+        use crate::engine::SslState;
+        let pair = rcgen::generate_simple_self_signed(vec!["a.test".into()]).unwrap();
+        let cert_pem = pair.cert.pem();
+        let key_pem = pair.key_pair.serialize_pem();
+        let cfg = Config::parse("").unwrap();
+        let engine = LuaEngine::new(&cfg, &std::path::PathBuf::from(".")).unwrap();
+
+        let mut ctx = RequestCtx::default();
+        ctx.ssl = Some(SslState {
+            server_name: Some("A.Test".into()),
+            ..SslState::default()
+        });
+        let shared = Arc::new(Mutex::new(ctx));
+        let code: Arc<str> = format!(
+            r#"
+            local ssl = require "ngx.ssl"
+            local sni = ssl.server_name()
+            local cert = assert(ssl.parse_pem_cert([==[{cert_pem}]==]))
+            local key = assert(ssl.parse_pem_priv_key([==[{key_pem}]==]))
+            local ok, err = ssl.set_cert_and_key(cert, key)
+            ngx.say(sni .. '|' .. tostring(ok) .. '|' .. tostring(err))
+            "#
+        )
+        .into();
+        engine
+            .run_phase("ssl_certificate", &LuaSource::Inline(code), Arc::clone(&shared))
+            .await
+            .expect("ssl phase 执行失败");
+        {
+            let ctx = shared.lock().unwrap();
+            let ssl = ctx.ssl.as_ref().expect("ssl 状态应保留");
+            assert_eq!(ssl.server_name.as_deref(), Some("A.Test"));
+            assert_eq!(ssl.cert_chain.as_ref().map(|c| c.len()), Some(1));
+            assert!(ssl.priv_key.is_some());
+            assert!(!ssl.aborted);
+            let body = String::from_utf8_lossy(ctx.body.as_deref().unwrap_or(&[]));
+            assert!(body.contains("A.Test|true|nil"), "{body}");
+        }
+
+        // ngx.exit(ngx.ERROR)：不报 Lua 错误，但把握手标记为中止
+        let mut ctx = RequestCtx::default();
+        ctx.ssl = Some(SslState::default());
+        let shared = Arc::new(Mutex::new(ctx));
+        let code: Arc<str> = "ngx.exit(ngx.ERROR)".into();
+        engine
+            .run_phase("ssl_certificate", &LuaSource::Inline(code), Arc::clone(&shared))
+            .await
+            .expect("ngx.exit(ngx.ERROR) 不应抛 Lua 错误");
+        assert!(shared.lock().unwrap().ssl.as_ref().unwrap().aborted);
     }
 
     // body_filter_by_lua 原语：ngx.arg[1] 读改响应体块、ngx.arg[2] 读 eof —— 代理路径过滤器复用之

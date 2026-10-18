@@ -96,12 +96,15 @@ pub struct UpstreamServer {
     pub conns: AtomicUsize,
     /// 主动健康检查结论；未配置探测时恒为 true
     pub healthy: AtomicBool,
+    /// 代理层上报的请求结果（指标用；是否触发摘除由 fails 单独判定）
+    successes: AtomicU64,
+    failures: AtomicU64,
     fails: AtomicUsize,
     /// 被动摘除截止时间（epoch 毫秒；0 = 可用）
     down_until: AtomicU64,
     probe_fails: AtomicUsize,
     probe_rises: AtomicUsize,
-    /// SWRR 状态：只在持有 `Upstream::schedule` 锁时写（report_* 也先取锁）
+    /// SWRR 状态：只在持有 `Upstream::schedule` 锁时写（acquire 路径）
     current_weight: AtomicIsize,
     effective_weight: AtomicIsize,
 }
@@ -118,6 +121,8 @@ impl UpstreamServer {
             max_conns: 0,
             conns: AtomicUsize::new(0),
             healthy: AtomicBool::new(true),
+            successes: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
             fails: AtomicUsize::new(0),
             down_until: AtomicU64::new(0),
             probe_fails: AtomicUsize::new(0),
@@ -154,6 +159,7 @@ impl UpstreamServer {
     /// 满 max_fails 次：有效权重降一档（最低 0）并进入摘除期。
     /// 权重降到 0 不等于永久摘除——fail_timeout 到期后靠真实流量试探恢复。
     fn note_failure(&self) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
         let n = self.fails.fetch_add(1, Ordering::Relaxed) + 1;
         if n < self.max_fails.max(1) {
             return;
@@ -171,10 +177,20 @@ impl UpstreamServer {
     }
 
     fn note_success(&self) {
+        self.successes.fetch_add(1, Ordering::Relaxed);
         self.fails.store(0, Ordering::Relaxed);
         self.down_until.store(0, Ordering::Relaxed);
         self.effective_weight
             .store(self.weight as isize, Ordering::Relaxed);
+    }
+
+    /// 代理层上报的累计成功/失败数（指标渲染用）
+    pub fn success_count(&self) -> u64 {
+        self.successes.load(Ordering::Relaxed)
+    }
+
+    pub fn failure_count(&self) -> u64 {
+        self.failures.load(Ordering::Relaxed)
     }
 
     /// 主动探测结果落账：fails/rises 双阈值，只在状态翻转时打日志（避免每轮刷屏）
@@ -223,23 +239,19 @@ impl Upstream {
             s.restore_if_expired(now);
         }
 
-        let group = self.candidates(false, tried);
-        let group = if group.is_empty() {
-            self.candidates(true, tried)
-        } else {
-            group
-        };
+        let mut group = self.candidates(false, tried);
+        if group.is_empty() {
+            group = self.candidates(true, tried);
+        }
         if group.is_empty() {
             return None;
         }
         // 摘除期内的节点权重已归零：只要还有正权重节点就不给它流量；
-        // 全组都是零时保留原组，让流量去试探最早失败的节点（否则一旦全摘除就再也起不来）
-        let live: Vec<usize> = group
-            .iter()
-            .copied()
-            .filter(|i| self.servers[*i].effective() > 0)
-            .collect();
-        let group = if live.is_empty() { group } else { live };
+        // 全组都是零时保留原组，让流量去试探最早失败的节点（否则一旦全摘除就再也起不来）。
+        // 原地 retain 而不是再 collect 一个 Vec：取节点在每请求热路径上，省一次分配。
+        if group.iter().any(|i| self.servers[*i].effective() > 0) {
+            group.retain(|i| self.servers[*i].effective() > 0);
+        }
 
         let idx = match self.lb {
             LoadBalance::RoundRobin => self.pick_swrr(&group),
@@ -313,12 +325,12 @@ impl Upstream {
         candidates[0]
     }
 
-    /// 代理层上报健康结果（拿调度锁，和 SWRR 的写者串行）
+    /// 代理层上报健康结果。只写节点自身的原子量，不碰 SWRR 的 current_weight，
+    /// 因此无需调度锁——锁只保护 acquire 的选点轨迹。
     pub fn report(&self, idx: usize, ok: bool) {
         let Some(s) = self.servers.get(idx) else {
             return;
         };
-        let _sched = self.schedule.lock().unwrap_or_else(|e| e.into_inner());
         if ok {
             s.note_success();
         } else {
@@ -679,12 +691,6 @@ mod tests {
 
     fn upstream(conf: &str) -> Arc<Upstream> {
         Arc::clone(pool(conf).unwrap().get("u").unwrap())
-    }
-
-    fn pick(up: &Arc<Upstream>, tried: &[usize]) -> String {
-        up.acquire("10.0.0.1", tried)
-            .map(|g| (*g).clone())
-            .unwrap_or_else(|| "<none>".into())
     }
 
     /// 一次选完就立刻释放连接租约，否则 max_conns/least_conn 的计数会串扰

@@ -105,6 +105,37 @@ def main():
         check("get_plus flags==0（无类型存储）", p.get("pflags") == "0", f"pflags={p.get('pflags')}")
         check("get2 值/stale/flags", p.get("g2v") == "42" and p.get("g2stale") == "false" and p.get("g2flags") == "0", f"g2={p}")
 
+        st, body = get("/accounting")
+        a = kv(body)
+        check("/accounting 200", st == 200, f"st={st}")
+        check("capacity==64k", a.get("cap") == "65536", f"cap={a.get('cap')}")
+        d_aaa = int(a["f0"]) - int(a["f1"]) if {"f0", "f1"} <= a.keys() else None
+        d_bbb = int(a["f1"]) - int(a["f2"]) if {"f1", "f2"} <= a.keys() else None
+        d_shrink = int(a["f3"]) - int(a["f2"]) if {"f2", "f3"} <= a.keys() else None
+        d_del1 = int(a["f4"]) - int(a["f3"]) if {"f3", "f4"} <= a.keys() else None
+        d_del2 = int(a["f5"]) - int(a["f4"]) if {"f4", "f5"} <= a.keys() else None
+        check("set 计入 free_space(3+1+64)", d_aaa == 68, f"delta={d_aaa} body={a}")
+        check("第二项计入 free_space(3+10+64)", d_bbb == 77, f"delta={d_bbb}")
+        check("覆盖为更小值释放 9 字节", d_shrink == 9, f"delta={d_shrink}")
+        check("delete aaa 释放 68", d_del1 == 68, f"delta={d_del1}")
+        check("delete bbb 释放 68 且回到基线", d_del2 == 68 and a.get("f5") == a.get("f0"), f"delta={d_del2} f0={a.get('f0')} f5={a.get('f5')}")
+        check("exptime=0 表示永不过期", a.get("never") == "true", f"never={a.get('never')}")
+
+        st, body = get("/expired")
+        e = kv(body)
+        check("/expired 200", st == 200, f"st={st}")
+        check("过期项 key_present=false", e.get("present") == "false", f"present={e.get('present')}")
+        check("add 覆盖过期项成功", e.get("add") == "true" and e.get("val") == "n", f"add={e.get('add')} val={e.get('val')}")
+        check("覆盖过期项不重复计费(释放165/记入66)", e.get("d1") == "99", f"d1={e.get('d1')}")
+        check("flush_all 回收全部已用空间(165)", e.get("d2") == "165", f"d2={e.get('d2')}")
+
+        st, body = get("/incrspace")
+        g = kv(body)
+        check("/incrspace 200", st == 200, f"st={st}")
+        check("incr 一位→两位计费 +1", g.get("g1") == "1", f"g1={g.get('g1')}")
+        check("incr 两位→三位计费 +1", g.get("g2") == "1", f"g2={g.get('g2')}")
+        check("incr 缩位释放 2 字节", g.get("g3") == "2", f"g3={g.get('g3')}")
+
     finally:
         proc.terminate()
         try:

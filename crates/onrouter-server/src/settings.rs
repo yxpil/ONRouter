@@ -241,6 +241,8 @@ impl Settings {
 
         // reload：配置热重载轮询间隔。`reload 2s;` 每 2s 检查 mtime；`reload on;` 默认 1s；
         // `reload off;`（默认）不自动重载，但 unix 仍可用 SIGHUP 触发。
+        // 注意：`*.lua` 脚本文件的 1 秒定期自检与这个开关无关，任何时候都常开
+        //（main.rs 的 reload 任务 -> lua_engine::recheck_cached_files）。
         if let Some(v) = config.find("reload").and_then(|d| d.arg(0)) {
             match v.to_ascii_lowercase().as_str() {
                 "off" => s.reload = None,

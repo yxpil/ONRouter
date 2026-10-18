@@ -5,12 +5,18 @@
 //! 对应 nginx 的 `listen 443 ssl` + 多 server 块 + SNI 语义。
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::crypto::ring::sign::any_supported_type;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+};
+use rustls::server::{
+    ClientHello, NoServerSessionStorage, ProducesTickets, ResolvesServerCert,
+    ServerSessionMemoryCache, StoresServerSessions,
+};
 use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig, SupportedProtocolVersion};
 
@@ -123,6 +129,48 @@ pub struct TlsOptions {
     pub http2: bool,
     /// 显式启用的 TLS 协议集合（`ssl_protocols`）
     pub protocols: TlsProtocols,
+    /// 会话恢复策略（`ssl_session_cache` / `ssl_session_tickets`）
+    pub session: SessionOptions,
+}
+
+/// `ssl_session_cache` 的三种模式（nginx 语义）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCache {
+    /// 不保存会话（nginx `off` / `none`）；若 tickets 开，仍可无状态恢复
+    Off,
+    /// 每个监听端口独立缓存，n 为会话条数（nginx `builtin[:n]`）
+    Builtin(usize),
+    /// 同名监听共享一个进程级缓存（nginx `shared:name:size`，size 按字节折算条数）
+    Shared { name: String, capacity: usize },
+}
+
+impl Default for SessionCache {
+    /// 保持既有行为：每监听 256 条，开箱即用可恢复。
+    fn default() -> Self {
+        SessionCache::Builtin(256)
+    }
+}
+
+/// 一次构建内所有 TLS 监听共享的会话设施。
+/// `shared_store` 和 `ticketer` 由 Router 构建时注入，使多端口行为与 nginx 的
+/// shared 缓存 / 进程内 ticket 密钥一致（而不是每个监听各自一套）。
+#[derive(Clone, Default)]
+pub struct SessionOptions {
+    pub cache: SessionCache,
+    pub tickets: bool,
+    pub shared_store: Option<Arc<dyn StoresServerSessions>>,
+    pub ticketer: Option<Arc<dyn ProducesTickets>>,
+}
+
+impl fmt::Debug for SessionOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionOptions")
+            .field("cache", &self.cache)
+            .field("tickets", &self.tickets)
+            .field("shared_store", &self.shared_store.is_some())
+            .field("ticketer", &self.ticketer.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -193,8 +241,16 @@ pub fn build_resolver(specs: &[CertSpec]) -> Result<SniResolver, String> {
         let key_der = load_key(&spec.key)?;
         let key = any_supported_type(&key_der)
             .map_err(|e| format!("私钥 {} 不被支持的签名算法: {e}", spec.key.display()))?;
-        // 校验私钥与证书公钥匹配（rustls 在 CertifiedKey 使用时才报，这里提前失败）
+        // 校验私钥与证书公钥匹配（rustls 在 CertifiedKey 使用时才报，这里提前失败）；
+        // keys_match 同时会解析 X.509，损坏/伪造的 DER 在加载期就被拒绝，而不是拖到握手。
         let ck = Arc::new(CertifiedKey::new(certs, key));
+        ck.keys_match().map_err(|e| {
+            format!(
+                "证书 {} 与私钥 {} 不匹配或证书无效: {e}",
+                spec.cert.display(),
+                spec.key.display()
+            )
+        })?;
         if default.is_none() {
             default = Some(Arc::clone(&ck));
         }
@@ -219,8 +275,69 @@ pub fn build_resolver(specs: &[CertSpec]) -> Result<SniResolver, String> {
     })
 }
 
+/// ssl_certificate_by_lua 选出的固定证书：任何 SNI 都返回它（OpenResty set_cert 的语义——
+/// 脚本显式指定后不再按 SNI 查表）。
+#[derive(Debug)]
+pub struct StaticResolver(pub Arc<CertifiedKey>);
+
+impl ResolvesServerCert for StaticResolver {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
+}
+
+/// 解析 DER 私钥。脚本可能传 PKCS#8 / PKCS#1 / SEC1，逐个尝试比在 Lua 侧暴露格式差异更稳。
+fn parse_der_key(der: Vec<u8>) -> Result<PrivateKeyDer<'static>, String> {
+    let candidates = [
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der.clone())),
+        PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der.clone())),
+        PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der)),
+    ];
+    for k in candidates {
+        if any_supported_type(&k).is_ok() {
+            return Ok(k);
+        }
+    }
+    Err("私钥 DER 无法识别（支持 PKCS#8 / PKCS#1 / SEC1）".to_string())
+}
+
+/// ngx.ssl.set_cert_and_key 的落地点：DER 证书链 + DER 私钥 → CertifiedKey。
+/// 同时校验私钥与首张证书匹配，让脚本里的错误在握手中立即暴露。
+pub fn certified_key_from_der(cert_chain: Vec<Vec<u8>>, key_der: Vec<u8>) -> Result<CertifiedKey, String> {
+    if cert_chain.is_empty() {
+        return Err("证书链为空".to_string());
+    }
+    let certs: Vec<CertificateDer<'static>> = cert_chain
+        .into_iter()
+        .map(|d| CertificateDer::from(d).into_owned())
+        .collect();
+    let key = any_supported_type(&parse_der_key(key_der)?)
+        .map_err(|e| format!("私钥不被支持的签名算法: {e}"))?;
+    let ck = CertifiedKey::new(certs, key);
+    ck.keys_match()
+        .map_err(|e| format!("证书与私钥不匹配: {e}"))?;
+    Ok(ck)
+}
+
+/// 动态证书缓存键：内容相同的一组证书/私钥共用同一份 ServerConfig（会话缓存也因此收敛）。
+pub fn cert_pair_id(cert_chain: &[Vec<u8>], key_der: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    cert_chain.hash(&mut h);
+    key_der.hash(&mut h);
+    h.finish()
+}
+
 pub fn build_server_config(opts: &TlsOptions) -> Result<ServerConfig, String> {
     let resolver = Arc::new(build_resolver(&opts.specs)?);
+    build_server_config_with(opts, resolver)
+}
+
+/// 用给定证书解析器装配其余 TLS 参数（协议集、ALPN、会话恢复）。
+pub fn build_server_config_with(
+    opts: &TlsOptions,
+    resolver: Arc<dyn ResolvesServerCert>,
+) -> Result<ServerConfig, String> {
     let protocols = opts.protocols.normalized();
     // rustls 只能协商 TLS1.2/1.3；1.0/1.1 由 feature-gated native 后端负责（见 build_native_acceptor）。
     let versions = protocols.rustls_versions();
@@ -238,6 +355,21 @@ pub fn build_server_config(opts: &TlsOptions) -> Result<ServerConfig, String> {
     } else {
         vec![b"http/1.1".to_vec()]
     };
+    // 会话恢复：off 明确用"永不存储"实现（默认 memory cache 会悄悄缓存）；
+    // shared 必须由 Router 注入同一实例，才能跨监听端口恢复。
+    config.session_storage = match &opts.session.cache {
+        SessionCache::Off => Arc::new(NoServerSessionStorage {}),
+        SessionCache::Builtin(cap) => ServerSessionMemoryCache::new((*cap).max(1)),
+        SessionCache::Shared { .. } => match &opts.session.shared_store {
+            Some(store) => Arc::clone(store),
+            None => return Err("ssl_session_cache shared 缺少共享存储实例".to_string()),
+        },
+    };
+    if opts.session.tickets {
+        if let Some(t) = &opts.session.ticketer {
+            config.ticketer = Arc::clone(t);
+        }
+    }
     Ok(config)
 }
 
@@ -369,6 +501,7 @@ mod tests {
             specs: vec![spec.clone()],
             http2: true,
             protocols: TlsProtocols::default(),
+            session: SessionOptions::default(),
         })
         .unwrap();
         assert_eq!(h2.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
@@ -377,6 +510,7 @@ mod tests {
             specs: vec![spec],
             http2: false,
             protocols: TlsProtocols::from_min(TlsVersion::Tls13),
+            session: SessionOptions::default(),
         })
         .unwrap();
         assert_eq!(h1.alpn_protocols, vec![b"http/1.1".to_vec()]);
@@ -437,9 +571,95 @@ mod tests {
             protocols: TlsProtocols {
                 enabled: vec![TlsVersion::Tls10, TlsVersion::Tls11],
             },
+            session: SessionOptions::default(),
         });
         assert!(err.is_err(), "仅 TLS1.0/1.1 时 rustls 后端应明确拒绝而非静默降级");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_cache_modes_and_ticketer_are_wired() {
+        let dir = std::env::temp_dir().join(format!("onrouter-certs-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (c, k) = write_pair(&dir, &["localhost"]);
+        let spec = CertSpec {
+            names: vec!["localhost".into()],
+            cert: c,
+            key: k,
+        };
+
+        let off = build_server_config(&TlsOptions {
+            specs: vec![spec.clone()],
+            http2: false,
+            protocols: TlsProtocols::default(),
+            session: SessionOptions {
+                cache: SessionCache::Off,
+                tickets: false,
+                ..SessionOptions::default()
+            },
+        })
+        .unwrap();
+        assert!(!off.session_storage.can_cache(), "off 必须真正不缓存");
+        assert!(!off.ticketer.enabled(), "tickets off 时不应签发 ticket");
+
+        let shared: Arc<dyn StoresServerSessions> = ServerSessionMemoryCache::new(8);
+        let ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
+        let cfg = build_server_config(&TlsOptions {
+            specs: vec![spec.clone()],
+            http2: false,
+            protocols: TlsProtocols::default(),
+            session: SessionOptions {
+                cache: SessionCache::Shared {
+                    name: "SSL".into(),
+                    capacity: 8,
+                },
+                tickets: true,
+                shared_store: Some(Arc::clone(&shared)),
+                ticketer: Some(Arc::clone(&ticketer)),
+            },
+        })
+        .unwrap();
+        assert!(cfg.session_storage.can_cache());
+        assert!(
+            Arc::ptr_eq(&cfg.session_storage, &shared),
+            "shared 模式必须复用注入的同一缓存实例"
+        );
+        assert!(Arc::ptr_eq(&cfg.ticketer, &ticketer));
+        assert!(cfg.ticketer.enabled());
+
+        let missing = build_server_config(&TlsOptions {
+            specs: vec![spec],
+            http2: false,
+            protocols: TlsProtocols::default(),
+            session: SessionOptions {
+                cache: SessionCache::Shared {
+                    name: "SSL".into(),
+                    capacity: 8,
+                },
+                ..SessionOptions::default()
+            },
+        });
+        assert!(missing.is_err(), "shared 模式未注入存储时应明确报错");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_certified_key_from_der_validates_pairing() {
+        let pair = rcgen::generate_simple_self_signed(vec!["dyn.test".into()]).unwrap();
+        let chain = vec![pair.cert.der().as_ref().to_vec()];
+        let key = pair.key_pair.serialize_der();
+        let ck = certified_key_from_der(chain.clone(), key.clone()).expect("合法证书对");
+        assert_eq!(ck.cert.len(), 1);
+
+        // 同一证书配另一把私钥 -> 拒绝（keys_match 校验）
+        let other = rcgen::generate_simple_self_signed(vec!["dyn.test".into()]).unwrap();
+        assert!(
+            certified_key_from_der(chain.clone(), other.key_pair.serialize_der()).is_err(),
+            "私钥错配必须被拒绝"
+        );
+        assert!(certified_key_from_der(Vec::new(), key.clone()).is_err(), "空证书链必须拒绝");
+        // 缓存键随内容变化
+        assert_ne!(cert_pair_id(&chain, &key), cert_pair_id(&chain, b"other"));
     }
 
     #[test]

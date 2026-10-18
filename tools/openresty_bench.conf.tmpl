@@ -1,0 +1,51 @@
+# Linux A/B 用的 OpenResty 配置模板：由 tools/linux_ab.sh 渲染到临时前缀，
+# 端点与 conf/bench_ab.conf 逐条对齐。__REPO__ 会替换为仓库根目录的绝对路径。
+worker_processes auto;
+error_log logs/error.log warn;
+pid logs/nginx.pid;
+
+events {
+    worker_connections 10240;
+}
+
+http {
+    access_log off;
+    lua_shared_dict counters 1m;
+
+    upstream demo_backend {
+        server 127.0.0.1:9001;
+        server 127.0.0.1:9002;
+    }
+
+    server {
+        listen 8080;
+        server_name localhost;
+        root __REPO__/public;
+
+        # 与 conf/bench_ab.conf 里 content_by_lua 的字符串完全一致
+        location = /bench/hello {
+            content_by_lua "ngx.say('hello-from-lua-benchmark') ngx.say('method=', ngx.req.get_method(), ' path=', ngx.var.uri)";
+        }
+
+        location = /bench/count {
+            content_by_lua "local d = ngx.shared.counters local n = d:incr('hits', 1, 0) ngx.header['Content-Type'] = 'text/plain; charset=utf-8' ngx.say('hits=' .. n)";
+        }
+
+        location = /bench/luafile {
+            content_by_lua_file __REPO__/conf/bench_hello.lua;
+        }
+
+        location /bench/proxy/ {
+            proxy_pass http://demo_backend/;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+
+        location = /health {
+            return 200 "ok";
+        }
+
+        location / {
+            root __REPO__/public;
+        }
+    }
+}

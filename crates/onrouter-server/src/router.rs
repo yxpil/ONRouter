@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use onrouter_config::{Config, Directive};
 
-use crate::certs::{CertSpec, TlsOptions, TlsProtocols, TlsVersion};
+use crate::certs::{CertSpec, SessionCache, SessionOptions, TlsOptions, TlsProtocols, TlsVersion};
 use crate::engine::{
     HandlerSpec, GeoDef, GeoRule, MapCase, MapDef, Phase, ReturnAction, RewriteFlag, RewriteRule,
     SplitBucket, SplitDef,
@@ -102,11 +102,16 @@ pub struct Location {
     pub ret: Option<ReturnAction>,
     pub proxy_pass: Option<String>,
     pub proxy_set_headers: Vec<(String, String)>,
-    pub proxy_read_timeout: u64,
-    pub proxy_connect_timeout: u64,
-    pub proxy_send_timeout: u64,
-    /// `proxy_next_upstream off | error | timeout | http_500 | ...`（默认 error,timeout）
+    pub proxy_read_timeout: std::time::Duration,
+    pub proxy_connect_timeout: std::time::Duration,
+    pub proxy_send_timeout: std::time::Duration,
+    /// `proxy_next_upstream off | error | timeout | invalid_header | non_idempotent | http_XXX`
+    /// （默认 error,timeout）
     pub proxy_next_upstream: Vec<String>,
+    /// `proxy_next_upstream_tries`：最多尝试节点数（0 = 跟随 upstream 节点数）
+    pub proxy_next_upstream_tries: u32,
+    /// `proxy_next_upstream_timeout`：换节点总时间预算（0 = 不限制）
+    pub proxy_next_upstream_timeout: std::time::Duration,
     /// `proxy_request_buffering on|off`（默认 on）。off 且该 location 有 proxy_pass 时，
     /// 请求体边收边转发给后端，网关不再整体缓冲（nginx 语义）。
     pub proxy_request_buffering: bool,
@@ -141,6 +146,16 @@ pub struct Location {
     pub proxy_cache_valid: Vec<(Vec<String>, std::time::Duration)>,
     /// `proxy_cache_min_uses N`（默认 1）：同一 key 第 N 次起才写入
     pub proxy_cache_min_uses: u32,
+    /// `proxy_cache_lock on|off`：同一 key 并发未命中时只放一个请求回源
+    pub proxy_cache_lock: bool,
+    /// `proxy_cache_lock_timeout`（默认 5s）：等锁超时后自己回源
+    pub proxy_cache_lock_timeout: std::time::Duration,
+    /// `proxy_cache_use_stale`：回源失败/指定状态码/刷新中时回放过期条目
+    pub proxy_cache_use_stale: Vec<String>,
+    /// `proxy_cache_bypass`：任一表达式展开为非空且非 "0" 时不读缓存
+    pub proxy_cache_bypass: Vec<String>,
+    /// `proxy_no_cache`：任一表达式展开为非空且非 "0" 时不写缓存
+    pub proxy_no_cache: Vec<String>,
     /// `proxy_ssl_*`：https/wss 后端的客户端 TLS 策略
     pub proxy_tls: TlsPolicy,
     /// `sub_filter ...`：响应体文本替换输出过滤器（None=未启用）
@@ -179,11 +194,23 @@ pub struct Server {
     pub real_ip: crate::realip::RealIpConf,
 }
 
+/// 一个 server 块的 `ssl_certificate_by_lua*`：握手阶段按 SNI 选中并执行。
+/// `names` 是该 server 的 server_name 集合，空表示兜底（无 SNI 命中时使用）。
+#[derive(Debug, Clone)]
+pub struct SslCertScript {
+    pub names: Vec<String>,
+    /// 原始指令名（ssl_certificate_by_lua / _file），日志与错误信息用
+    pub directive: String,
+    pub source: LuaSource,
+}
+
 /// 一个真实监听端点
 #[derive(Debug, Clone)]
 pub struct Listener {
     pub addr: SocketAddr,
     pub tls: Option<TlsOptions>,
+    /// 该监听上各 server 的握手脚本（按配置顺序；空 = 不启用）
+    pub ssl_cert_scripts: Vec<SslCertScript>,
     /// 明文监听是否接受 h2c（prior-knowledge）；TLS 监听的 h2 由 tls.http2 决定
     pub http2: bool,
     /// `listen ... quic`：该端点用 QUIC/HTTP/3 服务（UDP），隐含 tls=Some。
@@ -245,6 +272,8 @@ pub struct Router {
     pub warnings: Vec<String>,
     /// 顶层 `stream{}` 解析出的四层监听配置（HTTP 路由之外，由 stream.rs 独立服务）。
     pub stream: Vec<StreamServer>,
+    /// 顶层 `proxy_cache_path ... keys_zone=name:size` 换算出的每区条目上限
+    pub cache_zones: HashMap<String, usize>,
 }
 
 /// 一个 server 块里除 listen 之外的所有配置模板
@@ -259,15 +288,23 @@ struct ServerTemplate {
     client_max_body_size: Option<u64>,
     add_headers: Vec<(String, String)>,
     proxy_set_headers: Vec<(String, String)>,
-    proxy_connect_timeout: u64,
-    proxy_read_timeout: u64,
-    proxy_send_timeout: u64,
+    proxy_connect_timeout: std::time::Duration,
+    proxy_read_timeout: std::time::Duration,
+    proxy_send_timeout: std::time::Duration,
+    proxy_next_upstream: Vec<String>,
+    proxy_next_upstream_tries: u32,
+    proxy_next_upstream_timeout: std::time::Duration,
     proxy_request_buffering: bool,
     proxy_cache: Option<String>,
     proxy_cache_key: String,
     proxy_cache_methods: Vec<String>,
     proxy_cache_valid: Vec<(Vec<String>, std::time::Duration)>,
     proxy_cache_min_uses: u32,
+    proxy_cache_lock: bool,
+    proxy_cache_lock_timeout: std::time::Duration,
+    proxy_cache_use_stale: Vec<String>,
+    proxy_cache_bypass: Vec<String>,
+    proxy_no_cache: Vec<String>,
     proxy_tls: TlsPolicy,
     limit_conn: Vec<ConnRule>,
     access_rules: Vec<crate::access::AccessRule>,
@@ -276,6 +313,7 @@ struct ServerTemplate {
     real_ip: crate::realip::RealIpConf,
     ssl_cert: Option<PathBuf>,
     ssl_key: Option<PathBuf>,
+    ssl_cert_script: Option<SslCertScript>,
     protocols: TlsProtocols,
     http2: bool,
 }
@@ -393,10 +431,30 @@ pub fn parse_size(s: &str) -> Option<u64> {
     num.trim().parse::<u64>().ok().map(|n| n * mult)
 }
 
-fn parse_time_secs(v: &str, default: u64) -> u64 {
-    crate::settings::parse_duration(v)
-        .map(|d| d.as_secs())
-        .unwrap_or(default)
+/// nginx 时间值：带 ms 精度，0 表示不限（由调用方解释）。
+fn parse_time(v: &str, default: std::time::Duration) -> std::time::Duration {
+    crate::settings::parse_duration(v).unwrap_or(default)
+}
+
+/// nginx 的 proxy_next_upstream 取值；http_XXX 任意三位状态码，其余未知 token 告警忽略。
+fn validate_next_upstream(args: &[String], warnings: &mut Vec<String>) {
+    for a in args {
+        let known = matches!(
+            a.as_str(),
+            "off" | "error" | "timeout" | "invalid_header" | "non_idempotent"
+        ) || a
+            .strip_prefix("http_")
+            .and_then(|s| s.parse::<u16>().ok())
+            .is_some();
+        if !known {
+            warnings.push(format!("proxy_next_upstream 未识别的取值 '{a}'（已忽略）"));
+        }
+    }
+}
+
+/// `client_max_body_size`：0 在 nginx 里表示"不限制"，这里翻成 u64::MAX 以便覆盖继承值。
+fn parse_body_limit(v: &str) -> Option<u64> {
+    parse_size(v).map(|n| if n == 0 { u64::MAX } else { n })
 }
 
 fn parse_on_off(v: &str) -> Option<bool> {
@@ -404,6 +462,146 @@ fn parse_on_off(v: &str) -> Option<bool> {
         "on" | "true" | "1" => Some(true),
         "off" | "false" | "0" => Some(false),
         _ => None,
+    }
+}
+
+/// 解析顶层 `ssl_session_cache`：
+///   off | none | builtin[:条数] | shared:名称:容量
+/// nginx 允许 builtin 与 shared 并存；这里只保留最后一个并告警（单后端不做复合缓存）。
+fn parse_session_cache(config: &Config, warnings: &mut Vec<String>) -> SessionCache {
+    let mut result = SessionCache::default();
+    for d in config
+        .root
+        .block
+        .iter()
+        .filter(|d| d.name == "ssl_session_cache")
+    {
+        if d.args.is_empty() {
+            warnings.push(format!(
+                "第 {} 行 ssl_session_cache 缺少参数（off/builtin[:n]/shared:name:size）",
+                d.line
+            ));
+            continue;
+        }
+        let mut chosen = 0usize;
+        for tok in &d.args {
+            let lower = tok.to_ascii_lowercase();
+            let parsed = if lower == "off" || lower == "none" {
+                Some(SessionCache::Off)
+            } else if lower == "builtin" {
+                Some(SessionCache::Builtin(256))
+            } else if let Some(n) = lower.strip_prefix("builtin:") {
+                match n.parse::<usize>() {
+                    Ok(v) if v > 0 => Some(SessionCache::Builtin(v)),
+                    _ => {
+                        warnings.push(format!(
+                            "第 {} 行 ssl_session_cache builtin 条数非法 '{tok}'，按 256 处理",
+                            d.line
+                        ));
+                        Some(SessionCache::Builtin(256))
+                    }
+                }
+            } else if lower.starts_with("shared:") {
+                let rest = &tok["shared:".len()..];
+                match rest.rsplit_once(':') {
+                    Some((name, size)) if !name.is_empty() => match parse_size(size) {
+                        Some(bytes) if bytes > 0 => Some(SessionCache::Shared {
+                            name: name.to_string(),
+                            // nginx 的容量单位是字节；rustls 按会话条数计，按每会话约 512B 折算
+                            capacity: ((bytes / 512).clamp(64, 1_000_000)) as usize,
+                        }),
+                        _ => {
+                            warnings.push(format!(
+                                "第 {} 行 ssl_session_cache 容量非法 '{size}'（应如 10m）",
+                                d.line
+                            ));
+                            None
+                        }
+                    },
+                    _ => {
+                        warnings.push(format!(
+                            "第 {} 行 ssl_session_cache 格式应为 shared:名称:容量（收到 '{tok}'）",
+                            d.line
+                        ));
+                        None
+                    }
+                }
+            } else {
+                warnings.push(format!(
+                    "第 {} 行 ssl_session_cache 无法识别 '{tok}'（支持 off/builtin[:n]/shared:name:size）",
+                    d.line
+                ));
+                None
+            };
+            if let Some(p) = parsed {
+                if chosen > 0 {
+                    warnings.push(format!(
+                        "第 {} 行 ssl_session_cache 配置了多种模式，ONRouter 只采用最后一个",
+                        d.line
+                    ));
+                }
+                result = p;
+                chosen += 1;
+            }
+        }
+    }
+    result
+}
+
+/// 顶层 `ssl_session_tickets on|off`（nginx 默认 on）。
+fn parse_session_tickets(config: &Config, warnings: &mut Vec<String>) -> bool {
+    let mut on = true;
+    for d in config
+        .root
+        .block
+        .iter()
+        .filter(|d| d.name == "ssl_session_tickets")
+    {
+        match d.arg(0).and_then(|v| parse_on_off(v)) {
+            Some(v) => on = v,
+            None => warnings.push(format!(
+                "第 {} 行 ssl_session_tickets 只接受 on/off（收到 '{}'），保持 {}",
+                d.line,
+                d.arg(0).unwrap_or(""),
+                if on { "on" } else { "off" }
+            )),
+        }
+    }
+    on
+}
+
+/// 组装本进程所有 TLS 监听共用的会话设施。
+/// tickets 开 → 整个进程一份 ticket 密钥（跨端口可无状态恢复）；
+/// shared → 整个进程一份内存缓存，而非每个监听各建一份。
+fn parse_session_options(config: &Config, warnings: &mut Vec<String>) -> SessionOptions {
+    let cache = parse_session_cache(config, warnings);
+    let tickets = parse_session_tickets(config, warnings);
+    let shared_store = match &cache {
+        SessionCache::Shared { capacity, .. } => {
+            let store: std::sync::Arc<dyn rustls::server::StoresServerSessions> =
+                rustls::server::ServerSessionMemoryCache::new((*capacity).max(1));
+            Some(store)
+        }
+        _ => None,
+    };
+    let ticketer = if tickets {
+        match rustls::crypto::ring::Ticketer::new() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                warnings.push(format!(
+                    "TLS ticketer 初始化失败（{e}），回退到有状态会话缓存"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    SessionOptions {
+        cache,
+        tickets,
+        shared_store,
+        ticketer,
     }
 }
 
@@ -464,6 +662,11 @@ struct CacheSettings {
     valid: Vec<(Vec<String>, std::time::Duration)>,
     has_valid: bool,
     min_uses: Option<u32>,
+    lock: Option<bool>,
+    lock_timeout: Option<std::time::Duration>,
+    use_stale: Option<Vec<String>>,
+    bypass: Option<Vec<String>>,
+    no_cache: Option<Vec<String>>,
 }
 
 fn parse_cache_directives(d: &Directive, warnings: &mut Vec<String>) -> CacheSettings {
@@ -474,6 +677,11 @@ fn parse_cache_directives(d: &Directive, warnings: &mut Vec<String>) -> CacheSet
         valid: Vec::new(),
         has_valid: false,
         min_uses: None,
+        lock: None,
+        lock_timeout: None,
+        use_stale: None,
+        bypass: None,
+        no_cache: None,
     };
     if let Some(v) = d.find("proxy_cache").and_then(|x| x.arg(0)) {
         cs.zone = Some(if v.eq_ignore_ascii_case("off") {
@@ -515,22 +723,80 @@ fn parse_cache_directives(d: &Directive, warnings: &mut Vec<String>) -> CacheSet
             _ => warnings.push(format!("proxy_cache_min_uses 需为 ≥1 整数，已忽略 '{v}'")),
         }
     }
+    if let Some(v) = d.find("proxy_cache_lock").and_then(|x| x.arg(0)) {
+        match parse_on_off(v) {
+            Some(b) => cs.lock = Some(b),
+            None => warnings.push(format!("proxy_cache_lock 只接受 on/off（收到 '{v}'），保持 off")),
+        }
+    }
+    if let Some(v) = d.find("proxy_cache_lock_timeout").and_then(|x| x.arg(0)) {
+        match crate::settings::parse_duration(v) {
+            Some(dur) => cs.lock_timeout = Some(dur),
+            None => warnings.push(format!(
+                "proxy_cache_lock_timeout 时长非法 '{v}'，保持 5s"
+            )),
+        }
+    }
+    if let Some(u) = d.find("proxy_cache_use_stale") {
+        let mut tokens: Vec<String> = Vec::new();
+        for a in &u.args {
+            let t = a.to_ascii_lowercase();
+            let valid = matches!(
+                t.as_str(),
+                "off" | "error"
+                    | "timeout"
+                    | "updating"
+                    | "invalid_header"
+                    | "http_403"
+                    | "http_404"
+                    | "http_429"
+                    | "http_500"
+                    | "http_501"
+                    | "http_502"
+                    | "http_503"
+                    | "http_504"
+                    | "http_505"
+            );
+            if valid {
+                tokens.push(t);
+            } else {
+                warnings.push(format!(
+                    "第 {} 行 proxy_cache_use_stale 不支持 '{a}'，已忽略",
+                    u.line
+                ));
+            }
+        }
+        // nginx：`off` 与其他值混写时只有 off 生效
+        if tokens.iter().any(|t| t == "off") {
+            tokens.clear();
+        }
+        cs.use_stale = Some(tokens);
+    }
+    if let Some(b) = d.find("proxy_cache_bypass") {
+        cs.bypass = Some(b.args.clone());
+    }
+    if let Some(n) = d.find("proxy_no_cache") {
+        cs.no_cache = Some(n.args.clone());
+    }
     cs
 }
 
 impl Router {
     pub fn build(config: &Config, base_dir: &PathBuf) -> Result<Self, AppError> {
-        Self::build_with_listeners(config, base_dir, None)
+        Self::build_with_listeners(config, base_dir, None).map(|(r, _)| r)
     }
 
     /// 热重载：复用进程已绑定的监听集合，只按新配置重建 vhost/location 路由表。
     /// reload 期间从不触碰 listen socket（无 accept 空窗），因此新增/改动的
     /// server/location 对新请求立即生效；配置里新引入的监听地址不会被绑定（需重启）。
-    pub fn rebuild_routing(
+    ///
+    /// 额外返回**新配置解析出的监听参数**（证书路径、协议集合、ssl_certificate_by_lua
+    /// 脚本），供 TLS 层原地刷新证书。Router.listeners 仍保留已绑定集合，不重新 bind。
+    pub fn rebuild_routing_with_specs(
         config: &Config,
         base_dir: &PathBuf,
         listeners: &[Listener],
-    ) -> Result<Self, AppError> {
+    ) -> Result<(Self, Vec<Listener>), AppError> {
         Self::build_with_listeners(config, base_dir, Some(listeners.to_vec()))
     }
 
@@ -720,14 +986,19 @@ impl Router {
         config: &Config,
         base_dir: &PathBuf,
         listener_override: Option<Vec<Listener>>,
-    ) -> Result<Self, AppError> {
+    ) -> Result<(Self, Vec<Listener>), AppError> {
         let mut warnings: Vec<String> = Vec::new();
+        Self::warn_unknown_top_level(config, &mut warnings);
+        // TLS 会话恢复策略是进程级的：所有监听共享同一份缓存/ticket 密钥
+        let session = parse_session_options(config, &mut warnings);
         // addr -> servers
         let mut groups: HashMap<SocketAddr, Vec<Arc<Server>>> = HashMap::new();
         // addr -> 默认 vhost 下标标记
         let mut defaults: HashMap<SocketAddr, usize> = HashMap::new();
         // addr -> TLS 证书集合
         let mut tls_specs: HashMap<SocketAddr, Vec<CertSpec>> = HashMap::new();
+        // addr -> ssl_certificate_by_lua 脚本（按 server 块配置顺序）
+        let mut tls_scripts: HashMap<SocketAddr, Vec<SslCertScript>> = HashMap::new();
         // addr -> (是否 ssl, 是否 http2, 最低 TLS 版本)
         struct Endpoint {
             ssl: bool,
@@ -769,11 +1040,15 @@ impl Router {
                 &["listen", "server_name", "root", "index", "autoindex", "try_files",
                    "error_page", "client_max_body_size", "return", "rewrite", "add_header",
                    "proxy_pass", "proxy_set_header", "proxy_read_timeout", "proxy_connect_timeout",
-                   "proxy_send_timeout", "proxy_next_upstream", "proxy_request_buffering", "limit_conn", "http2",
+                   "proxy_send_timeout", "proxy_next_upstream", "proxy_next_upstream_tries",
+                   "proxy_next_upstream_timeout", "proxy_request_buffering", "limit_conn", "http2",
                    "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
+                   "proxy_cache_lock", "proxy_cache_lock_timeout", "proxy_cache_use_stale",
+                   "proxy_cache_bypass", "proxy_no_cache",
                    "proxy_ssl_verify", "proxy_ssl_server_name", "proxy_ssl_name", "proxy_ssl_trusted_certificate",
                    "proxy_ssl_certificate", "proxy_ssl_certificate_key",
                    "ssl_certificate", "ssl_certificate_key", "ssl_min_version", "ssl_protocols",
+                   "ssl_certificate_by_lua", "ssl_certificate_by_lua_file",
                    "location", "content_by_lua", "content_by_lua_file", "access_by_lua",
                    "access_by_lua_file", "rewrite_by_lua", "rewrite_by_lua_file",
                    "header_filter_by_lua", "header_filter_by_lua_file",
@@ -842,7 +1117,15 @@ impl Router {
                         cert,
                         key,
                     });
+                    if let Some(mut script) = tmpl.ssl_cert_script.clone() {
+                        script.names = tmpl.server_names.clone();
+                        tls_scripts.entry(addr).or_default().push(script);
+                    }
                 } else if ep.ssl {
+                    if let Some(mut script) = tmpl.ssl_cert_script.clone() {
+                        script.names = tmpl.server_names.clone();
+                        tls_scripts.entry(addr).or_default().push(script);
+                    }
                     // 该端点已被其他 server 要求 TLS：这个 vhost 复用同一监听 socket，
                     // 只能走 HTTPS（与 nginx 行为一致：同一地址不能同时有明文与 TLS）
                     plain_conflicts.push(addr);
@@ -891,6 +1174,7 @@ impl Router {
                 specs: tls_specs.remove(&addr).unwrap_or_default(),
                 http2: e.http2,
                 protocols: e.protocols.clone(),
+                session: session.clone(),
             });
             if ep.map(|e| e.ssl).unwrap_or(false) && tls.as_ref().map(|t| t.specs.is_empty()).unwrap_or(true) {
                 return Err(AppError::Other(format!("{addr} 需要 TLS 但没有加载到证书")));
@@ -898,6 +1182,7 @@ impl Router {
             listeners.push(Listener {
                 addr,
                 tls,
+                ssl_cert_scripts: tls_scripts.remove(&addr).unwrap_or_default(),
                 http2: ep.map(|e| e.http2).unwrap_or(false),
                 quic: ep.map(|e| e.quic).unwrap_or(false),
                 backlog: ep.and_then(|e| e.backlog),
@@ -926,13 +1211,63 @@ impl Router {
         }
 
         let stream = Self::parse_streams(config, &mut warnings)?;
+        let cache_zones = Self::parse_cache_zones(config, &mut warnings);
 
-        Ok(Router {
-            groups: out_groups,
-            listeners: listener_override.unwrap_or(listeners),
-            warnings,
-            stream,
-        })
+        let config_listeners = listeners;
+        Ok((
+            Router {
+                groups: out_groups,
+                listeners: listener_override.unwrap_or_else(|| config_listeners.clone()),
+                warnings,
+                stream,
+                cache_zones,
+            },
+            config_listeners,
+        ))
+    }
+
+    /// 顶层 `proxy_cache_path <path> ... keys_zone=<name>:<size> ...;`
+    /// ONRouter 只有内存缓存，path/levels/max_size 不会落盘；keys_zone 的 size 用于
+    /// 换算每区条目上限（nginx 文档 1 MB ≈ 8000 key，这里按约 128 B/条估算）。
+    fn parse_cache_zones(config: &Config, warnings: &mut Vec<String>) -> HashMap<String, usize> {
+        let mut out = HashMap::new();
+        for d in config
+            .root
+            .block
+            .iter()
+            .filter(|d| d.name == "proxy_cache_path")
+        {
+            let Some(kz) = d
+                .args
+                .iter()
+                .find_map(|a| a.strip_prefix("keys_zone="))
+            else {
+                warnings.push(format!(
+                    "顶层第 {} 行 proxy_cache_path 缺少 keys_zone=<名称>:<容量>，已忽略",
+                    d.line
+                ));
+                continue;
+            };
+            let (name, size) = kz.split_once(':').unwrap_or((kz, ""));
+            let Some(bytes) = parse_size(size).filter(|b| *b > 0) else {
+                warnings.push(format!(
+                    "顶层第 {} 行 proxy_cache_path keys_zone 容量非法 '{size}'，已忽略",
+                    d.line
+                ));
+                continue;
+            };
+            if name.is_empty() {
+                warnings.push(format!(
+                    "顶层第 {} 行 proxy_cache_path keys_zone 缺少名称，已忽略",
+                    d.line
+                ));
+                continue;
+            }
+            // 128 B/条 → 1 MB ≈ 8192 条；下限 8 条便于测试/极小配置
+            let capacity = ((bytes / 128) as usize).max(8);
+            out.insert(name.to_string(), capacity);
+        }
+        out
     }
 
     /// 解析顶层 `stream { server { listen …; proxy_pass …; [ssl_preread on;] [sni_match …;] } }`。
@@ -1035,6 +1370,45 @@ impl Router {
         }
     }
 
+    /// 顶层未知指令告警。迁移 nginx.conf 时最常见的问题是"写了但没生效"，
+    /// 因此未识别的顶层指令必须在启动/重载日志里显式出现。
+    fn warn_unknown_top_level(config: &Config, warnings: &mut Vec<String>) {
+        const KNOWN: &[&str] = &[
+            "server", "stream", "upstream",
+            "map", "geo", "split_clients",
+            "limit_req_zone", "limit_conn_zone", "limit_req_status", "limit_conn_status",
+            "lua_shared_dict", "init_by_lua", "init_by_lua_file",
+            "init_worker_by_lua", "init_worker_by_lua_file", "lua_package_path",
+            "error_log", "error_log_max_size", "error_log_keep",
+            "access_log", "access_log_max_size", "access_log_keep",
+            "resolver", "resolver_timeout", "pid",
+            "worker_connections", "client_header_timeout", "client_body_timeout",
+            "keepalive_timeout", "tls_handshake_timeout", "shutdown_grace",
+            "keepalive_requests", "server_tokens", "tcp_nodelay", "accept_backlog",
+            "gzip", "gzip_min_length", "gzip_comp_level", "gzip_types", "reload",
+            "ssl_session_cache", "ssl_session_tickets", "proxy_cache_path",
+        ];
+        for d in &config.root.block {
+            match d.name.as_str() {
+                "worker_processes" => warnings.push(format!(
+                    "顶层第 {} 行：worker_processes 已忽略（ONRouter 为单进程多线程模型，\
+                     工作线程数固定为 CPU 核数）",
+                    d.line
+                )),
+                "log_format" => warnings.push(format!(
+                    "顶层第 {} 行：log_format 已忽略（access_log 固定使用内置 combined 格式，\
+                     暂不支持自定义格式）",
+                    d.line
+                )),
+                name if KNOWN.contains(&name) => {}
+                name => warnings.push(format!(
+                    "顶层第 {} 行：未知指令 '{name}'（已忽略，请检查拼写或是否尚未支持）",
+                    d.line
+                )),
+            }
+        }
+    }
+
     fn build_template(
         d: &Directive,
         base_dir: &PathBuf,
@@ -1049,18 +1423,26 @@ impl Router {
             index: vec!["index.html".to_string()],
             autoindex: false,
             error_pages: HashMap::new(),
-            client_max_body_size: None,
+            client_max_body_size: Some(1024 * 1024),
             add_headers: Vec::new(),
             proxy_set_headers: Vec::new(),
-            proxy_connect_timeout: 3,
-            proxy_read_timeout: 60,
-            proxy_send_timeout: 60,
+            proxy_connect_timeout: std::time::Duration::from_secs(3),
+            proxy_read_timeout: std::time::Duration::from_secs(60),
+            proxy_send_timeout: std::time::Duration::from_secs(60),
+            proxy_next_upstream: vec!["error".to_string(), "timeout".to_string()],
+            proxy_next_upstream_tries: 0,
+            proxy_next_upstream_timeout: std::time::Duration::ZERO,
             proxy_request_buffering: true,
             proxy_cache: None,
             proxy_cache_key: "$scheme$proxy_host$request_uri".to_string(),
             proxy_cache_methods: vec!["GET".to_string(), "HEAD".to_string()],
             proxy_cache_valid: Vec::new(),
             proxy_cache_min_uses: 1,
+            proxy_cache_lock: false,
+            proxy_cache_lock_timeout: std::time::Duration::from_secs(5),
+            proxy_cache_use_stale: Vec::new(),
+            proxy_cache_bypass: Vec::new(),
+            proxy_no_cache: Vec::new(),
             proxy_tls: TlsPolicy::default(),
             limit_conn: Vec::new(),
             access_rules: Vec::new(),
@@ -1069,6 +1451,7 @@ impl Router {
             real_ip: crate::realip::RealIpConf::default(),
             ssl_cert: None,
             ssl_key: None,
+            ssl_cert_script: None,
             protocols: TlsProtocols::default(),
             http2: false,
         };
@@ -1099,7 +1482,7 @@ impl Router {
         if let Some(v) = d
             .find("client_max_body_size")
             .and_then(|x| x.arg(0))
-            .and_then(parse_size)
+            .and_then(parse_body_limit)
         {
             tmpl.client_max_body_size = Some(v);
         }
@@ -1108,6 +1491,18 @@ impl Router {
         }
         if let Some(key) = d.find("ssl_certificate_key").and_then(|x| x.arg(0)) {
             tmpl.ssl_key = Some(crate::resolve_path(key, base_dir));
+        }
+        for name in ["ssl_certificate_by_lua", "ssl_certificate_by_lua_file"] {
+            if let Some(dir) = d.find(name) {
+                if let Some(src) = LuaSource::from_directive(dir, base_dir) {
+                    tmpl.ssl_cert_script = Some(SslCertScript {
+                        names: Vec::new(), // 落到监听时按 server_name 填
+                        directive: name.to_string(),
+                        source: src,
+                    });
+                    break;
+                }
+            }
         }
         // ssl_min_version：等价于"该版本及以上全部启用"（向后兼容别名）。
         if let Some(v) = d.find("ssl_min_version").and_then(|x| x.arg(0)) {
@@ -1156,7 +1551,29 @@ impl Router {
             ("proxy_send_timeout", &mut tmpl.proxy_send_timeout),
         ] {
             if let Some(v) = d.find(name).and_then(|x| x.arg(0)) {
-                *slot = parse_time_secs(v, *slot);
+                *slot = parse_time(v, *slot);
+            }
+        }
+        if let Some(nu) = d.find("proxy_next_upstream") {
+            validate_next_upstream(&nu.args, warnings);
+            tmpl.proxy_next_upstream = nu.args.clone();
+        }
+        if let Some(v) = d.find("proxy_next_upstream_tries").and_then(|x| x.arg(0)) {
+            match v.parse::<u32>() {
+                Ok(n) => tmpl.proxy_next_upstream_tries = n,
+                Err(_) => warnings.push(format!(
+                    "proxy_next_upstream_tries 需要非负整数（收到 '{v}'），保持 {}",
+                    tmpl.proxy_next_upstream_tries
+                )),
+            }
+        }
+        if let Some(v) = d.find("proxy_next_upstream_timeout").and_then(|x| x.arg(0)) {
+            match crate::settings::parse_duration(v) {
+                Some(t) => tmpl.proxy_next_upstream_timeout = t,
+                None => warnings.push(format!(
+                    "proxy_next_upstream_timeout 无法解析 '{v}'，保持 {:?}",
+                    tmpl.proxy_next_upstream_timeout
+                )),
             }
         }
         if let Some(v) = d.find("proxy_request_buffering").and_then(|x| x.arg(0)) {
@@ -1183,6 +1600,21 @@ impl Router {
         }
         if cs.min_uses.is_some() {
             tmpl.proxy_cache_min_uses = cs.min_uses.unwrap();
+        }
+        if let Some(b) = cs.lock {
+            tmpl.proxy_cache_lock = b;
+        }
+        if let Some(t) = cs.lock_timeout {
+            tmpl.proxy_cache_lock_timeout = t;
+        }
+        if let Some(s) = cs.use_stale {
+            tmpl.proxy_cache_use_stale = s;
+        }
+        if let Some(b) = cs.bypass {
+            tmpl.proxy_cache_bypass = b;
+        }
+        if let Some(n) = cs.no_cache {
+            tmpl.proxy_no_cache = n;
         }
         for c in d.block.iter().filter(|x| x.name == "limit_conn") {
             match crate::limit::parse_conn_rule(c) {
@@ -1274,13 +1706,20 @@ impl Router {
             proxy_read_timeout: tmpl.proxy_read_timeout,
             proxy_connect_timeout: tmpl.proxy_connect_timeout,
             proxy_send_timeout: tmpl.proxy_send_timeout,
-            proxy_next_upstream: vec!["error".to_string(), "timeout".to_string()],
+            proxy_next_upstream: tmpl.proxy_next_upstream.clone(),
+            proxy_next_upstream_tries: tmpl.proxy_next_upstream_tries,
+            proxy_next_upstream_timeout: tmpl.proxy_next_upstream_timeout,
             proxy_request_buffering: tmpl.proxy_request_buffering,
             proxy_cache: tmpl.proxy_cache.clone(),
             proxy_cache_key: tmpl.proxy_cache_key.clone(),
             proxy_cache_methods: tmpl.proxy_cache_methods.clone(),
             proxy_cache_valid: tmpl.proxy_cache_valid.clone(),
             proxy_cache_min_uses: tmpl.proxy_cache_min_uses,
+            proxy_cache_lock: tmpl.proxy_cache_lock,
+            proxy_cache_lock_timeout: tmpl.proxy_cache_lock_timeout,
+            proxy_cache_use_stale: tmpl.proxy_cache_use_stale.clone(),
+            proxy_cache_bypass: tmpl.proxy_cache_bypass.clone(),
+            proxy_no_cache: tmpl.proxy_no_cache.clone(),
             proxy_tls: tmpl.proxy_tls.clone(),
             rust_phases: Vec::new(),
             lua_phases: Vec::new(),
@@ -1306,8 +1745,11 @@ impl Router {
             d,
             &["rewrite", "return", "proxy_pass", "proxy_set_header", "proxy_read_timeout",
                "proxy_connect_timeout", "proxy_send_timeout", "proxy_next_upstream",
+               "proxy_next_upstream_tries", "proxy_next_upstream_timeout",
                "proxy_request_buffering",
                "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
+               "proxy_cache_lock", "proxy_cache_lock_timeout", "proxy_cache_use_stale",
+               "proxy_cache_bypass", "proxy_no_cache",
                "proxy_ssl_verify", "proxy_ssl_server_name", "proxy_ssl_name", "proxy_ssl_trusted_certificate",
                    "proxy_ssl_certificate", "proxy_ssl_certificate_key",
                "root",
@@ -1355,7 +1797,7 @@ impl Router {
         if let Some(v) = d
             .find("client_max_body_size")
             .and_then(|x| x.arg(0))
-            .and_then(parse_size)
+            .and_then(parse_body_limit)
         {
             loc.client_max_body_size = Some(v);
         }
@@ -1519,11 +1961,30 @@ impl Router {
             ("proxy_send_timeout", &mut loc.proxy_send_timeout),
         ] {
             if let Some(v) = d.find(name).and_then(|x| x.arg(0)) {
-                *slot = parse_time_secs(v, *slot);
+                *slot = parse_time(v, *slot);
             }
         }
         if let Some(nu) = d.find("proxy_next_upstream") {
+            validate_next_upstream(&nu.args, warnings);
             loc.proxy_next_upstream = nu.args.clone();
+        }
+        if let Some(v) = d.find("proxy_next_upstream_tries").and_then(|x| x.arg(0)) {
+            match v.parse::<u32>() {
+                Ok(n) => loc.proxy_next_upstream_tries = n,
+                Err(_) => warnings.push(format!(
+                    "proxy_next_upstream_tries 需要非负整数（收到 '{v}'），保持 {}",
+                    loc.proxy_next_upstream_tries
+                )),
+            }
+        }
+        if let Some(v) = d.find("proxy_next_upstream_timeout").and_then(|x| x.arg(0)) {
+            match crate::settings::parse_duration(v) {
+                Some(t) => loc.proxy_next_upstream_timeout = t,
+                None => warnings.push(format!(
+                    "proxy_next_upstream_timeout 无法解析 '{v}'，保持 {:?}",
+                    loc.proxy_next_upstream_timeout
+                )),
+            }
         }
         if let Some(v) = d.find("proxy_request_buffering").and_then(|x| x.arg(0)) {
             match parse_on_off(v) {
@@ -1550,6 +2011,21 @@ impl Router {
         }
         if lcs.min_uses.is_some() {
             loc.proxy_cache_min_uses = lcs.min_uses.unwrap();
+        }
+        if let Some(b) = lcs.lock {
+            loc.proxy_cache_lock = b;
+        }
+        if let Some(t) = lcs.lock_timeout {
+            loc.proxy_cache_lock_timeout = t;
+        }
+        if let Some(s) = lcs.use_stale {
+            loc.proxy_cache_use_stale = s;
+        }
+        if let Some(b) = lcs.bypass {
+            loc.proxy_cache_bypass = b;
+        }
+        if let Some(n) = lcs.no_cache {
+            loc.proxy_no_cache = n;
         }
         for r in d.block.iter().filter(|x| x.name == "limit_req") {
             match crate::limit::parse_req_rule(r) {
@@ -1664,12 +2140,18 @@ impl Router {
         let group = self
             .groups
             .get(&local)
-            // 兜底：同一端口其他地址绑定时共享 vhost 集合（例如 0.0.0.0 与 127.0.0.1 混配）
+            // 兜底：同一端口其他地址绑定时共享 vhost 集合（例如 0.0.0.0 与 127.0.0.1 混配）。
+            // HashMap 迭代顺序不稳定，必须显式排序：优先同协议族的未指定地址
+            // （0.0.0.0 / [::]），其余按 SocketAddr 字典序取最小，保证同一请求永远落到同一个 vhost。
             .or_else(|| {
                 self.groups
-                    .iter()
-                    .find(|(a, _)| a.port() == local.port())
-                    .map(|(_, g)| g)
+                    .keys()
+                    .filter(|a| a.port() == local.port())
+                    .min_by_key(|a| {
+                        let unspecified = a.ip().is_unspecified() && a.is_ipv4() == local.is_ipv4();
+                        (!unspecified, **a)
+                    })
+                    .and_then(|a| self.groups.get(a))
             })?;
         let servers = &group.servers;
         if let Some(h) = host.map(strip_port).filter(|h| !h.is_empty()) {
@@ -1906,6 +2388,185 @@ mod tests {
 
     fn build(s: &str) -> Router {
         Router::build(&cfg(s), &PathBuf::from(".")).unwrap()
+    }
+
+    #[test]
+    fn session_cache_directive_forms() {
+        let mut w = Vec::new();
+        assert_eq!(
+            parse_session_cache(&cfg("ssl_session_cache off;"), &mut w),
+            SessionCache::Off
+        );
+        assert_eq!(
+            parse_session_cache(&cfg("ssl_session_cache none;"), &mut w),
+            SessionCache::Off
+        );
+        assert_eq!(
+            parse_session_cache(&cfg("ssl_session_cache builtin:1000;"), &mut w),
+            SessionCache::Builtin(1000)
+        );
+        assert_eq!(
+            parse_session_cache(&cfg("ssl_session_cache shared:SSL:10m;"), &mut w),
+            SessionCache::Shared {
+                name: "SSL".into(),
+                capacity: 20480
+            }
+        );
+        assert!(w.is_empty(), "{w:?}");
+
+        // nginx 允许 builtin 与 shared 并存；这里取最后一个并告警
+        let mut w = Vec::new();
+        assert_eq!(
+            parse_session_cache(&cfg("ssl_session_cache builtin:100 shared:SSL:1m;"), &mut w),
+            SessionCache::Shared {
+                name: "SSL".into(),
+                capacity: 2048
+            }
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+
+        let mut w = Vec::new();
+        let _ = parse_session_cache(&cfg("ssl_session_cache shared:SSL:banana;"), &mut w);
+        assert!(!w.is_empty());
+    }
+
+    #[test]
+    fn session_options_share_ticketer_and_store() {
+        let mut w = Vec::new();
+        assert!(parse_session_tickets(&cfg("ssl_session_tickets on;"), &mut w));
+        let mut w = Vec::new();
+        assert!(!parse_session_tickets(&cfg("ssl_session_tickets off;"), &mut w));
+
+        let opts = parse_session_options(
+            &cfg("ssl_session_cache shared:SSL:1m; ssl_session_tickets on;"),
+            &mut w,
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert!(opts.tickets);
+        assert!(opts.ticketer.is_some());
+        assert!(opts.shared_store.is_some());
+        assert!(matches!(
+            opts.cache,
+            SessionCache::Shared { ref name, capacity: 2048 } if name == "SSL"
+        ));
+
+        let off = parse_session_options(
+            &cfg("ssl_session_cache off; ssl_session_tickets off;"),
+            &mut w,
+        );
+        assert!(!off.tickets);
+        assert!(off.ticketer.is_none());
+        assert!(off.shared_store.is_none());
+    }
+
+    #[test]
+    fn cache_lock_stale_bypass_directives_parse() {
+        let r = build(
+            r#"
+            proxy_cache_path /tmp/c levels=1:2 keys_zone=pages:16m max_size=1g;
+            server {
+                listen 127.0.0.1:18196;
+                location / {
+                    proxy_pass http://127.0.0.1:1;
+                    proxy_cache pages;
+                    proxy_cache_valid 200 1m;
+                    proxy_cache_min_uses 2;
+                    proxy_cache_lock on;
+                    proxy_cache_lock_timeout 250ms;
+                    proxy_cache_use_stale error timeout http_502 updating;
+                    proxy_cache_bypass $cookie_nocache $arg_nocache;
+                    proxy_no_cache $arg_nocache;
+                }
+            }
+            "#,
+        );
+        let loc = &r.groups[&"127.0.0.1:18196".parse::<std::net::SocketAddr>().unwrap()]
+            .servers[0]
+            .locations[0];
+        assert!(loc.proxy_cache_lock);
+        assert_eq!(
+            loc.proxy_cache_lock_timeout,
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(
+            loc.proxy_cache_use_stale,
+            vec!["error", "timeout", "http_502", "updating"]
+        );
+        assert_eq!(loc.proxy_cache_bypass, vec!["$cookie_nocache", "$arg_nocache"]);
+        assert_eq!(loc.proxy_no_cache, vec!["$arg_nocache"]);
+        assert_eq!(loc.proxy_cache_min_uses, 2);
+        // 16m keys_zone → 16*1024*1024/128 = 131072 条
+        assert_eq!(r.cache_zones.get("pages"), Some(&131072));
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("proxy_cache_path")),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn cache_use_stale_off_and_invalid_tokens() {
+        let conf = r#"
+            server {
+                listen 127.0.0.1:18196;
+                location /bad {
+                    proxy_cache_use_stale error garbage;
+                }
+                location /off {
+                    proxy_cache_use_stale off;
+                }
+                location /mixed {
+                    proxy_cache_use_stale error off;
+                }
+            }
+        "#;
+        let r = build(conf);
+        let srv = &r.groups[&"127.0.0.1:18196".parse::<std::net::SocketAddr>().unwrap()]
+            .servers[0];
+        assert_eq!(srv.locations[0].proxy_cache_use_stale, vec!["error"]);
+        assert!(
+            srv.locations[1].proxy_cache_use_stale.is_empty(),
+            "off 应清空 stale 集合"
+        );
+        assert!(
+            srv.locations[2].proxy_cache_use_stale.is_empty(),
+            "off 与其他值混写时只有 off 生效"
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("garbage")),
+            "未知 token 应告警: {:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn proxy_cache_path_without_keys_zone_warns() {
+        let mut w = Vec::new();
+        let zones = Router::parse_cache_zones(&cfg("proxy_cache_path /tmp/c;"), &mut w);
+        assert!(zones.is_empty());
+        assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn top_level_unknown_and_ignored_directives_warn() {
+        let conf = r#"
+            worker_processes auto;
+            log_format main '$remote_addr - $request';
+            totally_unknown_directive x;
+            gzip on;
+            server { listen 127.0.0.1:18195; location / { return 200 ok; } }
+        "#;
+        let r = build(conf);
+        let joined = r.warnings.join("\n");
+        assert!(joined.contains("worker_processes 已忽略"), "{joined}");
+        assert!(joined.contains("log_format 已忽略"), "{joined}");
+        assert!(
+            joined.contains("未知指令 'totally_unknown_directive'"),
+            "{joined}"
+        );
+        // 已知顶层指令不应产生告警
+        assert!(!joined.contains("未知指令 'gzip'"), "{joined}");
+        assert!(!joined.contains("未知指令 'server'"), "{joined}");
     }
 
     #[test]
@@ -2231,6 +2892,33 @@ mod tests {
     }
 
     #[test]
+    fn same_port_vhost_fallback_is_deterministic() {
+        // 未绑定的本机地址触发同端口兜底：优先同协议族的未指定地址（0.0.0.0），
+        // 不受 HashMap 迭代顺序影响。
+        let r = build(
+            r#"server { listen 127.0.0.1:18088; server_name loop; }
+               server { listen 0.0.0.0:18088; server_name wild; }"#,
+        );
+        for _ in 0..16 {
+            let s = r
+                .match_server("192.0.2.10:18088".parse().unwrap(), None)
+                .unwrap();
+            assert_eq!(s.server_name, "wild");
+        }
+        // 没有未指定地址时按 SocketAddr 字典序取最小，结果同样稳定。
+        let r = build(
+            r#"server { listen 127.0.0.2:18089; server_name two; }
+               server { listen 127.0.0.1:18089; server_name one; }"#,
+        );
+        for _ in 0..16 {
+            let s = r
+                .match_server("192.0.2.11:18089".parse().unwrap(), None)
+                .unwrap();
+            assert_eq!(s.server_name, "one");
+        }
+    }
+
+    #[test]
     fn unknown_directive_is_warned_not_silently_dropped() {
         let r = build(
             r#"server { listen 127.0.0.1:18099; server_name w; prxoy_pass http://127.0.0.1:1; }"#,
@@ -2448,6 +3136,38 @@ mod tests {
     }
 
     #[test]
+    fn client_max_body_size_default_is_one_megabyte_and_zero_means_unlimited() {
+        let r = build(
+            "server { listen 127.0.0.1:18080;
+                location / { }
+                location /big { client_max_body_size 0; }
+            }",
+        );
+        let s = r
+            .match_server("127.0.0.1:18080".parse().unwrap(), None)
+            .unwrap()
+            .clone();
+        assert_eq!(s.client_max_body_size, Some(1024 * 1024), "nginx 默认 1m");
+        assert_eq!(
+            Router::match_location(&s, "/small").unwrap().client_max_body_size,
+            None,
+            "location 未显式配置时继承 server"
+        );
+        assert_eq!(
+            Router::match_location(&s, "/big").unwrap().client_max_body_size,
+            Some(u64::MAX),
+            "0 = 不限制，需覆盖继承的 1m"
+        );
+
+        let r2 = build("server { listen 127.0.0.1:18081; client_max_body_size 0; location / { } }");
+        let s2 = r2
+            .match_server("127.0.0.1:18081".parse().unwrap(), None)
+            .unwrap()
+            .clone();
+        assert_eq!(s2.client_max_body_size, Some(u64::MAX), "server 级 0 同样不限制");
+    }
+
+    #[test]
     fn try_files_needs_fallback() {
         let err = Router::build(
             &cfg("server { listen 127.0.0.1:18080; location / { try_files $uri; } }"),
@@ -2573,7 +3293,9 @@ mod tests {
                 location = /added { return 200 "added"; }
             }
         "#;
-        let r1 = Router::rebuild_routing(&cfg(updated), &PathBuf::from("."), &bound).unwrap();
+        let (r1, fresh1) =
+            Router::rebuild_routing_with_specs(&cfg(updated), &PathBuf::from("."), &bound)
+                .unwrap();
 
         let a: SocketAddr = "127.0.0.1:18090".parse().unwrap();
         // 路由表更新：新增的 location 现在能命中，正文也换成新值
@@ -2586,14 +3308,23 @@ mod tests {
         // 监听集合原样保留（即便新配置里没提这个地址，也不新增/删除 socket）
         let addrs = |ls: &[Listener]| ls.iter().map(|l| l.addr).collect::<Vec<_>>();
         assert_eq!(addrs(&r1.listeners), addrs(&bound));
+        // 但新配置解析出的监听参数要单独交出来，供 TLS 证书/协议原地刷新
+        assert_eq!(addrs(&fresh1), addrs(&bound));
 
         // 新配置引入了一个**未绑定**的监听地址：rebuild_routing 不应把它加进来
         let with_new_port = r#"
             server { listen 127.0.0.1:18090; location = /x { return 200 "a"; } }
             server { listen 127.0.0.1:18099; location = /x { return 200 "b"; } }
         "#;
-        let r2 = Router::rebuild_routing(&cfg(with_new_port), &PathBuf::from("."), &bound).unwrap();
+        let (r2, fresh2) =
+            Router::rebuild_routing_with_specs(&cfg(with_new_port), &PathBuf::from("."), &bound)
+                .unwrap();
         assert_eq!(addrs(&r2.listeners), addrs(&bound), "热重载不绑定新监听地址（需重启）");
+        assert_eq!(
+            fresh2.len(),
+            2,
+            "新配置解析结果应包含 18090 与 18099，用于判断哪些监听可刷新、哪些需重启"
+        );
         // 已绑定的 18090 仍能正常路由
         assert!(r2.match_server(a, None).is_some());
     }

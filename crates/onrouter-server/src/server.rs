@@ -38,9 +38,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, OwnedSemaphorePermit};
 
 use crate::access_log::{AccessLog, LogRecord};
-use crate::certs;
 use crate::compress::{accepts_gzip, GzipBody};
-use crate::engine::{self, HandlerRegistry, Phase, RequestCtx};
+use crate::engine::{
+    self, HandlerRegistry, Phase, RequestCtx, StreamEvent, StreamSink,
+};
 use crate::lua_engine::LuaEngine;
 use crate::proxy::{ProxyBody, ProxyEngine, ProxyOpts, ProxyTimeouts};
 use crate::proxy_cache::CacheHit;
@@ -49,7 +50,29 @@ use crate::settings::Settings;
 use crate::tls::{self, TlsAcceptor};
 use crate::{log_debug, log_error, log_info, log_warn, AppError};
 
-pub type RespBody = BoxBody<Bytes, hyper::Error>;
+fn http_version_f64(v: Version) -> f64 {
+    match v {
+        Version::HTTP_09 => 0.9,
+        Version::HTTP_10 => 1.0,
+        Version::HTTP_11 => 1.1,
+        Version::HTTP_2 => 2.0,
+        Version::HTTP_3 => 3.0,
+        _ => 1.1,
+    }
+}
+
+/// 请求起始时间（epoch 秒）
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+
+/// 响应体错误类型：hyper::Error 无公开构造器，代理层无法在响应体中途表达
+/// “上游读超时”这类自定义错误，因此统一擦除成盒装错误（hyper/h3 都接受该类型）。
+pub type RespBody = BoxBody<Bytes, crate::proxy::BoxError>;
 pub type BoxResponse = Response<RespBody>;
 use http_body_util::combinators::BoxBody;
 
@@ -68,7 +91,9 @@ const PARSE_CEILING_BYTES: usize = 64 * 1024;
 /// 请求行（URI）长度上限，nginx 同样是 8K
 const MAX_URI_BYTES: usize = 8 * 1024;
 /// HTTP/2 并发流上限（nginx http2_max_concurrent_streams 默认 128）
-const MAX_CONCURRENT_STREAMS: u32 = 128;
+pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 128;
+/// 流式响应的通道容量（帧数）。慢客户端只能让脚本多缓冲，不会丢数据。
+const STREAM_CHANNEL_CAPACITY: usize = 64;
 
 pub struct AppState {
     /// 路由表放在热交换的 RwLock<Arc<Router>> 里：热重载任务只换这个 Arc，
@@ -83,6 +108,11 @@ pub struct AppState {
     pub limits: Arc<crate::limit::Limits>,
     /// 全局并发连接额度（worker_connections）
     pub permits: Arc<tokio::sync::Semaphore>,
+    /// 运行期 TLS 接受器 / QUIC endpoint 注册表：热重载时原地刷新证书与协议配置
+    pub tls_registry: crate::tls::TlsRegistry,
+    /// 当前生效的证书/私钥文件清单（去重）：重载任务据此监视 mtime/大小变化，
+    /// 让证书原地续期即便不动配置文件也能触发刷新。
+    pub cert_files: std::sync::RwLock<Vec<std::path::PathBuf>>,
 }
 
 impl AppState {
@@ -97,11 +127,29 @@ impl AppState {
 
     /// 热重载：原子替换路由表（写锁只覆盖一次 Arc 赋值）。
     pub fn swap_router(&self, next: Router) {
+        // 新的 proxy_cache_path keys_zone 容量随配置生效（已有 zone 立即裁剪）
+        self.proxy_cache.apply_capacities(&next.cache_zones);
         let mut w = self
             .router
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *w = Arc::new(next);
+    }
+
+    /// 当前证书/私钥文件清单快照（重载任务用于监视文件变化）。
+    pub fn cert_files(&self) -> Vec<std::path::PathBuf> {
+        self.cert_files
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// 热重载成功后更新证书文件清单（新配置可能换路径）。
+    pub fn set_cert_files(&self, files: Vec<std::path::PathBuf>) {
+        *self
+            .cert_files
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = files;
     }
 }
 
@@ -122,12 +170,14 @@ pub struct ConnMeta {
 
 pub fn full_body(b: impl Into<Bytes>) -> RespBody {
     Full::new(b.into())
-        .map_err(|never| match never {})
+        .map_err(|never| -> crate::proxy::BoxError { match never {} })
         .boxed()
 }
 
 fn empty_body() -> RespBody {
-    Empty::new().map_err(|never| match never {}).boxed()
+    Empty::new()
+        .map_err(|never| -> crate::proxy::BoxError { match never {} })
+        .boxed()
 }
 
 // ==================== 监听与 accept 循环 ====================
@@ -183,7 +233,7 @@ pub async fn serve(
 ) {
     let addr = listener.addr;
     let tls: Option<TlsAcceptor> = match &listener.tls {
-        Some(opts) => match tls::make_acceptor(opts) {
+        Some(opts) => match tls::make_acceptor(opts, &listener.ssl_cert_scripts, Arc::clone(&state.lua)) {
             Ok(acc) => {
                 let names: Vec<String> = opts
                     .specs
@@ -206,6 +256,11 @@ pub async fn serve(
         None => None,
     };
     let scheme = if tls.is_some() { "https" } else { "http" };
+    if let Some(acc) = &tls {
+        // 登记到运行期注册表：accept 循环每连接取最新句柄，SIGHUP/轮询重载可原地换证书
+        state.tls_registry.register_tcp(addr, acc.clone());
+    }
+    let is_tls = tls.is_some();
     // QUIC 端点在 TCP 响应上广播 Alt-Svc，让客户端发现同端口的 HTTP/3（h3 只在 https 上合法）
     let alt_svc: Option<String> = if listener.quic && tls.is_some() {
         Some(format!("h3=\":{}\"; ma=3600", addr.port()))
@@ -223,18 +278,27 @@ pub async fn serve(
         let accepted = tokio::select! {
             _ = shutdown.changed() => break,
             r = tcp.accept() => r,
+            // 顺手回收已完成的连接任务：JoinSet 只有 join 后才释放，
+            // 否则高流量下每个连接的任务内存会累积到进程退出
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
         };
         match accepted {
             Ok((stream, peer)) => {
                 backoff = Duration::from_millis(1);
                 crate::metrics::get().on_accept();
+                // 每连接取一次当前接受器：重载后新连接立即用新证书，在途握手不被打断
+                let current_tls = if is_tls {
+                    state.tls_registry.tcp(addr).or_else(|| tls.clone())
+                } else {
+                    None
+                };
                 spawn_connection(
                     &mut tasks,
                     Arc::clone(&state),
                     stream,
                     peer,
                     addr,
-                    tls.clone(),
+                    current_tls,
                     listener.http2,
                     alt_svc.clone(),
                     shutdown.clone(),
@@ -252,11 +316,19 @@ pub async fn serve(
         }
     }
 
+    // 先关闭监听 socket 再排空：grace 期间到达的新连接应立即被拒绝，
+    // 而不是在 backlog 里排到进程退出才被重置（nginx 的 listen close 语义）。
+    drop(tcp);
     drain_connections(&mut tasks, state.settings.shutdown_grace, addr).await;
 }
 
-/// 停机时在 grace 期内等在途连接自然结束，超时后强制断开（nginx 的 graceful shutdown 语义）
-async fn drain_connections(tasks: &mut tokio::task::JoinSet<()>, grace: Duration, addr: SocketAddr) {
+/// 停机时在 grace 期内等在途连接自然结束，超时后强制断开（nginx 的 graceful shutdown 语义）。
+/// HTTP/1.1、HTTP/2、HTTP/3 与 L4 stream 共用同一套排空逻辑。
+pub(crate) async fn drain_connections(
+    tasks: &mut tokio::task::JoinSet<()>,
+    grace: Duration,
+    addr: SocketAddr,
+) {
     if tasks.is_empty() {
         return;
     }
@@ -324,10 +396,12 @@ fn spawn_connection(
                 let (tls_stream, h2) = match handshake.await {
                     Ok(Ok(pair)) => pair,
                     Ok(Err(e)) => {
+                        crate::metrics::get().on_tls_handshake_failure();
                         log_debug!("TLS 握手失败 {peer}: {e}");
                         return;
                     }
                     Err(_) => {
+                        crate::metrics::get().on_tls_handshake_failure();
                         log_debug!("TLS 握手超时（{:.0?}）{peer}", state.settings.tls_handshake_timeout);
                         return;
                     }
@@ -376,7 +450,7 @@ async fn sniff_h2c_preface(stream: &TcpStream) -> bool {
 
 /// 过载快速拒绝：写一个 503 并关闭
 async fn reject_overloaded(mut stream: TcpStream) {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let body = b"service busy\r\n";
     let resp = format!(
         "HTTP/1.1 503 Service Unavailable\r\nserver: {SERVER_HEADER}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -387,6 +461,18 @@ async fn reject_overloaded(mut stream: TcpStream) {
     buf.extend_from_slice(body);
     let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(&buf)).await;
     let _ = stream.shutdown().await;
+    // 请求还在内核接收缓冲里没被读过，立即 close 会发 RST，把刚写出的 503 冲掉。
+    // 半关闭后给客户端几十毫秒排空（正常客户端读到 503 即关闭，不会真的等满）。
+    let mut sink = [0u8; 1024];
+    let _ = tokio::time::timeout(Duration::from_millis(50), async {
+        loop {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
 }
 
 /// 一条连接的读写循环：按 ALPN/明文选择 h1 或 h2，并在停机信号到来时优雅收尾
@@ -681,7 +767,7 @@ struct LoggedBody {
 
 impl Body for LoggedBody {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = crate::proxy::BoxError;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -804,7 +890,7 @@ async fn handle_request(
         query: uri.query().unwrap_or("").to_string(),
         uri: uri.to_string(),
         host,
-        remote_addr: rec.remote.clone(),
+        remote_addr: rec.remote(),
         remote_port: meta.peer.map(|p| p.port()).unwrap_or(0),
         server_port: meta.listener.port(),
         req_headers: header_pairs(headers),
@@ -812,9 +898,10 @@ async fn handle_request(
         rewritten_path: None,
         status: 200,
         body: None,
+        stream: None,
         done: false,
         internal_redirect: false,
-        req_body: Vec::new(),
+        req_body: Bytes::new(),
         exec_depth: 0,
         redirect: None,
         scheme: meta.scheme.to_string(),
@@ -830,34 +917,21 @@ async fn handle_request(
         upstream_addr: String::new(),
         upstream_status: 0,
         upstream_header_time: 0.0,
+        ssl: None,
+        start_time: unix_now(),
+        http_version: http_version_f64(version),
+        body_builder: None,
+        eof_sent: false,
     };
 
-    // ---- realip：直连对端为可信代理时，用 real_ip_header 里的地址覆盖 $remote_addr ----
-    // 必须早于 limit_conn / limit_req / geo / auth，令这些环节都基于真实客户端 IP。
-    if server.real_ip.enabled() {
-        if let Some(peer) = meta.peer {
-            if let Some(real) = server.real_ip.apply(peer.ip(), &ctx.req_headers) {
-                log_debug!("realip：{} → {}（源自 ${}", peer, real, server.real_ip.header);
-                ctx.remote_addr = real;
-            }
-        }
-    }
-
-    // ---- 并发连接限制（nginx limit_conn 在 ACCESS 之前，按 key 计数在途请求）----
-    let mut conn_guards = Vec::new();
-    for rule in &server.limit_conn {
-        let guard = state
-            .limits
-            .conn_zone(&rule.zone)
-            .and_then(|z| z.try_acquire(&ctx.remote_addr, rule.number));
-        match guard {
-            Some(g) => conn_guards.push(g),
-            None => {
-                log_debug!("limit_conn '{}' 命中: {}", rule.zone, ctx.remote_addr);
-                return close_now(status_page(state.limits.conn_status));
-            }
-        }
-    }
+    // ---- realip / limit_conn（Upgrade 与普通请求共用同一实现）----
+    apply_realip(&server, &mut ctx, meta.peer);
+    // 访问日志与 $remote_addr 保持一致：日志记录的是 realip 之后的客户端地址
+    rec.set_remote(ctx.remote_addr.clone());
+    let conn_guards = match acquire_conn_guards(&state, &server, &ctx.remote_addr) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
 
     // ---- 请求体：默认边读边限长缓冲；`proxy_request_buffering off` 的 proxy location 走流式转发 ----
     let loc0 = Router::match_location(&server, ctx.effective_path());
@@ -871,7 +945,8 @@ async fn handle_request(
             .map(|l| l.proxy_pass.is_some() && !l.proxy_request_buffering)
             .unwrap_or(false);
     let inbound = if stream_body {
-        // 分块无法预先限长；仅在客户端声明了 Content-Length 时做 upfront 拒绝
+        // 分块无法预先限长；声明了 Content-Length 时先做 upfront 拒绝，
+        // 其余（chunked / 谎报长度）在转发途中由 BodyLimitBody 边数边限。
         if let Some(max) = limit {
             if let Some(declared) = cl_values
                 .first()
@@ -883,6 +958,12 @@ async fn handle_request(
                 }
             }
         }
+        let body = match limit {
+            Some(max) if max != u64::MAX => {
+                BodyLimitBody { inner: body, max, seen: 0 }.boxed()
+            }
+            _ => body,
+        };
         ProxyBody::Streaming(Some(body))
     } else {
         let body_bytes = if has_body {
@@ -898,23 +979,41 @@ async fn handle_request(
         } else {
             Bytes::new()
         };
-        ctx.req_body = body_bytes.to_vec();
+        ctx.req_body = body_bytes.clone();
         ProxyBody::Buffered(Some(body_bytes))
     };
 
-    let resp = process(&state, &mut ctx, &server, inbound).await;
+    let mut scope = RequestScope {
+        guards: conn_guards,
+        streamed: false,
+        allow_stream: true,
+    };
+    let resp = process(&state, &mut ctx, &server, inbound, &mut scope).await;
+    // 访问日志的 $upstream_*：处理结束（含换节点重试）后回填。
+    // 流式响应的 ctx 已移交后台任务，此处读不到，日志按无上游记录。
+    if !scope.streamed {
+        rec.set_upstream(
+            ctx.upstream_addr.clone(),
+            ctx.upstream_status,
+            ctx.upstream_header_time,
+        );
+    }
     // ---- LOG 阶段：log_by_lua / log_by_rust（响应已成形）。脚本在 ctx 的副本上运行，
     // 其 ngx.say 等写入落到副本、不回灌已发送的 resp；失败只记日志，不改变响应。----
-    if let Some(loc) = Router::match_location(&server, ctx.effective_path()) {
-        let has_log = loc.lua_phases.iter().any(|(p, _, _)| *p == Phase::Log)
-            || loc.rust_phases.iter().any(|(p, _)| *p == Phase::Log);
-        if has_log {
-            ctx.status = resp.status().as_u16();
-            run_log_phase(&state, &mut ctx, loc).await;
+    // 流式响应把这段收尾转交给了后台的 Lua 任务（此时 ctx 已不属于本函数）。
+    if !scope.streamed {
+        if let Some(loc) = Router::match_location(&server, ctx.effective_path()) {
+            let has_log = loc.lua_phases.iter().any(|(p, _, _)| *p == Phase::Log)
+                || loc.rust_phases.iter().any(|(p, _)| *p == Phase::Log);
+            if has_log {
+                ctx.status = resp.status().as_u16();
+                run_log_phase(&state, &mut ctx, loc).await;
+            }
         }
     }
     // conn_guards 到这里才释放：整个请求处理期间都占着并发额度
-    drop(conn_guards);
+    // （流式请求的额度在后台任务末尾释放，覆盖脚本实际在跑的时长）
+    drop(scope);
     resp
 }
 
@@ -939,6 +1038,160 @@ async fn run_log_phase(state: &Arc<AppState>, ctx: &mut RequestCtx, loc: &Locati
     }
 }
 
+/// content_by_lua 的流式启动结果。
+enum StreamStart {
+    /// 头已成形、脚本转到后台继续跑，响应立即可发
+    Streamed(BoxResponse),
+    /// 脚本在首次输出前就结束了：ctx 已交回，继续走原有的缓冲路径
+    Completed(Option<AppError>),
+}
+
+/// 尝试流式运行 content_by_lua：
+/// - 首次 ngx.flush（或缓冲越过阈值）时，用此刻的 status/响应头立刻回响应；
+/// - 脚本跑完都没 flush → 取回 ctx，让调用方继续走缓冲路径（行为与之前完全一致）；
+/// - 出错同样交回 ctx，由调用方按 500 收尾。
+async fn start_streaming_content(
+    state: &Arc<AppState>,
+    ctx: &mut RequestCtx,
+    server: &Arc<Server>,
+    loc: &Location,
+    name: &str,
+    src: &crate::lua_engine::LuaSource,
+    scope: &mut RequestScope,
+) -> StreamStart {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
+    let extra = router::effective_add_headers(Some(loc), server)
+        .into_iter()
+        .cloned()
+        .collect();
+    ctx.stream = Some(StreamSink::new(tx, extra));
+    let shared = Arc::new(Mutex::new(std::mem::take(ctx)));
+    let engine = Arc::clone(&state.lua);
+    let shared_for_lua = Arc::clone(&shared);
+    let name_owned = name.to_string();
+    let src_owned = src.clone();
+    let mut lua_fut = Box::pin(async move {
+        engine
+            .run_phase(&name_owned, &src_owned, shared_for_lua)
+            .await
+    });
+
+    // biased：脚本 flush 后立刻返回时通道里已有 Head，优先按流式收尾，避免
+    // 缓冲路径拿到的是已被 flush 搬空的 body。
+    let mut finished: Option<Result<(), AppError>> = None;
+    let head = tokio::select! {
+        biased;
+        ev = rx.recv() => match ev {
+            Some(StreamEvent::Head { status, headers }) => Some((status, headers)),
+            _ => None,
+        },
+        res = &mut lua_fut => {
+            finished = Some(res);
+            match rx.try_recv() {
+                Ok(StreamEvent::Head { status, headers }) => Some((status, headers)),
+                _ => None,
+            }
+        }
+    };
+
+    let Some((status, headers)) = head else {
+        let mut final_ctx = take_ctx(shared);
+        final_ctx.stream = None;
+        *ctx = final_ctx;
+        return StreamStart::Completed(finished.and_then(|r| r.err()));
+    };
+
+    let guards = std::mem::take(&mut scope.guards);
+    scope.streamed = true;
+    let bg_state = Arc::clone(state);
+    let bg_server = Arc::clone(server);
+    match finished {
+        // Lua 已结束，只剩补发剩余字节/log 阶段
+        Some(run) => {
+            tokio::spawn(async move {
+                finish_streamed(bg_state, bg_server, shared, run, status, guards).await;
+            });
+        }
+        None => {
+            tokio::spawn(async move {
+                let run = lua_fut.await;
+                finish_streamed(bg_state, bg_server, shared, run, status, guards).await;
+            });
+        }
+    }
+    StreamStart::Streamed(stream_response(status, headers, rx))
+}
+
+/// 流式响应转到后台后的收尾：补发剩余字节 → 结束响应体 → LOG 阶段 → 释放 limit_conn。
+async fn finish_streamed(
+    state: Arc<AppState>,
+    server: Arc<Server>,
+    shared: Arc<Mutex<RequestCtx>>,
+    run: Result<(), AppError>,
+    status: u16,
+    guards: Vec<crate::limit::ConnGuard>,
+) {
+    let mut ctx = take_ctx(shared);
+    // 先关流再跑 LOG 阶段：log_by_lua 再慢也不拖住客户端最后一个字节。
+    ctx.drain_and_end_stream().await;
+    ctx.status = status;
+    if let Err(e) = run {
+        log_error!("content_by_lua（已开始流式输出）收尾失败: {e}");
+    }
+    if let Some(loc) = Router::match_location(&server, ctx.effective_path()) {
+        let has_log = loc.lua_phases.iter().any(|(p, _, _)| *p == Phase::Log)
+            || loc.rust_phases.iter().any(|(p, _)| *p == Phase::Log);
+        if has_log {
+            run_log_phase(&state, &mut ctx, loc).await;
+        }
+    }
+    drop(guards);
+}
+
+/// 从 Lua 任务的共享句柄取回 ctx（锁中毒也照常取，不让请求崩掉）。
+fn take_ctx(shared: Arc<Mutex<RequestCtx>>) -> RequestCtx {
+    match Arc::try_unwrap(shared) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    }
+}
+
+/// 把流式帧通道包成 hyper 响应体。Head 帧在启动阶段已被消费，这里只转发 Data。
+fn stream_response(
+    status: u16,
+    headers: Vec<(String, String)>,
+    rx: tokio::sync::mpsc::Receiver<StreamEvent>,
+) -> BoxResponse {
+    let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Some(StreamEvent::Data(data)) => {
+                    return Some((Ok::<_, crate::proxy::BoxError>(Frame::data(data)), rx));
+                }
+                Some(StreamEvent::Head { .. }) => continue,
+                Some(StreamEvent::End) | None => return None,
+            }
+        }
+    });
+    let body: RespBody = BodyExt::boxed(http_body_util::StreamBody::new(body_stream));
+    let mut builder =
+        Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
+    {
+        let hm = builder.headers_mut().unwrap();
+        for (k, v) in headers {
+            if let (Ok(name), Ok(val)) = (
+                HeaderName::try_from(k.as_str()),
+                HeaderValue::try_from(v.as_str()),
+            ) {
+                hm.insert(name, val);
+            }
+        }
+    }
+    builder
+        .body(body)
+        .unwrap_or_else(|_| error_page(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
 /// 有界 + 超时的请求体读取（chunked 与定长都适用）
 enum BodyFail {
     TooLarge,
@@ -959,18 +1212,67 @@ async fn read_body(
         match frame {
             Ok(f) => {
                 if let Some(data) = f.into_data().ok() {
-                    out.extend_from_slice(&data);
                     if let Some(max) = limit {
-                        if out.len() as u64 > max {
+                        if out.len() as u64 + data.len() as u64 > max {
                             return Err(BodyFail::TooLarge);
                         }
                     }
+                    out.extend_from_slice(&data);
                 }
             }
             Err(_) => return Err(BodyFail::Io),
         }
     }
     Ok(Bytes::from(out))
+}
+
+/// 流式请求体的字节上限：chunked 没有 Content-Length 可预检，只能边转发边计数。
+/// 超限时以 body 错误中断，上游连接随之中断（不会把超出的字节继续塞给后端）。
+const STREAM_BODY_LIMIT_ERR: &str = "client_max_body_size exceeded (streamed request body)";
+
+struct BodyLimitBody {
+    inner: crate::proxy::ProxyReqBody,
+    max: u64,
+    seen: u64,
+}
+
+impl Body for BodyLimitBody {
+    type Data = Bytes;
+    type Error = crate::proxy::BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.seen = this.seen.saturating_add(data.len() as u64);
+                    if this.seen > this.max {
+                        return Poll::Ready(Some(Err(STREAM_BODY_LIMIT_ERR.into())));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// 判断 Lua 是否改写过请求体。`Bytes` 不可变，改写只能换一个新分配：
+/// 指针与长度都相同即可跳过逐字节比较；指针不同时仍按内容判断，
+/// 避免"脚本写了内容相同的新字节"被误当成改写。
+fn same_body(a: &Bytes, b: &Bytes) -> bool {
+    a.len() == b.len() && (a.as_ptr() == b.as_ptr() || &a[..] == &b[..])
 }
 
 /// 子请求（`ngx.location.capture`）的捕获结果：状态码 + 响应头 + 完整响应体。
@@ -991,6 +1293,7 @@ pub async fn run_capture(
     parent: &RequestCtx,
     uri: &str,
     method: &str,
+    body: &[u8],
 ) -> Result<CaptureResult, String> {
     if parent.capture_depth >= MAX_CAPTURE_DEPTH {
         return Err("subrequest capture depth limit exceeded".to_string());
@@ -1026,9 +1329,10 @@ pub async fn run_capture(
         rewritten_path: None,
         status: 200,
         body: None,
+        stream: None,
         done: false,
         internal_redirect: false,
-        req_body: Vec::new(),
+        req_body: Bytes::copy_from_slice(body),
         exec_depth: 0,
         redirect: None,
         scheme: parent.scheme.clone(),
@@ -1044,9 +1348,30 @@ pub async fn run_capture(
         upstream_addr: String::new(),
         upstream_status: 0,
         upstream_header_time: 0.0,
+        ssl: None,
+        start_time: unix_now(),
+        http_version: parent.http_version,
+        body_builder: None,
+        eof_sent: false,
     };
+    if !body.is_empty() {
+        ctx.req_headers
+            .retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+        ctx.req_headers
+            .push(("content-length".to_string(), body.len().to_string()));
+    }
 
-    let resp = process(state, &mut ctx, &server, ProxyBody::Buffered(None)).await;
+    let mut scope = RequestScope {
+        guards: Vec::new(),
+        streamed: false,
+        allow_stream: false,
+    };
+    let capture_body = if body.is_empty() {
+        ProxyBody::Buffered(None)
+    } else {
+        ProxyBody::Buffered(Some(Bytes::copy_from_slice(body)))
+    };
+    let resp = process(state, &mut ctx, &server, capture_body, &mut scope).await;
     let (parts, body) = resp.into_parts();
     let collected = body
         .collect()
@@ -1065,20 +1390,30 @@ pub async fn run_capture(
     })
 }
 
-async fn process(
+/// 请求生命周期资源。流式响应一旦开头，Lua 收尾、LOG 阶段与 limit_conn 额度的
+/// 释放都要延后到响应体结束，故由 process 就地转交（streamed=true 时 guards 被移走）。
+struct RequestScope {
+    guards: Vec<crate::limit::ConnGuard>,
+    streamed: bool,
+    /// 子请求（ngx.location.capture）要把响应体收集完整，必须走缓冲路径
+    allow_stream: bool,
+}
+
+/// REWRITE → PREACCESS → ACCESS 的共用入口（普通请求与 WebSocket Upgrade 都走这里，
+/// 避免 Upgrade 绕过 allow/deny、auth_basic、限流和 Lua access 阶段）。
+/// 返回最终命中的 location；拒绝/跳转/结束请求以 Err(response) 返回。
+async fn run_ingress<'a>(
     state: &Arc<AppState>,
     ctx: &mut RequestCtx,
-    server: &Arc<Server>,
-    body: ProxyBody,
-) -> BoxResponse {
-    // ---- REWRITE / POST_REWRITE / PREACCESS / ACCESS 循环 ----
-    let mut current_loc: Option<&Location> = None;
+    server: &'a Arc<Server>,
+) -> Result<&'a Location, BoxResponse> {
+    let mut last_loc: Option<&'a Location> = None;
     // 停在"还在跳转"状态跑满 10 跳 = 配置成环（nginx: rewrite or internal redirection cycle → 500）
     let mut cycle = false;
     for _ in 0..MAX_URI_CHANGES {
         cycle = true;
         let loc = Router::match_location(server, ctx.effective_path());
-        current_loc = loc;
+        last_loc = loc;
         let Some(loc) = loc else {
             cycle = false;
             break;
@@ -1086,13 +1421,14 @@ async fn process(
 
         // internal 只允许内部重定向命中（nginx：外部请求访问 internal location → 404）
         if loc.internal && !ctx.internal_request {
-            return error_page(StatusCode::NOT_FOUND);
+            ctx.status = 404;
+            return Err(error_page(StatusCode::NOT_FOUND));
         }
 
         // 1) rewrite 指令
         if !loc.rewrites.is_empty() && engine::apply_rewrites(ctx, &loc.rewrites) {
             if let Some((code, target)) = ctx.redirect.take() {
-                return redirect_response(code, &target);
+                return Err(redirect_response(code, &target));
             }
             if ctx.internal_redirect {
                 ctx.internal_redirect = false;
@@ -1103,10 +1439,10 @@ async fn process(
         // 2) rewrite_by_rust / rewrite_by_lua
         if !run_phases(state, ctx, loc, Phase::Rewrite, server).await {
             if let Some((code, target)) = ctx.redirect.take() {
-                return redirect_response(code, &target);
+                return Err(redirect_response(code, &target));
             }
             if ctx.done {
-                return finish_response(ctx, server, current_loc);
+                return Err(finish_response(ctx, server, last_loc));
             }
             if ctx.internal_redirect {
                 ctx.internal_redirect = false;
@@ -1117,19 +1453,19 @@ async fn process(
         }
         // 3) PREACCESS：limit_req
         if let Some(resp) = check_limit_req(state, ctx, loc) {
-            return resp;
+            return Err(resp);
         }
         // 3.5) ACCESS：内置 allow/deny（IP）+ auth_basic（basic auth），先于 access_by_*
         if let Some(resp) = check_access_and_auth(state, ctx, loc, server).await {
-            return resp;
+            return Err(resp);
         }
         // 4) ACCESS：access_by_rust / access_by_lua
         if !run_phases(state, ctx, loc, Phase::Access, server).await {
             if let Some((code, target)) = ctx.redirect.take() {
-                return redirect_response(code, &target);
+                return Err(redirect_response(code, &target));
             }
             if ctx.done {
-                return finish_response(ctx, server, current_loc);
+                return Err(finish_response(ctx, server, last_loc));
             }
             if ctx.internal_redirect {
                 ctx.internal_redirect = false;
@@ -1138,30 +1474,39 @@ async fn process(
                 continue;
             }
         }
-        cycle = false;
-        break;
+
+        // return 指令在 access 之前生效（nginx 的 return 属于 rewrite 阶段，这里保持原实现语义）
+        if let Some(ret) = &loc.ret {
+            engine::apply_return(ctx, ret);
+            if let Some((code, target)) = ctx.redirect.take() {
+                return Err(redirect_response(code, &target));
+            }
+            return Err(finish_response(ctx, server, Some(loc)));
+        }
+        return Ok(loc);
     }
     if cycle {
         log_error!(
             "内部重定向成环：'{}' 已跳满 {MAX_URI_CHANGES} 次（检查 rewrite ... last / ngx.exec）",
             ctx.effective_path()
         );
-        return error_response(ctx, server, current_loc, 500).await;
+        return Err(error_response(ctx, server, last_loc, 500).await);
     }
+    ctx.status = 404;
+    Err(error_page(StatusCode::NOT_FOUND))
+}
 
-    let Some(loc) = current_loc else {
-        ctx.status = 404;
-        return error_page(StatusCode::NOT_FOUND);
+async fn process(
+    state: &Arc<AppState>,
+    ctx: &mut RequestCtx,
+    server: &Arc<Server>,
+    body: ProxyBody,
+    scope: &mut RequestScope,
+) -> BoxResponse {
+    let loc = match run_ingress(state, ctx, server).await {
+        Ok(loc) => loc,
+        Err(resp) => return resp,
     };
-
-    // return 指令在 access 之前生效（nginx 的 return 属于 rewrite 阶段，这里保持原实现语义）
-    if let Some(ret) = &loc.ret {
-        engine::apply_return(ctx, ret);
-        if let Some((code, target)) = ctx.redirect.take() {
-            return redirect_response(code, &target);
-        }
-        return finish_response(ctx, server, Some(loc));
-    }
 
     // ---- CONTENT ----
     if let Some(target) = &loc.proxy_pass {
@@ -1171,10 +1516,13 @@ async fn process(
         let opts = ProxyOpts {
             set_headers: &headers,
             timeouts: ProxyTimeouts {
-                connect: Duration::from_secs(loc.proxy_connect_timeout),
-                read: Duration::from_secs(loc.proxy_read_timeout),
+                connect: loc.proxy_connect_timeout,
+                send: loc.proxy_send_timeout,
+                read: loc.proxy_read_timeout,
             },
             next_upstream: &loc.proxy_next_upstream,
+            next_upstream_tries: loc.proxy_next_upstream_tries,
+            next_upstream_timeout: loc.proxy_next_upstream_timeout,
             tls: &loc.proxy_tls,
         };
 
@@ -1186,13 +1534,18 @@ async fn process(
                 .iter()
                 .any(|m| m.eq_ignore_ascii_case(&ctx.method))
             && matches!(body, ProxyBody::Buffered(_));
-        let cache_key = if cacheable_method {
-            Some(build_cache_key(&loc.proxy_cache_key, ctx, target))
+        let cache_target = if cacheable_method {
+            caching_zone
+                .clone()
+                .map(|zone| (zone, build_cache_key(&loc.proxy_cache_key, ctx, target)))
         } else {
             None
         };
-        let lookup = match (&caching_zone, &cache_key) {
-            (Some(zone), Some(key)) => {
+        // nginx 语义：表达式展开后非空且不为 "0" 即触发
+        let bypass = cache_target.is_some() && cache_expr_truthy(&loc.proxy_cache_bypass, ctx);
+        let no_cache = cache_target.is_some() && cache_expr_truthy(&loc.proxy_no_cache, ctx);
+        let lookup = match (&cache_target, bypass) {
+            (Some((zone, key)), false) => {
                 let (hit, cached, count) = state.proxy_cache.lookup(zone, key);
                 Some((zone.clone(), key.clone(), hit, cached, count))
             }
@@ -1202,12 +1555,90 @@ async fn process(
             let resp = Arc::clone(resp);
             return serve_from_cache(resp, loc, server, "HIT");
         }
+        // 过期条目在 stale 滞留期内仍可被 use_stale 回放
+        let stale_response = match &lookup {
+            Some((_, _, CacheHit::Expired, Some(resp), _)) => Some(Arc::clone(resp)),
+            _ => None,
+        };
+        let status_tag = if bypass || (caching_zone.is_some() && cache_target.is_none()) {
+            "BYPASS"
+        } else {
+            match &lookup {
+                Some((_, _, CacheHit::Expired, _, _)) => "EXPIRED",
+                Some((_, _, CacheHit::Miss, _, _)) => "MISS",
+                _ => "",
+            }
+        };
 
-        let status_tag = match &lookup {
-            Some((_, _, CacheHit::Expired, _, _)) => "MISS", // 无 use_stale：过期即回源重取
-            Some((_, _, CacheHit::Miss, _, _)) => "MISS",
-            _ if caching_zone.is_some() => "BYPASS", // 方法/请求体不满足缓存条件
-            _ => "",
+        // proxy_cache_lock：同 key 并发 MISS 只放一个请求回源；等待者拿到锁后二次查缓存。
+        // `updating` + stale：刷新进行中时直接回放过期内容，避免所有并发请求一起等。
+        let mut lock_guard: Option<tokio::sync::OwnedMutexGuard<()>> = None;
+        if loc.proxy_cache_lock && !bypass && !no_cache {
+            if let Some((zone, key)) = &cache_target {
+                let lock = state.proxy_cache.cache_lock(zone, key);
+                let mut acquired = None;
+                if stale_response.is_some() && use_stale_allows(&loc.proxy_cache_use_stale, "updating") {
+                    match lock.clone().try_lock_owned() {
+                        Ok(g) => acquired = Some(g),
+                        Err(_) => {
+                            log_debug!("proxy_cache updating: {key} 刷新进行中，回放 stale");
+                            return serve_from_cache(
+                                Arc::clone(stale_response.as_ref().unwrap()),
+                                loc,
+                                server,
+                                "STALE",
+                            );
+                        }
+                    }
+                }
+                if acquired.is_none() {
+                    acquired =
+                        match tokio::time::timeout(loc.proxy_cache_lock_timeout, lock.lock_owned())
+                            .await
+                        {
+                            Ok(g) => Some(g),
+                            Err(_) => {
+                                log_warn!(
+                                    "proxy_cache_lock 等待超时（{}s），直接回源：{key}",
+                                    loc.proxy_cache_lock_timeout.as_secs_f64()
+                                );
+                                None
+                            }
+                        };
+                }
+                if acquired.is_some() {
+                    let (hit, cached) = state.proxy_cache.peek(zone, key);
+                    if hit == CacheHit::Hit {
+                        if let Some(resp) = cached {
+                            return serve_from_cache(resp, loc, server, "HIT");
+                        }
+                    }
+                }
+                lock_guard = acquired;
+            }
+        }
+        let _lock_guard = lock_guard;
+
+        // min_uses 计数：bypass 请求不做 lookup，但仍要计入“第 N 次才写缓存”
+        let use_count = match &lookup {
+            Some((_, _, _, _, c)) => *c,
+            None => match &cache_target {
+                Some((zone, key)) => state.proxy_cache.note_use(zone, key),
+                None => 0,
+            },
+        };
+
+        // Lua 的 set_body_data / init_body…finish_body / discard_body 改写的是 ctx.req_body：
+        // 转发时以它为准（对标 OpenResty：proxy_pass 发送的是被脚本替换后的请求体）。
+        // Bytes 不可变：指针+长度相同即可断定未被改写，省掉每请求一次 memcmp。
+        let body = match body {
+            ProxyBody::Buffered(Some(ref b)) if !same_body(&ctx.req_body, b) => {
+                ProxyBody::Buffered(Some(ctx.req_body.clone()))
+            }
+            ProxyBody::Buffered(None) if !ctx.req_body.is_empty() => {
+                ProxyBody::Buffered(Some(ctx.req_body.clone()))
+            }
+            other => other,
         };
 
         return match state
@@ -1216,10 +1647,22 @@ async fn process(
             .await
         {
             Ok(upstream_resp) => {
+                // use_stale http_xxx：上游返回这些状态码时回放过期内容（不覆盖缓存）
+                let upstream_status = upstream_resp.status().as_u16();
+                if let Some(stale) = &stale_response {
+                    let token = format!("http_{upstream_status}");
+                    if use_stale_allows(&loc.proxy_cache_use_stale, &token) {
+                        log_warn!(
+                            "proxy_cache use_stale {token}：回放过期响应 {}",
+                            ctx.effective_path()
+                        );
+                        return serve_from_cache(Arc::clone(stale), loc, server, "STALE");
+                    }
+                }
                 // 未启用缓存：若声明了 header_filter_by_lua/body_filter_by_lua/sub_filter，则缓冲代理
                 // 响应并运行过滤器（对齐 nginx：响应过滤器对代理响应同样生效，代价是关闭流式）；
                 // 否则保持既有流式转发路径。
-                if lookup.is_none() {
+                if cache_target.is_none() {
                     let hf = loc
                         .lua_phases
                         .iter()
@@ -1272,8 +1715,8 @@ async fn process(
                     let hdrs = ctx.resp_headers.clone();
                     return build_buffered_response(ctx.status, &hdrs, body_bytes, loc, server, "", false);
                 }
-                let (zone, key, _, _, count) = lookup.unwrap();
-                let status = upstream_resp.status().as_u16();
+                let (zone, key) = cache_target.clone().unwrap();
+                let status = upstream_status;
                 let (parts, ibody) = upstream_resp.into_parts();
                 let collected = match ibody.collect().await {
                     Ok(c) => c.to_bytes(),
@@ -1304,7 +1747,11 @@ async fn process(
                 );
                 let cacheable = ttl.is_some()
                     && !has_set_cookie
-                    && count >= loc.proxy_cache_min_uses;
+                    && !no_cache
+                    // HEAD 只读不写：HEAD 响应无 body，写入会让同 key 的 GET 命中空体
+                    // （nginx 用 proxy_cache_convert_head 规避，这里直接不写）
+                    && !ctx.method.eq_ignore_ascii_case("HEAD")
+                    && use_count >= loc.proxy_cache_min_uses;
                 let body = bytes::Bytes::from(collected.to_vec());
                 if cacheable {
                     state.proxy_cache.store(
@@ -1329,15 +1776,48 @@ async fn process(
                 )
             }
             Err(e) => {
+                // use_stale error/timeout：回源失败时回放过期内容（缓存不可用时网关仍可用）
+                if let Some(stale) = &stale_response {
+                    if use_stale_allows(&loc.proxy_cache_use_stale, "error")
+                        || use_stale_allows(&loc.proxy_cache_use_stale, "timeout")
+                    {
+                        log_warn!(
+                            "proxy_cache use_stale：回源失败回放过期响应 {}{}: {e}",
+                            target,
+                            ctx.effective_path()
+                        );
+                        return serve_from_cache(Arc::clone(stale), loc, server, "STALE");
+                    }
+                }
                 log_error!("代理失败 {}{}: {e}", target, ctx.effective_path());
+                // 流式请求体超限是客户端的问题，按 413 回（其余转发失败才是 502）
+                if e.contains(STREAM_BODY_LIMIT_ERR) {
+                    return error_response(ctx, server, Some(loc), 413).await;
+                }
                 error_response(ctx, server, Some(loc), 502).await
             }
         }
     }
 
     if let Some((_, name, src)) = loc.lua_phases.iter().find(|(p, _, _)| *p == Phase::Content) {
-        // 出错已由 run_lua 记账并置 500，这里只需处理脚本产生的跳转
-        if run_lua(state, ctx, name, src).await {
+        // header/body filter 与 sub_filter 需要完整响应体才能处理，命中它们时不流式。
+        let streamable = scope.allow_stream
+            && loc.sub_filter.is_none()
+            && !loc.lua_phases.iter().any(|(p, n, _)| {
+                *p == Phase::Content
+                    && (n.starts_with("header_filter_by_lua")
+                        || n.starts_with("body_filter_by_lua"))
+            });
+        let failed = if streamable {
+            match start_streaming_content(state, ctx, server, loc, name, src, scope).await {
+                StreamStart::Streamed(resp) => return resp,
+                StreamStart::Completed(res) => res.is_some(),
+            }
+        } else {
+            run_lua(state, ctx, name, src).await
+        };
+        // 出错已由收尾逻辑记账并置 500，这里只需处理脚本产生的跳转
+        if failed {
             return finish_response(ctx, server, Some(loc));
         }
         if let Some((code, target)) = ctx.redirect.take() {
@@ -1347,11 +1827,11 @@ async fn process(
             ctx.internal_redirect = false;
             ctx.internal_request = true;
             ctx.exec_depth += 1;
-            return Box::pin(process(state, ctx, server, body)).await;
+            return Box::pin(process(state, ctx, server, body, scope)).await;
         }
         // 脚本没产出任何响应体也没 exit：继续按静态兜底（对标 content_by_lua 未命中的常见写法）
         if !ctx.done && ctx.body.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
-            return serve_static_flow(state, ctx, server, loc, body).await;
+            return serve_static_flow(state, ctx, server, loc, body, scope).await;
         }
         
         // 执行 header_filter_by_lua（如果存在，用于修改响应头）
@@ -1394,7 +1874,7 @@ async fn process(
         return finish_response(ctx, server, Some(loc));
     }
 
-    serve_static_flow(state, ctx, server, loc, body).await
+    serve_static_flow(state, ctx, server, loc, body, scope).await
 }
 
 /// 执行某个阶段的 rust + lua 处理器；返回 true 表示应当中止（出错）
@@ -1439,11 +1919,7 @@ async fn run_lua(
     let shared = Arc::new(Mutex::new(std::mem::take(ctx)));
     let r = state.lua.run_phase(name, src, Arc::clone(&shared)).await;
     // 取回 ctx：中毒锁也照常取（宁可带着略过的状态返回，也不要 panic）
-    *ctx = match Arc::try_unwrap(shared) {
-        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
-        // 仍有其他持有者（Lua 线程里残留引用）：克隆一份当前状态
-        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-    };
+    *ctx = take_ctx(shared);
     if let Err(e) = r {
         log_error!("{name} 执行失败: {e}");
         ctx.status = 500;
@@ -1462,6 +1938,7 @@ fn check_limit_req(state: &Arc<AppState>, ctx: &mut RequestCtx, loc: &Location) 
             .and_then(|z| z.check(&ctx.remote_addr, rule.burst));
         if let Some(secs) = retry_after {
             log_debug!("limit_req '{}' 命中: {}", rule.zone, ctx.remote_addr);
+            crate::metrics::get().on_limit_req_rejected();
             ctx.status = state.limits.req_status;
             let mut resp = status_page(state.limits.req_status);
             set_header(&mut resp, "retry-after", &secs.to_string());
@@ -1472,6 +1949,44 @@ fn check_limit_req(state: &Arc<AppState>, ctx: &mut RequestCtx, loc: &Location) 
 }
 
 // ==================== ACCESS：内置 allow/deny + auth_basic ====================
+
+/// realip：直连对端为可信代理时，用 real_ip_header 覆盖 $remote_addr。
+/// 必须早于 limit_conn / limit_req / geo / auth，令这些环节都基于真实客户端 IP。
+fn apply_realip(server: &Server, ctx: &mut RequestCtx, peer: Option<std::net::SocketAddr>) {
+    if !server.real_ip.enabled() {
+        return;
+    }
+    if let Some(peer) = peer {
+        if let Some(real) = server.real_ip.apply(peer.ip(), &ctx.req_headers) {
+            log_debug!("realip：{} → {}（源自 ${}", peer, real, server.real_ip.header);
+            ctx.remote_addr = real;
+        }
+    }
+}
+
+/// limit_conn：在 ACCESS 之前按客户端 IP 占用并发额度；超限返回 nginx 风格错误页。
+fn acquire_conn_guards(
+    state: &AppState,
+    server: &Server,
+    remote_addr: &str,
+) -> Result<Vec<crate::limit::ConnGuard>, BoxResponse> {
+    let mut guards = Vec::new();
+    for rule in &server.limit_conn {
+        match state
+            .limits
+            .conn_zone(&rule.zone)
+            .and_then(|z| z.try_acquire(remote_addr, rule.number))
+        {
+            Some(g) => guards.push(g),
+            None => {
+                log_debug!("limit_conn '{}' 命中: {}", rule.zone, remote_addr);
+                crate::metrics::get().on_limit_conn_rejected();
+                return Err(close_now(status_page(state.limits.conn_status)));
+            }
+        }
+    }
+    Ok(guards)
+}
 
 /// ACCESS 阶段内置访问控制：先 IP（allow/deny）后 HTTP Basic（auth_basic），都在
 /// access_by_* 之前执行（与 nginx 内置模块的注册顺序一致）。命中拒绝则返回统一错误页。
@@ -1511,16 +2026,21 @@ async fn check_access_and_auth(
         .as_ref()
         .or(server.auth_basic_user_file.as_ref())?;
 
-    // 校验 Authorization（缺失/格式错/不匹配一律 401，附带 WWW-Authenticate）
-    let users = {
-        let path = file.clone();
-        tokio::task::spawn_blocking(move || crate::access::load_htpasswd(&path))
-            .await
-            .ok()
-            .flatten()
-    };
-    let users = match users {
-        Some(u) => u,
+    // 校验 Authorization（缺失/格式错/不匹配一律 401，附带 WWW-Authenticate）。
+    // 文件读取与口令校验（md5crypt 是 1000 轮 MD5）一起丢进阻塞池：
+    // 放在请求任务上会占住 async worker，几个慢校验就能拖垮整条 accept 链。
+    let header = ctx.header("authorization").map(str::to_string);
+    let path = file.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::access::load_htpasswd(&path).map(|users| {
+            crate::access::check_auth_header(header.as_deref(), &users)
+        })
+    })
+    .await
+    .ok()
+    .flatten();
+    let outcome = match outcome {
+        Some(o) => o,
         None => {
             // 文件读不到：等同认证失败，但仍要给出 401 质询（与 nginx 行为一致）
             log_error!("auth_basic_user_file 无法读取: {}", file.display());
@@ -1528,16 +2048,12 @@ async fn check_access_and_auth(
             return Some(basic_challenge(realm));
         }
     };
-    let authed_user = match crate::access::check_auth_header(ctx.header("authorization"), &users) {
-        crate::access::AuthOutcome::Ok(user) => Some(user),
-        _ => None,
-    };
-    match authed_user {
-        Some(user) => {
+    match outcome {
+        crate::access::AuthOutcome::Ok(user) => {
             log_debug!("auth_basic 通过: {user}");
             None
         }
-        None => {
+        _ => {
             ctx.status = 401;
             Some(basic_challenge(realm))
         }
@@ -1571,6 +2087,7 @@ async fn serve_static_flow(
     server: &Arc<Server>,
     loc: &Location,
     body: ProxyBody,
+    scope: &mut RequestScope,
 ) -> BoxResponse {
     let Some(snap) = static_snapshot(ctx, server, loc) else {
         return error_response(ctx, server, Some(loc), 404).await;
@@ -1579,28 +2096,61 @@ async fn serve_static_flow(
         .await
         .unwrap_or(StaticHit::NotFound);
     match hit {
-        StaticHit::File { code, mime, body: content, meta, window } => {
+        StaticHit::File { code, mime, body: source, meta, window } => {
             // window 命中时同一份文件要改写成 206
             let status = match (code, window) {
                 (200, Some(_)) => StatusCode::PARTIAL_CONTENT,
                 (c, _) => StatusCode::from_u16(c).unwrap_or(StatusCode::OK),
             };
-            // sub_filter：仅对完整体（非 Range 切片）按响应类型改写；Range/206 不改（对齐 nginx：
-            // 无法在字节区间上安全替换）。
-            let content = if window.is_none() && loc.sub_filter.is_some() {
-                crate::engine::apply_sub_filter(
-                    loc.sub_filter.as_ref(),
-                    Some(mime.as_str()),
-                    content,
-                )
-            } else {
-                content
+            // sub_filter：仅对完整体（非 Range 切片）且 MIME 命中时改写；Range/206 不改（对齐 nginx：
+            // 无法在字节区间上安全替换）。命中过滤器时大文件也必须整份读入内存。
+            let filter = loc.sub_filter.as_ref().filter(|c| {
+                window.is_none()
+                    && !c.filters.is_empty()
+                    && crate::engine::sub_filter_applies(Some(mime.as_str()), &c.types)
+            });
+            let source = match source {
+                FileSource::Memory(content) => FileSource::Memory(match filter {
+                    Some(conf) => Bytes::from(crate::engine::apply_sub_filter(
+                        Some(conf),
+                        Some(mime.as_str()),
+                        content.to_vec(),
+                    )),
+                    None => content,
+                }),
+                FileSource::Disk { path, start, len } => match filter {
+                    Some(conf) => match tokio::fs::read(&path).await {
+                        Ok(all) => {
+                            let lo = start as usize;
+                            let hi = (start + len).min(all.len() as u64) as usize;
+                            FileSource::Memory(Bytes::from(crate::engine::apply_sub_filter(
+                                Some(conf),
+                                Some(mime.as_str()),
+                                all.get(lo..hi).unwrap_or(&[]).to_vec(),
+                            )))
+                        }
+                        Err(e) => {
+                            log_warn!("静态文件读取失败 {}: {e}", path.display());
+                            return error_response(ctx, server, Some(loc), 404).await;
+                        }
+                    },
+                    None => FileSource::Disk { path, start, len },
+                },
             };
-            let total = meta.as_ref().map(|m| m.size).unwrap_or(content.len() as u64);
+            let total = meta.as_ref().map(|m| m.size).unwrap_or(match &source {
+                FileSource::Memory(b) => b.len() as u64,
+                FileSource::Disk { len, .. } => *len,
+            });
+            let body_len = match &source {
+                FileSource::Memory(b) => b.len() as u64,
+                FileSource::Disk { len, .. } => *len,
+            };
             let mut builder = Response::builder()
                 .status(status)
                 .header("content-type", mime)
-                .header("server", SERVER_HEADER);
+                .header("server", SERVER_HEADER)
+                // 流式体没有可推断的长度，显式声明让定长分帧与 HEAD 语义和 buffered 路径一致
+                .header(hyper::header::CONTENT_LENGTH, body_len.to_string());
             if let Some(m) = &meta {
                 builder = builder
                     .header("etag", m.etag.as_str())
@@ -1610,8 +2160,23 @@ async fn serve_static_flow(
             if let Some((start, end)) = window {
                 builder = builder.header("content-range", format!("bytes {start}-{end}/{total}"));
             }
+            // HEAD 不发体：大文件连打开都不必，头部元数据已足够
+            let body = if ctx.method == "HEAD" {
+                empty_body()
+            } else {
+                match source {
+                    FileSource::Memory(content) => full_body(content),
+                    FileSource::Disk { path, start, len } => match DiskBody::open(&path, start, len).await {
+                        Some(b) => b,
+                        None => {
+                            log_warn!("静态文件打开失败 {}", path.display());
+                            return error_response(ctx, server, Some(loc), 404).await;
+                        }
+                    },
+                }
+            };
             let mut resp = builder
-                .body(full_body(content))
+                .body(body)
                 .unwrap_or_else(|_| error_page(StatusCode::INTERNAL_SERVER_ERROR));
             apply_add_headers(&mut resp, loc, server);
             resp
@@ -1646,7 +2211,7 @@ async fn serve_static_flow(
                 ctx.rewritten_path = Some(last);
                 ctx.exec_depth += 1;
                 ctx.internal_request = true;
-                return Box::pin(process(state, ctx, server, body)).await;
+                return Box::pin(process(state, ctx, server, body, scope)).await;
             }
             error_response(ctx, server, Some(loc), 404).await
         }
@@ -1661,7 +2226,7 @@ enum StaticHit {
     File {
         code: u16,
         mime: String,
-        body: Vec<u8>,
+        body: FileSource,
         meta: Option<FileMeta>,
         window: Option<(u64, u64)>,
     },
@@ -1675,6 +2240,129 @@ enum StaticHit {
     InternalRedirect(String),
     NotFound,
     Forbidden,
+}
+
+/// 静态文件的取体方式：小文件/动态生成走内存；大文件与 Range 只记录磁盘区间，
+/// 响应阶段按 64KiB 分块流式读出，不把整份文件驻留内存。
+#[derive(Debug)]
+enum FileSource {
+    /// `Bytes` 让缓存命中与 Range 切片都只做引用计数，不再整份复制
+    Memory(Bytes),
+    Disk { path: PathBuf, start: u64, len: u64 },
+}
+
+const DISK_CHUNK: usize = 64 * 1024;
+
+/// 从磁盘流式读响应体：每次 poll_frame 只读一块，文件句柄随体结束关闭。
+struct DiskBody {
+    file: Option<tokio::fs::File>,
+    remaining: u64,
+    buf: Vec<u8>,
+    pending: Option<
+        Pin<
+            Box<
+                dyn Future<Output = (tokio::fs::File, Vec<u8>, std::io::Result<usize>)>
+                    + Send
+                    + Sync
+                    + 'static,
+            >,
+        >,
+    >,
+}
+
+impl DiskBody {
+    async fn open(path: &std::path::Path, start: u64, len: u64) -> Option<RespBody> {
+        if len == 0 {
+            return Some(empty_body());
+        }
+        use tokio::io::AsyncSeekExt;
+        let mut file = tokio::fs::File::open(path).await.ok()?;
+        if start > 0 {
+            file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
+        }
+        Some(
+            DiskBody {
+                file: Some(file),
+                remaining: len,
+                buf: Vec::with_capacity(DISK_CHUNK.min(len as usize)),
+                pending: None,
+            }
+            .boxed(),
+        )
+    }
+}
+
+impl Body for DiskBody {
+    type Data = Bytes;
+    type Error = crate::proxy::BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(mut fut) = this.pending.take() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        this.pending = Some(fut);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready((file, buf, res)) => {
+                        this.file = Some(file);
+                        match res {
+                            Ok(0) => {
+                                // stat 之后文件被截断：提前结束，避免继续发不存在的字节
+                                log_warn!("静态文件提前 EOF（剩余 {} 字节未读）", this.remaining);
+                                this.remaining = 0;
+                                return Poll::Ready(None);
+                            }
+                            Ok(n) => {
+                                this.remaining -= n as u64;
+                                let out = Bytes::copy_from_slice(&buf[..n]);
+                                this.buf = buf;
+                                if this.remaining == 0 {
+                                    this.file = None;
+                                }
+                                return Poll::Ready(Some(Ok(Frame::data(out))));
+                            }
+                            Err(e) => {
+                                this.remaining = 0;
+                                this.file = None;
+                                return Poll::Ready(Some(Err(Box::new(e))));
+                            }
+                        }
+                    }
+                }
+            }
+            if this.remaining == 0 {
+                this.file = None;
+                return Poll::Ready(None);
+            }
+            let want = this.remaining.min(DISK_CHUNK as u64) as usize;
+            let Some(file) = this.file.take() else {
+                this.remaining = 0;
+                return Poll::Ready(None);
+            };
+            let mut buf = std::mem::take(&mut this.buf);
+            buf.resize(want, 0);
+            this.pending = Some(Box::pin(async move {
+                use tokio::io::AsyncReadExt;
+                let mut file = file;
+                let r = file.read(&mut buf[..want]).await;
+                (file, buf, r)
+            }));
+            // 建好读任务后立即回到循环顶部 poll 一次，少一次不必要的 task 唤醒
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
 }
 
 /// 静态解析快照：把 ctx/server/location 的相关数据抽成 owned 结构，整体丢进 spawn_blocking
@@ -1784,7 +2472,7 @@ fn resolve_one(snap: &StaticSnap, path: &str) -> StaticHit {
                 return StaticHit::File {
                     code: 200,
                     mime: "text/html; charset=utf-8".to_string(),
-                    body: html.into_bytes(),
+                    body: FileSource::Memory(Bytes::from(html.into_bytes())),
                     // 目录列表是动态生成的，没有稳定的校验位，也不支持 Range
                     meta: None,
                     window: None,
@@ -1811,7 +2499,7 @@ fn hidden_hit(path: &str) -> bool {
 const FILE_CACHE_MAX_FILE: u64 = 1024 * 1024;
 const FILE_CACHE_MAX_ENTRIES: usize = 512;
 
-type FileCacheInner = HashMap<PathBuf, (u64, u64, Arc<Vec<u8>>)>;
+type FileCacheInner = HashMap<PathBuf, (u64, u64, Bytes)>;
 static FILE_CACHE: std::sync::OnceLock<RwLock<FileCacheInner>> = std::sync::OnceLock::new();
 use std::sync::RwLock;
 
@@ -1819,37 +2507,23 @@ fn file_cache() -> &'static RwLock<FileCacheInner> {
     FILE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// 读全量并回填缓存；命中返回整份文件体
-fn read_cached(path: &std::path::Path, mtime: u64, size: u64) -> Option<Vec<u8>> {
+/// 读全量并回填缓存；命中返回整份文件体（`Bytes` 克隆只增引用计数）
+fn read_cached(path: &std::path::Path, mtime: u64, size: u64) -> Option<Bytes> {
     if let Ok(cache) = file_cache().read() {
         if let Some((m, sz, body)) = cache.get(path) {
             if *m == mtime && *sz == size {
-                return Some((**body).clone());
+                return Some(body.clone());
             }
         }
     }
-    let body = std::fs::read(path).ok()?;
+    let body = Bytes::from(std::fs::read(path).ok()?);
     if let Ok(mut cache) = file_cache().write() {
         if cache.len() >= FILE_CACHE_MAX_ENTRIES {
             cache.clear(); // 简单淘汰：满即清空，热文件下一轮自动回填
         }
-        cache.insert(path.to_path_buf(), (mtime, size, Arc::new(body.clone())));
+        cache.insert(path.to_path_buf(), (mtime, size, body.clone()));
     }
     Some(body)
-}
-
-/// 只读 [start, end] 这一段（含端点）：Range 请求不该为了 1KB 把 500MB 读进内存
-fn read_window(path: &std::path::Path, start: u64, end: u64) -> Option<Vec<u8>> {
-    use std::io::{Read, Seek};
-    if end < start {
-        return Some(Vec::new());
-    }
-    let mut f = std::fs::File::open(path).ok()?;
-    f.seek(std::io::SeekFrom::Start(start)).ok()?;
-    let len = (end - start + 1) as usize;
-    let mut buf = Vec::with_capacity(len.min(1 << 20));
-    f.take(len as u64).read_to_end(&mut buf).ok()?;
-    Some(buf)
 }
 
 fn file_hit(path: &std::path::Path, code: u16, snap: &StaticSnap) -> StaticHit {
@@ -1891,22 +2565,26 @@ fn file_hit(path: &std::path::Path, code: u16, snap: &StaticSnap) -> StaticHit {
         None
     };
 
-    // 3) 取体：小文件走内存缓存（命中即零磁盘读），大文件或 Range 只读需要的那一段
+    // 3) 取体：小文件走内存缓存（命中即零磁盘读）；大文件与未缓存文件只记录磁盘区间，
+    //    由 serve_static_flow 流式读出——不再把整份大文件读进内存
     let cached = if size <= FILE_CACHE_MAX_FILE {
         read_cached(path, mtime, size)
     } else {
         None
     };
     let body = match (window, cached) {
-        (Some((s, e)), Some(all)) => all[s as usize..=e as usize].to_vec(),
-        (Some((s, e)), None) => match read_window(path, s, e) {
-            Some(b) => b,
-            None => return StaticHit::NotFound,
+        // Bytes::slice 只做引用计数，Range 切片不再复制缓存内容
+        (Some((s, e)), Some(all)) => FileSource::Memory(all.slice(s as usize..=e as usize)),
+        (Some((s, e)), None) => FileSource::Disk {
+            path: path.to_path_buf(),
+            start: s,
+            len: e - s + 1,
         },
-        (None, Some(all)) => all,
-        (None, None) => match std::fs::read(path) {
-            Ok(b) => b,
-            Err(_) => return StaticHit::NotFound,
+        (None, Some(all)) => FileSource::Memory(all),
+        (None, None) => FileSource::Disk {
+            path: path.to_path_buf(),
+            start: 0,
+            len: size,
         },
     };
     StaticHit::File {
@@ -2142,7 +2820,7 @@ fn apply_proxied_header_rewrites(hm: &mut hyper::HeaderMap, loc: &Location) {
 }
 
 fn convert_upstream_response(
-    resp: Response<Incoming>,
+    resp: Response<crate::proxy::UpstreamBody>,
     loc: &Location,
     server: &Server,
 ) -> BoxResponse {
@@ -2199,6 +2877,18 @@ fn build_cache_key(template: &str, ctx: &RequestCtx, target: &str) -> String {
     };
     let with_host = template.replace("$proxy_host", proxy_host);
     crate::proxy::interpolate_vars(&with_host, ctx)
+}
+
+/// nginx 的 bypass/no_cache 条件：任一表达式展开后非空且不为 "0" 即成立。
+fn cache_expr_truthy(exprs: &[String], ctx: &RequestCtx) -> bool {
+    exprs.iter().any(|e| {
+        let v = crate::proxy::interpolate_vars(e, ctx);
+        !v.is_empty() && v != "0"
+    })
+}
+
+fn use_stale_allows(tokens: &[String], token: &str) -> bool {
+    tokens.iter().any(|t| t == token)
 }
 
 /// 命中缓存：用存储的状态/头/体重建响应，带上 X-Cache-Status 与 add_header。
@@ -2262,6 +2952,7 @@ fn build_buffered_response(
             }
         }
         if with_status_tag {
+            crate::metrics::get().record_cache_status(status_tag);
             if let Ok(val) = HeaderValue::from_str(status_tag) {
                 hm.insert(HeaderName::from_static("x-cache-status"), val);
             }
@@ -2321,7 +3012,12 @@ fn finish_response(ctx: &RequestCtx, server: &Server, loc: Option<&Location>) ->
                 HeaderName::try_from(k.as_str()),
                 HeaderValue::try_from(v.as_str()),
             ) {
-                hm.insert(name, val);
+                // resp_headers 里的同名多行（如多条 Set-Cookie）必须 append 保留
+                if hm.contains_key(&name) {
+                    hm.append(name, val);
+                } else {
+                    hm.insert(name, val);
+                }
             }
         }
         for (k, v) in router::effective_add_headers(loc, server) {
@@ -2433,7 +3129,7 @@ fn apply_add_headers(resp: &mut BoxResponse, loc: &Location, server: &Server) {
 async fn handle_upgrade(
     state: Arc<AppState>,
     meta: Arc<ConnMeta>,
-    _rec: Arc<LogRecord>,
+    rec: Arc<LogRecord>,
     req: &mut Request<Incoming>,
 ) -> BoxResponse {
     let host = req
@@ -2450,19 +3146,13 @@ async fn handle_upgrade(
         Some(p) => p,
         None => return error_page(StatusCode::BAD_REQUEST),
     };
-    let location = match Router::match_location(&server, &path) {
-        Some(l) if l.proxy_pass.is_some() => l,
-        _ => return error_page(StatusCode::BAD_REQUEST),
-    };
-    let proxy_pass = location.proxy_pass.clone().unwrap();
-
     let mut ctx = RequestCtx {
         method: req.method().as_str().to_string(),
         path,
         query: req.uri().query().unwrap_or("").to_string(),
         uri: req.uri().to_string(),
         host,
-        remote_addr: _rec.remote.clone(),
+        remote_addr: rec.remote(),
         remote_port: meta.peer.map(|p| p.port()).unwrap_or(0),
         server_port: meta.listener.port(),
         req_headers: header_pairs(req.headers()),
@@ -2470,9 +3160,10 @@ async fn handle_upgrade(
         rewritten_path: None,
         status: 101,
         body: None,
+        stream: None,
         done: false,
         internal_redirect: false,
-        req_body: Vec::new(),
+        req_body: Bytes::new(),
         exec_depth: 0,
         redirect: None,
         scheme: meta.scheme.to_string(),
@@ -2488,11 +3179,35 @@ async fn handle_upgrade(
         upstream_addr: String::new(),
         upstream_status: 0,
         upstream_header_time: 0.0,
+        ssl: None,
+        start_time: unix_now(),
+        http_version: http_version_f64(req.version()),
+        body_builder: None,
+        eof_sent: false,
+    };
+    // Upgrade 不再是旁路：realip / limit_conn / rewrite / limit_req / allow-deny / auth /
+    // access_by_lua 全部与普通请求一致，之后才允许进入 101 切换。
+    apply_realip(&server, &mut ctx, meta.peer);
+    rec.set_remote(ctx.remote_addr.clone());
+    let conn_guards = match acquire_conn_guards(&state, &server, &ctx.remote_addr) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let location = match run_ingress(&state, &mut ctx, &server).await {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    let Some(proxy_pass) = location.proxy_pass.clone() else {
+        return error_page(StatusCode::BAD_REQUEST);
     };
 
+    // Upgrade 与普通转发同语义：balancer_by_lua 先选点，set_timeouts 覆盖本跳超时
+    let _ = run_phases(&state, &mut ctx, &location, Phase::Balancer, &server).await;
+
     let timeouts = ProxyTimeouts {
-        connect: Duration::from_secs(location.proxy_connect_timeout),
-        read: Duration::from_secs(location.proxy_read_timeout),
+        connect: location.proxy_connect_timeout,
+        send: location.proxy_send_timeout,
+        read: location.proxy_read_timeout,
     };
     let set_headers_ref: Vec<(&str, &str)> = location
         .proxy_set_headers
@@ -2503,6 +3218,8 @@ async fn handle_upgrade(
         set_headers: &set_headers_ref,
         timeouts,
         next_upstream: &location.proxy_next_upstream,
+        next_upstream_tries: location.proxy_next_upstream_tries,
+        next_upstream_timeout: location.proxy_next_upstream_timeout,
         tls: &location.proxy_tls,
     };
 
@@ -2510,9 +3227,19 @@ async fn handle_upgrade(
         Ok(t) => t,
         Err(e) => {
             log_warn!("WebSocket 升级失败: {}", e);
+            rec.set_upstream(
+                ctx.upstream_addr.clone(),
+                ctx.upstream_status,
+                ctx.upstream_header_time,
+            );
             return error_page(StatusCode::BAD_GATEWAY);
         }
     };
+    rec.set_upstream(
+        ctx.upstream_addr.clone(),
+        ctx.upstream_status,
+        ctx.upstream_header_time,
+    );
 
     // 后端 101 头原样转发（Sec-WebSocket-Accept 由后端计算，不能自造）
     let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
@@ -2529,16 +3256,34 @@ async fn handle_upgrade(
 
     // 在 Request 上登记升级交接；响应写出后 hyper 把客户端裸流交给我们
     let on = hyper::upgrade::on(&mut *req);
+    // upstream 并发额度覆盖整条隧道：随 pump 任务结束（任一方向断开/空闲超时）才释放
+    let upstream_guard = tunnel.guard;
     let backend = PrefixedTcp::new(tunnel.prefix, tunnel.stream);
+    // 空闲超时对齐 nginx 的 proxy_read_timeout（0 = 不限）；balancer set_timeouts 覆盖首跳后
+    // 同样约束整条隧道。同时用内联 join 而不是嵌套 spawn，保证连接任务被 abort 时两个方向一起结束。
+    let idle = ctx
+        .balancer_timeouts
+        .map(|t| Duration::from_millis(t.2))
+        .unwrap_or(location.proxy_read_timeout);
     tokio::spawn(async move {
+        let _conn_guards = conn_guards; // limit_conn 的额度覆盖整条 WebSocket 生命周期
+        let _upstream_guard = upstream_guard; // upstream max_conns 同理
         match on.await {
             Ok(upgraded) => {
                 // Upgraded 实现 hyper 自带 IO trait，用 TokioIo 桥到 tokio traits
-                let mut client = hyper_util::rt::TokioIo::new(upgraded);
-                let mut backend = backend;
-                if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut backend).await {
-                    log_debug!("upgrade 隧道结束: {}", e);
-                }
+                let client = hyper_util::rt::TokioIo::new(upgraded);
+                let (mut cr, mut cw) = tokio::io::split(client);
+                let (mut br, mut bw) = tokio::io::split(backend);
+                tokio::join!(
+                    async {
+                        crate::stream::pump(&mut br, &mut cw, idle).await;
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut cw).await;
+                    },
+                    async {
+                        crate::stream::pump(&mut cr, &mut bw, idle).await;
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut bw).await;
+                    }
+                );
             }
             Err(e) => log_warn!("upgrade 交接失败: {}", e),
         }
@@ -2757,8 +3502,8 @@ pub fn permits_for(settings: &Settings) -> Arc<tokio::sync::Semaphore> {
 ///
 /// 复用与 TCP 监听完全相同的请求核心（`handle_request`）：h3 请求体先擦成 `ProxyReqBody`，
 /// 响应体仍是传输无关的 `RespBody`，因此 vhost/location/rewrite/access/proxy/lua 全部阶段
-/// 在 HTTP/1.1、HTTP/2、HTTP/3 上行为一致。证书走 `certs::build_quic_server_config`
-/// （锁 TLS1.3、ALPN=h3、多证书 SNI）。
+/// 在 HTTP/1.1、HTTP/2、HTTP/3 上行为一致。证书走 `tls::make_quic_server_config`
+/// （锁 TLS1.3、ALPN=h3、多证书 SNI；与热重载共用同一构造路径）。
 ///
 /// 已知边界：WebSocket/Upgrade 隧道只在 hyper（HTTP/1.1 over TCP）上接管原始 socket，
 /// HTTP/3 不支持 Upgrade；热重载沿用共享的 `RwLock<Arc<Router>>`，无需重新绑定 UDP。
@@ -2768,31 +3513,19 @@ pub async fn serve_quic(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let addr = listener.addr;
-    let specs = match &listener.tls {
-        Some(opts) => opts.specs.clone(),
+    let server_cfg = match &listener.tls {
+        Some(opts) => match crate::tls::make_quic_server_config(opts, MAX_CONCURRENT_STREAMS) {
+            Ok(c) => c,
+            Err(e) => {
+                log_error!("{addr} QUIC TLS 配置无效: {e}，该监听退出");
+                return;
+            }
+        },
         None => {
             log_error!("{addr} quic 监听缺少 TLS 证书（quic 隐含 ssl），该监听退出");
             return;
         }
     };
-    let rustls_cfg = match certs::build_quic_server_config(&specs) {
-        Ok(c) => c,
-        Err(e) => {
-            log_error!("{addr} QUIC TLS 配置无效: {e}，该监听退出");
-            return;
-        }
-    };
-    let quic_crypto = match quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg) {
-        Ok(q) => q,
-        Err(e) => {
-            log_error!("{addr} QUIC 无法装载 TLS 配置: {e:?}，该监听退出");
-            return;
-        }
-    };
-    let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_CONCURRENT_STREAMS));
-    server_cfg.transport_config(Arc::new(transport));
     let endpoint = match quinn::Endpoint::server(server_cfg, addr) {
         Ok(e) => e,
         Err(e) => {
@@ -2800,6 +3533,7 @@ pub async fn serve_quic(
             return;
         }
     };
+    state.tls_registry.register_quic(addr, endpoint.clone());
     log_info!("监听 https://{addr}（QUIC/HTTP/3，ALPN h3）");
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -2810,6 +3544,7 @@ pub async fn serve_quic(
         let incoming = tokio::select! {
             _ = shutdown.changed() => break,
             inc = endpoint.accept() => inc,
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
         };
         let Some(incoming) = incoming else {
             break; // endpoint 已关闭
@@ -2822,6 +3557,7 @@ pub async fn serve_quic(
                     let conn = match connecting.await {
                         Ok(c) => c,
                         Err(e) => {
+                            crate::metrics::get().on_tls_handshake_failure();
                             log_debug!("QUIC 握手失败 {peer}: {e}");
                             return;
                         }
@@ -3033,12 +3769,12 @@ mod tests {
         std::fs::write(dir.join("a.txt"), b"hello world").unwrap();
         let snap = snap_for(dir.clone(), "/a.txt");
         let hit = resolve_snap(&snap);
-        let StaticHit::File { meta: Some(m), body, .. } = hit else {
+        let StaticHit::File { meta: Some(m), body: FileSource::Memory(body), .. } = hit else {
             panic!("应为文件命中，实际 {hit:?}");
         };
         assert_eq!(m.size, 11);
         assert_eq!(m.etag, etag_of(m.mtime, 11));
-        assert_eq!(body, b"hello world");
+        assert_eq!(&body[..], b"hello world");
         // 同 (mtime,size) 必须得到同一个 ETag：这是 304 判定的前提
         assert_eq!(m.etag, etag_of(m.mtime, 11));
         assert!(m.last_modified.ends_with("GMT"));
@@ -3111,7 +3847,7 @@ mod tests {
             let mut snap = snap_for(dir.clone(), "/a.txt");
             snap.range = Some(hdr.to_string());
             let hit = resolve_snap(&snap);
-            let StaticHit::File { body, window: got, .. } = hit else {
+            let StaticHit::File { body: FileSource::Memory(body), window: got, .. } = hit else {
                 panic!("{hdr} 应命中文件");
             };
             assert_eq!(got, window, "{hdr} 的区间");
@@ -3135,18 +3871,18 @@ mod tests {
         };
         // 客户端缓存的校验位已过期：不能给 206，给整份 200
         snap.if_range = Some("\"deadbeef-99\"".to_string());
-        let StaticHit::File { body, window, .. } = resolve_snap(&snap) else {
+        let StaticHit::File { body: FileSource::Memory(body), window, .. } = resolve_snap(&snap) else {
             panic!("应命中文件");
         };
         assert_eq!(window, None);
-        assert_eq!(body, b"0123456789");
+        assert_eq!(&body[..], b"0123456789");
         // 校验位一致时 Range 生效
         snap.if_range = Some(m.etag.clone());
-        let StaticHit::File { window, body, .. } = resolve_snap(&snap) else {
+        let StaticHit::File { window, body: FileSource::Memory(body), .. } = resolve_snap(&snap) else {
             panic!("应命中文件");
         };
         assert_eq!(window, Some((0, 3)));
-        assert_eq!(body, b"0123");
+        assert_eq!(&body[..], b"0123");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3162,11 +3898,11 @@ mod tests {
         snap.negotiable = false;
         snap.if_none_match = Some(m.etag.clone());
         snap.range = Some("bytes=0-2".to_string());
-        let StaticHit::File { body, window, .. } = resolve_snap(&snap) else {
+        let StaticHit::File { body: FileSource::Memory(body), window, .. } = resolve_snap(&snap) else {
             panic!("应命中文件");
         };
         assert_eq!(window, None);
-        assert_eq!(body, b"hello world");
+        assert_eq!(&body[..], b"hello world");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3190,10 +3926,10 @@ mod tests {
             StaticHit::NotFound
         ));
         // 同一目录下的普通文件不受影响
-        let StaticHit::File { body, .. } = resolve_snap(&snap_for(dir.clone(), "/visible.txt")) else {
+        let StaticHit::File { body: FileSource::Memory(body), .. } = resolve_snap(&snap_for(dir.clone(), "/visible.txt")) else {
             panic!("普通文件应照常服务");
         };
-        assert_eq!(body, b"ok");
+        assert_eq!(&body[..], b"ok");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3219,16 +3955,43 @@ mod tests {
         assert!(parse_http_date("").is_none());
     }
 
-    #[test]
-    fn window_read_is_inclusive_and_bounded() {
-        let dir = tmp_dir("window");
-        std::fs::write(dir.join("a.bin"), b"0123456789").unwrap();
-        let p = dir.join("a.bin");
-        assert_eq!(read_window(&p, 2, 4).unwrap(), b"234");
-        assert_eq!(read_window(&p, 9, 9).unwrap(), b"9");
-        assert_eq!(read_window(&p, 5, 100).unwrap(), b"56789");
-        assert_eq!(read_window(&p, 7, 3).unwrap(), b"");
-        assert!(read_window(&dir.join("missing"), 0, 1).is_none());
+    #[tokio::test]
+    async fn large_files_and_ranges_stream_from_disk() {
+        let dir = tmp_dir("diskstream");
+        let data: Vec<u8> = (0..(FILE_CACHE_MAX_FILE as usize + 4096))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(dir.join("big.bin"), &data).unwrap();
+
+        // 超过缓存阈值 → 不整份入内存，只登记磁盘区间
+        let hit = resolve_snap(&snap_for(dir.clone(), "/big.bin"));
+        let StaticHit::File { body: FileSource::Disk { start, len, .. }, window: None, .. } = hit
+        else {
+            panic!("大文件应走磁盘流式：{hit:?}");
+        };
+        assert_eq!((start, len), (0, data.len() as u64));
+
+        // Range 同理，且流式读出的字节与源文件一致（含端点）
+        let mut snap = snap_for(dir.clone(), "/big.bin");
+        let lo = FILE_CACHE_MAX_FILE + 17;
+        snap.range = Some(format!("bytes={lo}-{}", lo + 99));
+        let hit = resolve_snap(&snap);
+        let StaticHit::File { body: FileSource::Disk { start, len, .. }, window, .. } = hit else {
+            panic!("大文件 Range 应走磁盘流式：{hit:?}");
+        };
+        assert_eq!(window, Some((lo, lo + 99)));
+        assert_eq!((start, len), (lo, 100));
+        let mut body = DiskBody::open(&dir.join("big.bin"), start, len)
+            .await
+            .expect("打开磁盘体");
+        let mut got = Vec::new();
+        while let Some(frame) = body.frame().await {
+            got.extend_from_slice(frame.unwrap().data_ref().unwrap());
+        }
+        assert_eq!(got, &data[lo as usize..(lo + 100) as usize]);
+
+        // 文件被截断/删除后打开失败 → 调用方回 404，而不是挂起或发出空体
+        assert!(DiskBody::open(&dir.join("missing.bin"), 0, 10).await.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

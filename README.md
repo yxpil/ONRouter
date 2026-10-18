@@ -16,16 +16,27 @@ all gateway logic is hand-written.
 - **Lua script file cache**: `LuaSource::File` used to read from disk synchronously on every request
   (`fs::read_to_string`), one of the largest blocking points. It is now a process-level cache
   (`OnceLock<RwLock<HashMap<PathBuf, Arc<str>>>>`) — each file is read once, on first request.
-- **Static IO moved off workers**: every filesystem call in the static-serving path (resolve / index /
-  autoindex / read) is handed wholesale to `tokio::task::spawn_blocking` via an owned snapshot, so
-  tokio worker threads are never blocked by disk IO.
+- **Static IO moved off workers**: the filesystem calls in the static-serving path (resolve / index /
+  autoindex) are handed wholesale to `tokio::task::spawn_blocking` via an owned snapshot, so tokio
+  worker threads are never blocked by disk IO; large-file body reads use `tokio::fs` chunked reads
+  (which themselves run on the blocking pool per chunk).
 - **error_page target files** are likewise read once to build the response, removing extra synchronous
   IO round-trips from the error-page hot path.
 - Measured (32 concurrent keep-alive connections): static 4880 → 6715 req/s (+38%), Lua
   7867 → 9044 req/s (+15%).
 - **Static file in-memory cache**: files ≤1 MB are held entirely in process memory (up to 512 entries),
   invalidated by (mtime, size). A cache hit costs zero disk reads and zero syscalls beyond a single
-  `stat`; file edits are detected automatically.
+  `stat`; file edits are detected automatically. Cached bodies are `Bytes`, so a full-file hit and a
+  `Range` slice served from cache are reference-counted, not copied.
+- **Large/uncached files stream from disk**: files above the cache threshold (and `Range` windows that
+  miss it) are no longer read into memory. `serve_static_flow` emits a chunked `DiskBody` that seeks
+  once and reads 64 KiB per poll while the response is written, with an explicit `Content-Length` so
+  keep-alive framing and `HEAD` stay exact; `HEAD` doesn't even open the file. `sub_filter` still needs
+  the whole body, but only buffers when its MIME gate matches. Verified by `tools/static_stream_e2e.py`
+  (19 checks: a 128 MB file served whole / by mid-file `Range` / suffix `Range` / `HEAD` / `304` /
+  `416` with sha256 equality, a 2 MB file rewritten by `sub_filter` while its `Range` slice stays
+  byte-exact, and a paused mid-download showing **0.6 MB RSS delta for a 128 MB file** versus the old
+  whole-file buffer) + unit test `large_files_and_ranges_stream_from_disk`.
 
 ## Security
 
@@ -50,13 +61,22 @@ all gateway logic is hand-written.
   many in-flight requests as Lua coroutines — a request yields only at `ngx.sleep` and the VM lock is
   released between synchronous resume segments, so `ngx.timer` callbacks and sleep timers progress
   while other requests on the same VM run (OpenResty's single-worker C10K, not one-request-per-VM).
+- **Low-concurrency fast path (no scheduler hop for the common case)**: when the target VM lock is
+  free, the request task compiles/resumes the first Lua segment inline; scripts that never yield
+  finish without ever touching the scheduler task. On the first yield the coroutine is handed to the
+  scheduler (`Job::Adopt`) and resumed there like any other request. A shared per-VM chunk cache keeps
+  compilation single-flight. Exposed as `onrouter_lua_phase_{inline,adopted,scheduled}_total`; real
+  traffic shows 100/100 inline for a no-yield script and 50/50 adopt for `ngx.sleep`.
 - **16-shard ngx.shared.DICT**: sharded by key hash, each shard with its own lock, so multi-core
   concurrent reads/writes never block each other.
 - **Lock-free hot paths**: round-robin cursor / node health state / VM selection are all atomic.
 - **Async access log**: a dedicated writer thread + buffered batch flush; the request hot path does
   only one lock-free enqueue.
-- **proxy_next_upstream**: connection-level upstream failures automatically retry once against the next
-  node (self-heals stale connection-pool hits).
+- **proxy_next_upstream**: nginx token semantics — `error`, `timeout`, `invalid_header`, `http_XXX`,
+  `non_idempotent`, `off`, plus `proxy_next_upstream_tries` / `_timeout` budgets. Connection-level
+  failures retry even for non-idempotent requests (nothing was sent yet); once bytes hit the wire only
+  idempotent methods (or an explicit `non_idempotent`) retry, and streamed request bodies are never
+  replayed. When the retry budget/node list is exhausted the last upstream response is returned as-is.
 - **TCP_NODELAY**: Nagle disabled by default on all inbound connections.
 
 ## Feature map
@@ -69,7 +89,7 @@ all gateway logic is hand-written.
 | passive health checks `max_fails` / `fail_timeout` | failure counting + node removal + expiry recovery (falls back to full set when all are down) | `upstream.rs` |
 | `proxy_pass` reverse proxy | hyper connection pool, `proxy_set_header` variable interpolation, prefix replacement | `proxy.rs` |
 | `resolver` + async DNS | pure-Rust non-blocking UDP stub resolver (A/AAAA, RFC1035 + compression pointers), `valid=` TTL cache | `dns.rs` |
-| `proxy_cache` response caching | in-memory named zones, `proxy_cache_valid`/key/methods/min_uses, upstream `Cache-Control`/`Expires` precedence, `X-Cache-Status` | `proxy_cache.rs` |
+| `proxy_cache` response caching | in-memory named zones sized from `keys_zone` with LRU eviction, `proxy_cache_valid`/key/methods/min_uses, `proxy_cache_lock` coalescing, `use_stale` (error/timeout/updating/http_xxx), `bypass`/`no_cache`, upstream `Cache-Control`/`Expires` precedence, `X-Cache-Status` | `proxy_cache.rs` |
 | `proxy_pass https://` / `wss://` backends | pure-Rust rustls client over one pooled `Service<Uri>` connector shared with http backends; `proxy_ssl_verify`/`_trusted_certificate`/`_name`/`_server_name` + `proxy_ssl_certificate`/`_certificate_key` (mTLS client cert), TLS policy incl. client cert in the pool key | `proxy_tls.rs`, `proxy.rs` |
 | `rewrite ... last/break/redirect/permanent` | regex engine + `$1..$9` back-references | `engine.rs` |
 | `map $src $dst { … }` derived variables | exact/`~`/`~*`/capture-group cases + `default`, shared resolver for `ngx.var` + config interpolation | `engine.rs`, `router.rs` |
@@ -78,20 +98,23 @@ all gateway logic is hand-written.
 | `sub_filter <m> <r>;` response rewrite | literal + `~`/`~*` regex match, `&` back-reference in the replacement, `sub_filter_once`/`sub_filter_types`, applied on buffered proxy/cache/static/Lua bodies | `engine.rs`, `server.rs`, `router.rs` |
 | `set_real_ip_from` + `real_ip_header`/`real_ip_recursive` | realip module: trust the client IP from a header only when the direct peer is in a trusted CIDR, XFF chain right-most (off) / recursive-trusted-skip (on); overrides `$remote_addr` before geo/limit/auth | `realip.rs`, `router.rs`, `server.rs` |
 | `proxy_redirect` + `proxy_cookie_domain`/`proxy_cookie_path` | rewrite upstream `Location`/`Refresh` (literal prefix, `~regex` with captures, or `default` = origin→location-prefix relative form) and `Set-Cookie` `domain=`/`path=` (literal/regex, `none` deletes, path prefix-preserving); applied on both proxy seams (streaming + buffered), multi `Set-Cookie` preserved | `resp_rewrite.rs`, `router.rs`, `server.rs` |
-| `stream { server { … } }` L4 proxy + `ssl_preread` | byte-transparent TCP tunnel (no TLS termination, no protocol parsing); optional `ssl_preread` peeks the first TLS record and parses SNI from the ClientHello (a self-contained offset-walk, best-effort: non-TLS/incomplete/no-SNI still wires to the default), routing by `sni_match <name> <target>` (exact or `*.suffix` single-label wildcard; target = named `upstream` reusing the L7 pool, or a literal `host:port`), falling back to `proxy_pass`; peeked bytes are replayed to the backend so the handshake is untouched; separate accept loop shares only the shutdown signal + upstream pool with HTTP | `stream.rs`, `router.rs`, `main.rs` |
-| `return` / `add_header` / `proxy_read_timeout` | same semantics | `router.rs` |
+| `stream { server { … } }` L4 proxy + `ssl_preread` | byte-transparent TCP tunnel (no TLS termination, no protocol parsing); optional `ssl_preread` peeks the first TLS record and parses SNI from the ClientHello (a self-contained offset-walk, best-effort: non-TLS/incomplete/no-SNI still wires to the default), routing by `sni_match <name> <target>` (exact or `*.suffix` single-label wildcard; target = named `upstream` reusing the L7 pool, or a literal `host:port`), falling back to `proxy_pass`; peeked bytes are replayed to the backend so the handshake is untouched; tunnels share the process-wide `worker_connections` budget and metrics with HTTP, hold an upstream guard (`max_conns`/passive health) for the whole tunnel, and stop/drain via `shutdown_grace` (listener closed first) | `stream.rs`, `router.rs`, `main.rs` |
+| `proxy_read_timeout` / `_connect_timeout` / `_send_timeout` | per-chunk response idle, connect, and idle-write watchdog (ms precision; `0` disables); `proxy_next_upstream` tokens + `_tries` / `_timeout` | `router.rs`, `proxy.rs`, `proxy_tls.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
+| Multi-certificate SNI vhosts | several `server` blocks share one `listen … ssl` port, each with its own cert; ClientHello `server_name` selects exact > `*.suffix` wildcard > default (first) cert, while request routing still follows `Host` (they may intentionally differ); verified by `tools/https_matrix_e2e.py` | `certs.rs`, `router.rs` |
 | `ssl_protocols TLSv1..TLSv1.3` | explicit enabled-version set (rustls serves the 1.2/1.3 subset by default); `--features native-tls` routes a legacy-needing listener to the OS stack (Windows Schannel) to truly negotiate TLS 1.0/1.1 | `certs.rs`, `tls.rs`, `router.rs` |
+| `ssl_session_cache` / `ssl_session_tickets` | process-wide session resumption shared by every TLS listener (all SNI vhosts and ports): `off` / `builtin[:n]` / `shared:name:size` with approximate LRU eviction, plus rustls `Ticketer` for stateless TLS1.3 tickets (`ssl_session_tickets on/off`, default on). Verified across two ports with `openssl -sess_out/-sess_in` and Python `session_reused` | `certs.rs`, `router.rs`, `tools/tls_session_e2e.py` |
+| `ssl_certificate_by_lua*` | per-SNI handshake script runs before certificate selection: `ngx.ssl.server_name()`, `ngx.ssl.parse_pem_cert` / `parse_pem_priv_key`, `ngx.ssl.set_cert` / `set_priv_key` / `clear_certs`, plus the `certificate` / `priv_key` legacy aliases; dynamic configs cached by cert+key hash. A handshake script error or `ngx.exit(ngx.ERROR)` aborts the handshake; `_file` form supported | `certs.rs`, `tls.rs`, `lua_engine.rs`, `tools/ssl_cert_lua_e2e.py` |
 | HTTP/2 serving (`http2 on;` + `listen … http2`) | TLS h2 via ALPN; cleartext h2c prior-knowledge via 24-byte preface sniff (MSG_PEEK, non-consuming) so h1/h2c share one listener; hyper multiplexed streams | `server.rs`, `router.rs` |
 | `SIGHUP` graceful config reload | in-process hot swap of the routing table behind `RwLock<Arc<Router>>`; listeners never rebound (no accept gap), per-request snapshot, invalid config keeps old; portable `reload <interval>;` mtime poll | `server.rs`, `main.rs` |
+| `init_by_lua*` / `init_worker_by_lua*` / `lua_package_path` | `init_by_lua*` once per VM at startup; `init_worker_by_lua*` (inline and `_file`) once per VM after its scheduler is live, so timers/cosockets/`ngx.sleep` work; startup aborts non-zero on script errors. `lua_package_path` supports `$prefix`/`${prefix}` and OpenResty's `;;` default-path semantics, repeatable directives joined with `;`, applied before init scripts | `lua_engine.rs`, `main.rs`, `tools/init_worker_package_e2e.py` |
 | HTTP/3 serving (`listen … quic`) | quinn QUIC endpoint (UDP) + h3 over it, TLS1.3/ALPN `h3` reusing the SNI cert store; same body-agnostic request core as h1/h2 (vhost/location/rewrite/access/proxy/lua); TCP-TLS on the same port serves h1/h2 and advertises `Alt-Svc: h3=":port"` | `server.rs`, `certs.rs`, `router.rs` |
 | `ngx_lua` scripting layer | mlua (Lua 5.4), see the Lua API list below | `lua_engine.rs` |
-| `init_by_lua` | runs once at startup | `lua_engine.rs` |
-| `lua_shared_dict` / `ngx.shared.DICT` | full OpenResty method surface: `get`/`get_stale`/`get_plus`/`get2`, `set`/`safe_set`/`force_set`/`set_auto`, `add`/`force_add`/`replace`, `incr`/`decr`/`bump`, `delete`/`flush_all`/`flush_expired`, `ttl`/`key_present`/`size`/`len`/`num`/`capacity`/`free_space` (true multi-value returns) | `shared_dict.rs`, `lua_engine.rs` |
-| `access_log` combined format | local file + stdout | `access_log.rs` |
+| `lua_shared_dict` / `ngx.shared.DICT` | full OpenResty method surface: `get`/`get_stale`/`get_plus`/`get2`, `set`/`safe_set`/`force_set`/`set_auto`, `add`/`force_add`/`replace`, `incr`/`decr`/`bump`, `delete`/`flush_all`/`flush_expired`, `ttl`/`key_present`/`size`/`len`/`num`/`capacity`/`free_space`/`get_keys`/`expire` (true multi-value returns) | `shared_dict.rs`, `lua_engine.rs` |
+| `access_log` combined format | local file + stdout; `$remote_addr` is captured after realip, so logs show the real client, not the trusted proxy; each line also carries `$request_time` and the `$upstream_addr` / `$upstream_status` / `$upstream_header_time` triple (`- - -` when no upstream was contacted; Upgrade tunnels log the `101` peer); a full async queue drops and counts lines instead of blocking request tasks | `access_log.rs` |
 | third-party C modules | `content_by_rust` / `access_by_rust` compile-time registered Rust handlers | `engine.rs` |
-| `stub_status` / Prometheus scraping | process-global runtime metrics (accepted/active/capacity + requests + 2xx/3xx/4xx/5xx) rendered as Prometheus text via `content_by_rust metrics` | `metrics.rs` |
+| `stub_status` / Prometheus scraping | process-global runtime metrics (accepted/active/capacity + requests + 2xx/3xx/4xx/5xx) plus per-upstream node connections/health/success/failure, cache-status counters, TLS handshake failures, limit_req/limit_conn rejections and dropped access-log lines, rendered as Prometheus text via `content_by_rust metrics` | `metrics.rs` |
 | `allow` / `deny` | ACCESS-phase IP ACL: IPv4/IPv6/CIDR/`all`, ordered first-match-wins (default allow), location inherits server rules | `access.rs` |
 | `auth_basic` / `auth_basic_user_file` | HTTP Basic auth in ACCESS phase; htpasswd supports plaintext, `{SHA}` (SHA-1), `$1$`/`$apr1$` (MD5-crypt), realm tri-state incl. `off`, mtime-cached file reload | `access.rs` |
 | nginx syntax compatibility | `location =/\^~/~/~*`, server_name wildcards, error_page, try_files, index, autoindex, alias, client_max_body_size, return URL shorthand | |
@@ -176,10 +199,29 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 
 ## Lua API (aligned with ngx.*)
 
-- Response: `ngx.say / print / status (read-write) / exit / header["X"]=v (read+write via metatable) / header.set / resp.get_headers()`
-- Request: `ngx.req.get_method / set_method / get_path / get_query / get_headers / set_header(name, value | array | nil) / set_raw_header / clear_header / get_uri_args / set_uri / set_uri_args / read_body / get_body_data / set_body_data / discard_body / get_body_file / get_post_args / raw_header([full])` —
+- Response: `ngx.say / print / status (read-write) / exit / flush([wait]) / send_headers() / eof() / headers_sent /
+  header["X"]=v (read+write via metatable) / header.set / resp.get_headers()`
+  — `ngx.flush` switches the response to streaming: head + buffered body go out immediately
+  (h1 chunked / h2 DATA), later writes keep streaming; without an explicit flush the first 64 KiB
+  does the same automatically. `ngx.send_headers()` flushes the status line + headers while staying
+  streaming, `ngx.eof()` ends the stream early and drops any later `ngx.say` output, and
+  `ngx.headers_sent` reports whether the head is already on the wire. `ngx.header["Set-Cookie"]`
+  accepts a table to emit repeated header lines (and reads back as a table when repeated). A location
+  with response filters (`header_filter_by_lua` / `body_filter_by_lua`) stays buffered by design,
+  since filters need the whole response.
+  Verified by `tools/lua_flush_socket_e2e.py` (23 checks incl. early-first-byte timing, h1 keepalive
+  reuse after a chunked response, h2 DATA frames, `limit_conn` accounting, and `log_by_lua`) and
+  `tools/api_compat_e2e.py` (send_headers/eof/headers_sent and multi-value Set-Cookie).
+- Request: `ngx.req.get_method / set_method / get_path / get_query / get_headers / set_header(name, value | array | nil) / set_raw_header / clear_header / get_uri_args / set_uri / set_uri_args / read_body / get_body_data / set_body_data / discard_body / init_body / append_body / finish_body / get_body_file / get_post_args / raw_header([full]) / start_time() / http_version() / is_internal()` —
   `set_header`/`clear_header` mutate the live inbound request headers, so a rewrite/access-phase change
-  is carried all the way to the proxied backend.
+  is carried all the way to the proxied backend. `init_body`/`append_body`/`finish_body` build a new
+  request body from scratch (streamed chunks committed as the new `Content-Length`); the built body
+  also overrides what `proxy_pass` forwards. `start_time()` / `http_version()` / `is_internal()` expose
+  the request timestamp, the HTTP version (1.0/1.1/2.0), and whether this is an internal subrequest.
+- Request body reader: `ngx.req.socket([raw])` → `receive(size?) / receiveuntil(delim, opts?) / close()`
+  — reads the already-buffered request body in order, with OpenResty's `nil, err, partial` convention;
+  `receiveuntil` defaults to trimming the delimiter and its iterator can be called repeatedly.
+  Verified by `tools/lua_flush_socket_e2e.py` (raw body bytes, delimiter boundaries, inclusive mode).
 - Control: `ngx.redirect(uri, code?) / ngx.exec(uri) / ngx.exit / ngx.sleep(secs) (async coroutine, seconds unit aligned with OpenResty)`
 - Cosocket: `ngx.socket.tcp()` → `connect / send / receive(*l | *a | n) / receiveany(min,max) /
   receiveuntil(delim) / shutdown(read?,write?) / settimeout / setsize / setkeepalive(timeout,pool) /
@@ -189,8 +231,10 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   returns the idle connection to a process-global pool keyed by `host:port`, and a later `connect`
   to the same peer reuses it (skip the handshake, second return `"reused"`). `tlshandshake` upgrades
   the stream to a rustls client TLS connection (`CosStream::Plain`→`CosStream::Tls`), after which
-  every receive variant runs over the encrypted stream. Verified by
-  `tools/sock_ext_e2e.py` / `tools/sock_tls_e2e.py` against real TCP and TLS backends.
+  every receive variant runs over the encrypted stream. `sslhandshake` is an alias of `tlshandshake`,
+  and `getreusedtimes()` returns `1` after a pooled connection was reused (`0` on a fresh socket).
+  Verified by `tools/sock_ext_e2e.py` / `tools/sock_tls_e2e.py` / `tools/api_compat_e2e.py` against
+  real TCP and TLS backends.
 - UDP: `ngx.socket.udp()` → `setpeername / send / receive(max) / settimeout / close` — connected-UDP
   datagram I/O on the same scheduler yield path; verified by `tools/sock_udp_e2e.py`.
 - Regex: `ngx.re.match(s, pat, flags?) / find / gmatch(s, pat, flags?)→iterator / sub(s, pat, repl, flags?) /
@@ -199,7 +243,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   expansion) or a callback function and return `new_subject, count`; `gmatch` returns a capture object with
   `[0]` whole match, `[N]` groups and named groups; `opt`'s handle avoids recompiling on the hot path.
 - Encoding: `ngx.encode_base64 / decode_base64 / escape_uri / unescape_uri / decode_args / encode_args`
-- Shared memory: `ngx.shared.<zone>:get / get_stale / set / safe_set / add / replace / delete / incr / ttl / flush_all`
+- Shared memory: `ngx.shared.<zone>:get / get_stale / set / safe_set / add / replace / delete / incr / ttl / flush_all / get_keys(max?) / expire(key, ttl)`
 - Background timers: `ngx.timer.at(delay_sec, cb, ...) / ngx.timer.every(interval_sec, cb, ...) / running_count() / pending_count()`
   — seconds unit, `premature` as the callback's first argument, user varargs forwarded verbatim,
   failures return `(nil, err)`, `return false` stops the interval (semantics aligned with official t/106/152/107)
@@ -221,12 +265,15 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
 - cosocket: `ngx.socket.tcp()` with `connect/send/receive(*l|*a|n)/settimeout/close` — ops run in
   tokio tasks (no VM lock held) and yield to the scheduler, so many socket-bound requests share one
   VM concurrently; partial-data + timeout semantics mirror ngx_lua (`nil, err, partial`)
-- Subrequests: `ngx.location.capture(uri, opts?)` → `{ status, body, header }` (and `opts.method`) —
-  runs the *full* pipeline for the captured location (rewrite → access → content: static / `return` /
-  `proxy_pass` / nested Lua all work) as an internal subrequest against the same vhost, then yields to
-  the VM scheduler (like the cosocket ops) so the parent coroutine and other in-flight requests keep
-  progressing; nested captures are supported with a depth guard (`status = 0` on overflow, mirroring
-  ngx_lua's error sentinel). Verified by `tools/subrequest_e2e.py`.
+- Subrequests: `ngx.location.capture(uri, opts?)` → `{ status, body, header }` (`opts.method`, `opts.body`,
+  `opts.args`) — runs the *full* pipeline for the captured location (rewrite → access → content: static /
+  `return` / `proxy_pass` / nested Lua all work) as an internal subrequest against the same vhost, then
+  yields to the VM scheduler (like the cosocket ops) so the parent coroutine and other in-flight requests
+  keep progressing; nested captures are supported with a depth guard (`status = 0` on overflow, mirroring
+  ngx_lua's error sentinel), and `ngx.is_subrequest` is true inside. `ngx.location.capture_multi({{uri,
+  opts}, …})` runs several captures concurrently as light threads (four 0.2 s subrequests finish in
+  ~0.2 s, not 0.8 s) and returns one `{status, body, header}` per entry. Verified by
+  `tools/subrequest_e2e.py` and `tools/api_compat_e2e.py`.
 - Light threads: `ngx.thread.spawn(func, ...) / ngx.thread.wait(thread...) / ngx.thread.yield() /
   ngx.thread.kill(thread)` — spawned threads are first-class coroutines on
   the same VM scheduler (they share the parent request's `ngx.ctx` and interleave real `ngx.sleep` /
@@ -236,34 +283,44 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   scheduling turn; killing a thread drops its in-flight sleep/socket op. The request terminating reaps
   any still-running children (mirrors ngx_lua). Verified by `tools/thread_e2e.py` (24 checks, incl. a
   wall-clock proof that 4 concurrent 0.4 s sleeps finish in ≪ 1.6 s and that two yielding threads
-  interleave `ABABAB`). `ngx.on_abort(handler)` additionally accepts and stores a per-request abort
-  callback (API-compatible); the disconnect-driven *invocation* hook is not yet wired to the server's
-  connection-liveness path and is on the roadmap.
+  interleave `ABABAB`). `ngx.semaphore` (`new(n) / count() / post(n) / wait(timeout?)`) is implemented
+  on the same scheduler coroutines as the official API: `wait` yields without blocking the VM, `post`
+  wakes a waiter, `timeout` returns `nil, "timeout"` and `0` polls non-blocking; it is per-VM (each VM
+  owns its own Lua state, so a semaphore is not shared across VMs). `ngx.on_abort(handler)` additionally
+  accepts and stores a per-request abort callback (API-compatible); the disconnect-driven *invocation*
+  hook is not yet wired to the server's connection-liveness path and is on the roadmap.
 - Balancer phase: `balancer_by_lua` / `balancer_by_lua_file` + `ngx.balancer`
   (`set_current_peer(host, port) / get_current_peer() / set_timeouts(connect_ms, send_ms, read_ms) /
   set_more_failures({failures,return_code,escalate}) / recreate_request(bool?)`) — the phase runs just
   before `proxy_pass` forwarding, reading the request via `ngx.req.get_uri_args()` / `ngx.req.get_headers()`
   and, on `set_current_peer`, routing the connection to the Lua-selected `host:port` *instead of* the
   upstream's load balancer (so Lua drives dynamic peer selection / service discovery). `set_timeouts`
-  overrides the location's connect/read timeouts for that hop. All five functions return OpenResty's
+  overrides the location's connect/send/read timeouts for that hop, and the read value also bounds the
+  idle timeout of a WebSocket tunnel opened to the selected peer. All five functions return OpenResty's
   `true` / `nil, err` convention; `set_current_peer('')` and negative timeouts reject. Tradeoff vs
   ngx_lua: the balancer runs once per request (not once per retry attempt), so a Lua-chosen peer is a
-  single hop without in-upstream failover, and the `send` timeout / `ngx.balancer.set_upstream_*`
-  override APIs remain (though the `$upstream_addr / $upstream_status / $upstream_header_time` log
-  variables are now recorded by the proxy path — see "Upstream metrics"). Verified by `tools/balancer_e2e.py` (11 checks: a `proxy_pass` to a dead upstream
-  502s on its own but the balancer re-routes it to live backends; query- and header-driven A/B
-  selection; `set_timeouts` cutting a 3 s backend down to a ~0.4 s 502; a shared-dict counter giving an
-  exact 5/5 round-robin split of real traffic). Engine-level unit test `balancer_lua_phase_stashes_peer_on_ctx`.
+  single hop without in-upstream failover, and the `ngx.balancer.set_upstream_*` override APIs remain
+  (though the `$upstream_addr / $upstream_status / $upstream_header_time` log variables are now
+  recorded by the proxy path — see "Upstream metrics"). The balancer phase also runs before Upgrade
+  handshakes, so WebSocket peers are selected the same way. Verified by `tools/balancer_e2e.py`
+  (17 checks: a `proxy_pass` to a dead upstream 502s on its own but the balancer re-routes it to live
+  backends; query- and header-driven A/B selection; `set_timeouts` cutting a 3 s backend down to a
+  ~0.4 s 502 and aborting an 8 MB upload to a non-reading sink after 300 ms; a WebSocket 101 + tunnel
+  echo that only succeed through the balancer-selected peer; a shared-dict counter giving an exact
+  5/5 round-robin split of real traffic). Engine-level unit test `balancer_lua_phase_stashes_peer_on_ctx`.
 - Others: `ngx.ctx (per-request table) / ngx.time / ngx.now / ngx.log / ngx.config.* / ngx.version`
 - Variables: `ngx.var` (metatable-backed nginx variables read off the live request) — `$uri /
   $request_uri / $args / $query_string / $is_args / $method→request_method / $scheme / $host /
-  $remote_addr / $remote_port / $server_port / $content_type / $status / $body_bytes_sent /
-  $request_length / $http_<name> (request header) / $sent_http_<name> (response header) /
+  $remote_addr / $remote_port / $server_addr / $server_port / $hostname / $content_type /
+  $content_length / $status / $body_bytes_sent / $request_length / $request_body / $request_time /
+  $msec / $time_local / $time_iso8601 / $https / $arg_<name> / $cookie_<name> /
+  $http_<name> (request header) / $sent_http_<name> (response header) / $proxy_add_x_forwarded_for /
   $upstream_addr / $upstream_status / $upstream_header_time(≡$upstream_response_time)`, all returned
   as strings with `nil` for undefined vars (OpenResty semantics). `$uri` (rewrites the path) and
   `$status` are writable; read-only vars ignore assignment. Verified by `tools/ngxvar_e2e.py` (19
   checks: live request metadata, `$http_x_test` header echo, undefined→nil, `$uri` write-then-read,
-  `$status=418` producing a real 418 response) + unit test `ngx_var_reads_and_writes`.
+  `$status=418` producing a real 418 response) + unit test `ngx_var_reads_and_writes`, plus the
+  `arg_/cookie_/request_time/msec/time_*` cases in `tools/api_compat_e2e.py`.
 - Derived variables — the nginx `map` directive. Top-level `map <source> <dest> { … }` blocks build a
   process-wide table (installed on every `Router::build`/hot-reload). Reads funnel through a single
   `engine::resolve_variable` so a `$dest` resolves identically in **both** `ngx.var.<dest>` (Lua) and
@@ -322,12 +379,15 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   right-to-left and returns the first address that is *not* itself trusted. The rewrite is applied only
   when the **direct peer** is trusted (so a client cannot forge the header) and it overwrites
   `ctx.remote_addr` **before** every downstream consumer, so `$remote_addr`, `$binary_remote_addr`,
-  `geo`, `limit_req`/`limit_conn`, `allow`/`deny` and `access_log` all key off the real client. Verified
-  by `tools/real_ip_e2e.py` (12 checks across four server blocks that turn the always-`127.0.0.1` test
+  `geo`, `limit_req`/`limit_conn`, `allow`/`deny` and `access_log` all key off the real client. The
+  access-log record is created at request entry but its remote field is updated right after realip
+  (both the normal and `Upgrade` paths), so the combined-log first column is the rewritten IP. Verified
+  by `tools/real_ip_e2e.py` (14 checks across four server blocks that turn the always-`127.0.0.1` test
   peer into trusted vs untrusted cases: X-Real-IP rewrite, the anti-forgery no-rewrite on an untrusted
   peer, the same `X-Forwarded-For` value yielding the right-most proxy address under `recursive off` vs
-  the true client under `recursive on`, and a `geo $net` derived variable tracking the rewritten IP
-  through each case) + pure unit tests in `realip.rs` and router tests `parse_real_ip_directives_into_server`.
+  the true client under `recursive on`, a `geo $net` derived variable tracking the rewritten IP through
+  each case, and the on-disk access-log line starting with `203.0.113.9` for the trusted case) + pure
+  unit tests in `realip.rs` and router tests `parse_real_ip_directives_into_server`.
 - Proxy response-header rewrite — the nginx `proxy_redirect` + `proxy_cookie_domain`/`proxy_cookie_path`
   (`resp_rewrite.rs`). These are config-time string rewrites applied to the upstream `Location`/`Refresh`
   and `Set-Cookie` response headers. `proxy_redirect <match> <replacement>` (repeatable) treats `match` as a
@@ -357,20 +417,39 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   `*.suffix` wildcard matching exactly one extra label, so `*.e.com` hits `a.e.com` but not `e.com`/`x.y.e.com`),
   and the target is a named `upstream` (reusing the L7 weighted-RR/health-check pool via `acquire`) or a literal
   `host:port`; no match falls back to `proxy_pass`. The peeked prefix is replayed to the backend before relaying,
-  so the handshake is never disturbed, and `relay` splits each direction onto its own task with an idle
-  (`proxy_timeout`) bound. Verified by `tools/stream_ssl_preread_e2e.py` (6 checks driven by **real Python TLS
-  clients**: full handshake through the tunnel proves byte transparency, exact SNI `alpha.test` → the named
-  upstream, wildcard `foo.wild.test` → `*.wild.test` backend, `wild.test`/`a.b.wild.test` correctly *not* matched
-  and `other.test` unmatched all fall back to `proxy_pass`, plus a no-preread plain TCP echo) + pure unit tests in
-  `stream.rs` (ClientHello SNI parse, truncation/garbage → `None`, exact+wildcard matcher, first-match-wins).
+  so the handshake is never disturbed, and `relay` runs both directions concurrently inside the single connection
+  task with an idle (`proxy_timeout`) bound — draining or aborting a connection cannot leave an orphan pump
+  holding half a socket. L4 uses the same process-wide `worker_connections` semaphore and connection metrics as
+  HTTP: a tunnel that cannot get a permit is dropped immediately (an HTTP peer gets a fast 503 instead), and a
+  tunnel to a named upstream holds its `UpstreamGuard` (hence `max_conns` and passive-health accounting) for the
+  whole tunnel rather than only `connect`. On shutdown the listening socket is closed first (new connects are
+  refused), in-flight tunnels drain within `shutdown_grace`, then leftovers are force-aborted; completed
+  connection tasks are reaped continuously instead of accumulating in the JoinSet.
+  Verified by `tools/stream_lifecycle_e2e.py` (24 checks driven by **real TCP traffic**: with
+  `worker_connections 1` the second L4 tunnel is dropped while HTTP receives 503, and both recover once the
+  first tunnel closes; an upstream `max_conns=1` rejects the second tunnel before any backend connection and
+  releases when the first closes; Prometheus `accepted`/`active` include L4 and fall back after close; a
+  Ctrl+Break graceful stop refuses new connections, keeps the in-flight tunnel echoing through a 3s
+  `shutdown_grace`, force-closes it on schedule and exits 0) plus `tools/stream_ssl_preread_e2e.py` (6 checks
+  driven by real Python TLS clients: full handshake through the tunnel proves byte transparency, exact SNI
+  `alpha.test` → the named upstream, wildcard `foo.wild.test` → `*.wild.test` backend,
+  `wild.test`/`a.b.wild.test` correctly *not* matched and `other.test` unmatched all fall back to `proxy_pass`,
+  plus a no-preread plain TCP echo) + pure unit tests in `stream.rs` (ClientHello SNI parse, truncation/garbage →
+  `None`, exact+wildcard matcher, first-match-wins).
 - Upstream metrics: proxied requests record the backend actually contacted — `ProxyEngine::forward`
   writes the chosen peer into `$upstream_addr`, the response code into `$upstream_status` (transport
   failures log `0`, matching nginx) and the connect+send+first-response-header round-trip into
   `$upstream_header_time`. These surface to Lua through `ngx.var` (above) so `log_by_lua` can harvest
-  per-request upstream timing/status. Verified by `tools/upstream_e2e.py` (10 checks: `$upstream_addr`
+  per-request upstream timing/status, and to the combined access log line (including the Upgrade
+  tunnel path). Process-wide, each upstream node also exposes connection count, active health and
+  lifetime success/failure counters through `/metrics` (see “Runtime metrics endpoint”); the
+  success/failure counters are updated with a lock-free atomic write, and a Content-Length response
+  settles success as soon as its last body frame arrives (hyper need not poll the body to `None`).
+  Verified by `tools/upstream_e2e.py` (10 checks: `$upstream_addr`
   = the live backend, a backend-emitted 503 is both passed through and logged as `$upstream_status=503`,
   and a 0.6s backend yields `$upstream_header_time ≥ 0.55` — real round-trip, not a placeholder) +
-  unit test `forward_records_upstream_metrics_on_failure`.
+  `tools/observability_e2e.py` (live/dead node success/failure split, connection gauge back to 0,
+  WebSocket 101 success) + unit tests `forward_records_upstream_metrics_on_failure`.
 - Digests & CRC (pure-Rust, via `ring` + a self-contained MD5): `ngx.md5(s[, binary]) / md5_bin /
   sha1_bin(s[, hex]) / sha256_bin(s[, hex]) / hmac_sha1(secret, s) / crc32_short / crc32_long` — verified byte-for-byte
   against RFC 1321 / RFC 2202 / FIPS 180-4 / the CRC-32 `0xCBF43926` vector
@@ -394,13 +473,22 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   error→`nil,err`, integer, bulk incl. nil→`false`, nested multi-bulk), `pipeline()`/`commit()` batching,
   and pool reuse via `set_keepalive`. Verified by `tools/resty_redis_e2e.py` (19 checks) against a real
   RESP stub server exercising SET/GET/INCR/DEL/EXISTS/MGET/PING, nil and error replies, and pipelines.
+  `resty.cookie` (`new(cookie_str) / get / get_all / set(opts)`, module called as `_M.new(self, str)`)
+  parses Cookie headers and emits `Set-Cookie` with `path/domain/expires/max_age/secure/httponly/
+  samesite/version/comment`; `value=false` emits a delete cookie, and multiple cookies append as
+  repeated response headers. `resty.limit.req` (leaky bucket `new(dict, rate, burst) / incoming(key,
+  commit) / uncommit`), `resty.limit.count` (fixed 1 s window), and `resty.limit.conn` (in-flight
+  connection accounting) reuse the shared-dict primitives and return the OpenResty `delay / nil,
+  "rejected" / remaining` conventions. Verified by `tools/api_compat_e2e.py` (real traffic incl.
+  concurrent rejection of the second `limit_conn` request and multi-line Set-Cookie).
 - Time: `ngx.today() / cookie_time(ts) / http_time(ts) / parse_http_time(str) / update_time()`
   (IMF + Netscape-cookie formats, `parse_http_time` returns `nil` on garbage)
 - Phase & request introspection: `ngx.get_phase()` (returns the running phase, e.g. `content_by_lua`)
   and `ngx.is_subrequest` (true inside an `ngx.location.capture` subrequest)
-- Workers & config: `ngx.worker.pid() / id() / count()` and `ngx.config.subsystem / prefix() /
+- Workers & config: `ngx.worker.pid() / id() / count() / pids() / exiting()` and `ngx.config.subsystem / prefix() /
   no_debug` — ONRouter is a single-process reactor, so `id()` is always `0` and `count()` is `1`
-  (`pid()` is the real OS pid)
+  (`pid()` is the real OS pid; `pids()` returns that same single pid; `exiting()` flips true when
+  SIGTERM/SIGINT — or Ctrl+C/Ctrl+Break on Windows — starts a graceful stop)
 - All of the above are exercised end-to-end against real traffic by `tools/ngx_api_e2e.py` (36 checks).
 
 ## E2E tests (aligned with the OpenResty official suite)
@@ -418,6 +506,29 @@ them as standalone runnable assertion scripts.
   round-trip, background timer heartbeat, 5 MB upload with matching sha256, 413, failover, timeout,
   502 on a dead backend, 30-request concurrency burst, malformed request → 400 with the gateway
   staying alive).
+- `tools/api_compat_e2e.py`: 57/57 passing, one process plus real HTTP/TCP backends covering the
+  newer API surface end-to-end — request metadata (`start_time/http_version/is_internal`), extra
+  `ngx.var`s, `send_headers`/`headers_sent`/`eof`, body builders reaching `proxy_pass` with an exact
+  `Content-Length`, `discard_body`, capture `method/body/args` + internal-only locations,
+  `capture_multi` concurrency (4×0.2 s in <0.45 s), `ngx.semaphore` wake/timeout, dict
+  `get_keys`/`expire`, `resty.cookie` multi-cookie output, `resty.limit.count/req/conn` incl. a
+  concurrent rejection, socket `sslhandshake`/`getreusedtimes`, and `ngx.worker.pid/pids`.
+- `tools/cache_advanced_e2e.py`: 32/32 passing — `proxy_cache_lock` coalescing (20 concurrent
+  same-key requests → 1 origin fetch, 1 `MISS` + 19 `HIT`), `use_stale` for HTTP 502, connect
+  failure and `updating` (STALE returned in <0.45 s while the 0.6 s refresh is in flight),
+  `bypass`/`no_cache` store-vs-skip semantics, keys_zone-driven LRU eviction, and HEAD
+  serving from (but never populating) the shared GET cache entry; the basic suite
+  `tools/proxy_cache_e2e.py` remains 13/13.
+- `tools/observability_e2e.py`: 26/26 passing, one process and real traffic for the #40 telemetry:
+  a live + dead node pair (`success`/`failure` per node, connection gauge back to 0, healthy gauge),
+  a MISS→HIT→BYPASS→EXPIRED cache sequence matched against `X-Cache-Status` **and** the per-status
+  Prometheus counters, `limit_req` 200→429 with `Retry-After`, `limit_conn` 503 under an in-flight
+  `ngx.sleep` request and recovery afterwards, a raw TLS-garbage probe bumping the handshake-failure
+  counter, a WebSocket 101 upgrade counted against its upstream, and access-log line assertions for
+  `$request_time` + the upstream triple (proxied, no-upstream `- - -`, and Upgrade `101`).
+- The whole suite (unit tests + 63 Python E2E scripts: every `tools/*_e2e.py` plus the root
+  scenario/compat/security/static/upstream suites) is re-run after these changes:
+  `cargo test --workspace` 251/251 and every E2E script passes with real traffic.
 - The official suite is vendored under `vendor/lua-nginx-module/t/` (gitignored) as a semantics
   reference. Running a full `.t` directly via Test::Nginx requires a real OpenResty binary as
   `TEST_NGINX_BINARY` plus `*_by_lua_block` syntax and Unix signals, which do not run on this Windows
@@ -428,9 +539,53 @@ them as standalone runnable assertion scripts.
 - Compatibility regression: `compat_test.py` 17/17, security `sec_test.py` 30 checks, plus the
   static / scenario / upstream suites in this directory.
 
+## Benchmarks and deployment docs
+
+- `bench_ab.py` runs ONRouter vs OpenResty on the same endpoints (Windows and Linux);
+  `tools/linux_ab.sh` renders an OpenResty config into a temporary prefix and runs the sweep.
+  Procedure, caveats, and the pending Linux baseline are in `docs/LINUX_AB.md`.
+- `docs/OPENRESTY_GAP_ANALYSIS.md` is the current capability/gap matrix with test evidence.
+- `docs/USR2_HOT_UPGRADE.md` explains why nginx-style USR2 needs a process-model change,
+  gives two designs (SO_REUSEPORT handover / master+worker FD inheritance), and a Linux test plan.
+
 ## Design tradeoffs & roadmap
 
 Already done (previously listed as gaps, now implemented):
+
+- **`*_by_lua_block` syntax**: the config lexer rewrites `<phase>_by_lua_block { <bare Lua> }` into the
+  equivalent quoted directive before parsing, understanding nested `{}`/tables, single/double-quoted
+  strings, Lua comments, and `[[long brackets]]`; line numbers are preserved so diagnostics still point
+  at the original directive. All phases support it (`content_by_lua_block`, `init_worker_by_lua_block`,
+  `ssl_certificate_by_lua_block`, …).
+- **Unknown-directive warnings**: unrecognized top-level directives are surfaced at startup/reload in
+  both the console and `error_log` instead of being silently dropped; `worker_processes` and
+  `log_format` are explicitly reported as “ignored” with the reason (single-process model / built-in
+  combined format).
+- **`ssl_certificate_by_lua*` + `ngx.ssl`**: handshake-time per-SNI certificate selection with a
+  cert/key-hash dynamic config cache; verified by `tools/ssl_cert_lua_e2e.py` (21 checks: two vhosts,
+  legacy `set_cert` aliases, TLS1.2, ALPN h2, unknown/no SNI fallback, script error → aborted
+  handshake, `clear_certs`, `_file`, and warning logs).
+- **`init_worker_by_lua*` + `lua_package_path`**: run once per VM after its scheduler is live (timers,
+  `ngx.sleep`, cosockets work), with `$prefix` and `;;` semantics; verified by
+  `tools/init_worker_package_e2e.py` (21 checks incl. per-VM count, ordering vs `init_by_lua`, module
+  `require` from disk, no re-run on later requests, and startup failure on script error).
+- **`ngx.flush` + `ngx.req.socket`**: streaming responses (early first byte, h1 chunked/h2 DATA,
+  64 KiB auto-flush) and sequential buffered body reads; verified by
+  `tools/lua_flush_socket_e2e.py` (23 checks).
+- **`proxy_cache` advanced semantics**: `proxy_cache_lock` coalescing of concurrent same-key misses,
+  `use_stale` (`error`/`timeout`/`updating`/`http_xxx`) replay of expired entries, `bypass`/`no_cache`,
+  and keys_zone-sized zones with LRU eviction; verified by `tools/cache_advanced_e2e.py` (32 checks:
+  20-way concurrency → one origin fetch, stale during refresh, upstream death, eviction order, and
+  HEAD non-poisoning).
+- **TLS session reuse across ports**: one process-wide `ssl_session_cache` store plus a stateless
+  ticketer shared by every listener, with `builtin`/`shared` modes and `ssl_session_tickets on|off`;
+  verified by `tools/tls_session_e2e.py` with `openssl -sess_out/-sess_in` and `session_reused`.
+- **Two-hop Lua scheduling fast path**: the request task runs the first Lua segment inline when the VM
+  is free and only hands off to the VM scheduler on a yield; no-yield scripts never cross task
+  boundaries. `onrouter_lua_phase_{inline,adopted,scheduled}_total` exposes which path each phase took.
+  On this Windows host the A/B sweep is neutral within run-to-run noise (Lua `content_by_lua` c=1
+  6518–6428/s after vs 6678/s before; c=4 15366–14882/s vs 15043/s); static/proxy rows moved with the
+  client ceiling (9844 → 8865–9193 req/s), so the host, not the change, dominates.
 
 - **Lua VM pool**: one VM per CPU core, so multiple requests execute scripts truly in parallel across
   VMs (no single process-wide lock).
@@ -476,8 +631,8 @@ Already done (previously listed as gaps, now implemented):
   (`compress.rs::GzipBody`, `server.rs::finalize`, verified by `tools/gzip_e2e.sh`.)
 - **Upstream keep-alive pool tuning**: per-upstream `keepalive N` and `keepalive_timeout <t>` drive
   hyper's client connection pool (`pool_max_idle_per_host` / `pool_idle_timeout`); the proxy caches
-  one pooled client per `(connect_timeout, max_idle, idle_timeout)` triple so differently-configured
-  upstreams get separate pools. (`upstream.rs::KeepaliveOpts`, `proxy.rs::client`, verified by
+  one pooled client per `(connect_timeout, send_timeout, max_idle, idle_timeout)` tuple so
+  differently-configured upstreams get separate pools. (`upstream.rs::KeepaliveOpts`, `proxy.rs::client`, verified by
   `tools/keepalive_e2e.sh`: `keepalive` reuses one backend connection, a short `keepalive_timeout`
   reaps the idle one between spaced requests.)
 - **Streaming request-body forwarding**: `proxy_request_buffering off` (per server/location, default
@@ -488,6 +643,18 @@ Already done (previously listed as gaps, now implemented):
   switching. (`proxy.rs::ProxyBody`, `server.rs::handle_request`, verified by
   `tools/streaming_body_e2e.py`: a body dribbled to the backend over ~1.2s shows a ~1.1s read span
   through `off` but a single burst read through `on`, with matching sha256 both ways.)
+- **`proxy_send_timeout` idle-write watchdog**: covers every header/body/flush write on the upstream
+  stream (plain or TLS). A write that stays `Pending` for the configured duration aborts the hop with
+  `Timed out`; `0` disables it, matching nginx (the timeout is per write operation, not a total
+  transfer budget). Writes are capped at 64 KiB per syscall so kernel backpressure stays observable on
+  every platform — Windows loopback completion I/O otherwise accepts a single 64 MB send immediately,
+  hiding the stall. `proxy_read_timeout` starts only after the request body has been handed to the
+  connection (frames are polled as hyper drains them), so streamed uploads are bounded by the write
+  watchdog rather than the response timeout; `0` disables the read timeout too. Verified by
+  `tools/proxy_semantics_e2e.py` (a 300 ms send timeout aborts a 64 MB upload to a non-reading backend
+  in <1.5 s; with `send 0` the 300 ms abort does not happen and the 2 s read timeout bounds the
+  exchange; and a continuously-reading backend receives all 64 MB untouched) plus `proxy_tls` unit
+  tests for the watchdog on/off paths.
 - **Within-VM Lua coroutine concurrency**: each VM is run by a scheduler task that holds the `Lua`
   lock only for a synchronous resume segment and releases it between segments, so many requests share
   one VM and interleave at `ngx.sleep` (a Lua wrapper around a `tokio::time::sleep` that yields the
@@ -502,14 +669,41 @@ Already done (previously listed as gaps, now implemented):
 - **Runtime metrics endpoint**: a process-global `Metrics` singleton (std `OnceLock`) is fed by the
   connection layer — accepted-count on each TCP accept, an active-connections gauge via an RAII guard
   scoped to each connection task, requests-handled per HTTP request, and responses bucketed by status
-  class (2xx/3xx/4xx/5xx) in `finalize`. `content_by_rust metrics` reads the singleton and renders it
-  in the Prometheus text exposition format (`# HELP`/`# TYPE` + `onrouter_uptime_seconds`,
-  `onrouter_connections_{accepted,active,capacity}`, `onrouter_http_requests_total`,
-  `onrouter_http_responses_total{class="…"}`). It uses the singleton because the native handler signature
-  has no access to `AppState`. (`metrics.rs`, `server.rs`, `engine.rs`, verified by
-  `tools/metrics_e2e.py`: with traffic interleaved between two scrapes, `requests_total`/`2xx`/`4xx`
-  deltas track the real request counts, the active gauge stays ≥1 while a connection is in flight, and
-  `capacity` equals the `worker_connections` default.)
+  class (2xx/3xx/4xx/5xx) in `finalize`. The same singleton is fed by the rest of the request path:
+  every cached-location response records its `X-Cache-Status` (`hit`/`miss`/`expired`/`bypass`/
+  `stale`), TLS accept/handshake failures (including a QUIC handshake failure) increment
+  `onrouter_tls_handshake_failures_total`, `limit_req`/`limit_conn` rejections increment
+  `onrouter_limit_rejections_total{type="req"|"conn"}`, and an access-log queue overflow increments
+  `onrouter_access_log_dropped_total` instead of blocking the request task. The upstream pool is
+  registered once at startup (`register_upstreams` keeps the live `Arc`s, so reloads stay current)
+  and renders per-node `onrouter_upstream_server_connections{upstream,server}`,
+  `onrouter_upstream_server_healthy` and
+  `onrouter_upstream_requests_total{upstream,server,result="success|failure"}`; the success/failure
+  counters live on the nodes themselves, not under the SWRR scheduling lock. `content_by_rust metrics`
+  reads the singleton and renders it in the Prometheus text exposition format (`# HELP`/`# TYPE` +
+  `onrouter_uptime_seconds`, `onrouter_connections_{accepted,active,capacity}`,
+  `onrouter_http_requests_total`, `onrouter_http_responses_total{class="…"}`, the cache/TLS/limit/log
+  families above, the upstream-server families, and the Lua scheduling-path counters
+  `onrouter_lua_phase_{inline,adopted,scheduled}_total`), escaping label values. It uses the singleton
+  because the native handler signature has no access to `AppState`. (`metrics.rs`, `server.rs`,
+  `engine.rs`, verified by `tools/metrics_e2e.py` 38/38 and `tools/observability_e2e.py` 26/26 with
+  real traffic: with traffic interleaved between two scrapes, `requests_total`/`2xx`/`4xx` deltas track
+  the real request counts, the active gauge stays ≥1 while a connection is in flight, `capacity` equals
+  the `worker_connections` default, a no-yield Lua endpoint increments `inline` while an `ngx.sleep`
+  endpoint increments `adopted`, three proxied requests through a two-node upstream count 3 successes
+  on the live node and 1 failure on the dead one, the MISS→HIT→BYPASS→EXPIRED cache sequence maps 1:1
+  onto the status counters, a raw TLS-garbage probe increments the handshake-failure counter, and one
+  each of limit_req/limit_conn rejections and a WebSocket upgrade (101, recorded against its upstream)
+  show up with the exact labels.)
+- **Access-log upstream fields**: besides the combined fields, every line carries
+  `$request_time` (3 decimals) and `$upstream_addr` / `$upstream_status` /
+  `$upstream_header_time`. The triple is filled after the whole proxy phase (including
+  `proxy_next_upstream` retries), so it names the backend that actually produced the response;
+  requests that never touch an upstream (static/return/Lua) log `- - -`; transport failures log `0`
+  like nginx; Upgrade tunnels are recorded too (`101` + peer). Streaming responses handed off to a
+  background task log the request-level fields and `- - -`, since their `RequestCtx` moved.
+  Emitting never blocks: a bounded channel to the writer thread drops lines under overload and the
+  drop count is exported as `onrouter_access_log_dropped_total`.
 - **Access control (`allow`/`deny` + `auth_basic`)**: an ACCESS-phase gate runs before
   `access_by_*` (matching nginx's built-in module order). `allow`/`deny` accept IPv4/IPv6/CIDR/`all`,
   evaluated first-match-wins with default-allow, and a location with no own rules inherits the
@@ -535,7 +729,9 @@ Already done (previously listed as gaps, now implemented):
   reachable only via capture, not from the client. (`server.rs::run_capture`, `lua_engine.rs`,
   verified by `tools/subrequest_e2e.py`: Lua/return/query/404 captures, a two-level nested capture, a
   self-referential capture hitting the depth guard, and an external request to an `internal` location
-  still returning 404.) `share_all_vars`/`ctx` option passing is not yet implemented.
+  still returning 404.) `opts.method` / `opts.body` / `opts.args` are honored, and
+  `ngx.location.capture_multi` runs a list of captures concurrently as light threads (verified in
+  `tools/api_compat_e2e.py`). `share_all_vars`/`ctx` option passing is not yet implemented.
 - **`resolver` + async DNS**: a pure-Rust, non-blocking UDP DNS stub resolver (`dns.rs`) — it builds
   RFC1035 queries for A/AAAA, follows compression pointers in the answer, and caches results for the
   `valid=` TTL (default 10s), with negative caching for NXDOMAIN. Without it, `proxy_pass` relies on
@@ -551,17 +747,30 @@ Already done (previously listed as gaps, now implemented):
 - **`proxy_cache` response caching**: an in-memory, named-zone cache (`proxy_cache.rs`) for the
   `proxy_pass` path. Directives: `proxy_cache <zone>|off`, `proxy_cache_key <template>` (default
   `$scheme$proxy_host$request_uri`), `proxy_cache_valid <codes…|any> <time>` (multi-line),
-  `proxy_cache_methods` (default `GET HEAD`), `proxy_cache_min_uses` (default 1). Freshness precedence
-  matches nginx: the upstream's own `Cache-Control`/`Expires` wins (and an explicit `no-store`/`no-cache`/
-  `private`/`max-age=0` forbids caching outright), falling back to `proxy_cache_valid` only when the
-  upstream gives no hint. Responses carrying `Set-Cookie` are never stored (shared-cache safety). Every
-  proxied response through a cached location gets an `X-Cache-Status: HIT|MISS|BYPASS` header. A hit
-  replays the buffered status/headers/body without contacting the backend.
-  (Verified by `tools/proxy_cache_e2e.py`: MISS→backend then HIT→same bytes with the backend counter
-  unchanged, distinct `?query` → distinct keys, `Set-Cookie` and `no-store` → `BYPASS`, and a
-  non-caching control location with no `X-Cache-Status`.) Not yet implemented: `proxy_cache_use_stale`,
-  revalidation (`If-None-Match` to origin), `proxy_cache_purge`, on-disk `keys_zone`, and `Vary`-aware
-  keying.
+  `proxy_cache_methods` (default `GET HEAD`), `proxy_cache_min_uses` (default 1),
+  `proxy_cache_lock on` + `proxy_cache_lock_timeout`, `proxy_cache_use_stale
+  error|timeout|updating|http_xxx`, `proxy_cache_bypass`, `proxy_no_cache`; top-level
+  `proxy_cache_path … keys_zone=<name>:<size>` sets per-zone capacity (128 B/entry; the path itself
+  is never written — the cache is memory-only). Freshness precedence matches nginx: the upstream's
+  own `Cache-Control`/`Expires` wins (and an explicit `no-store`/`no-cache`/`private`/`max-age=0`
+  forbids caching outright), falling back to `proxy_cache_valid` only when the upstream gives no
+  hint. Responses carrying `Set-Cookie` are never stored (shared-cache safety).
+  `proxy_cache_lock` coalesces concurrent same-key misses into one origin fetch (20 concurrent
+  requests → exactly 1 backend hit, 1 `MISS` + 19 `HIT`). Expired entries stay in memory for an
+  hour so `proxy_cache_use_stale` can replay them (`STALE`) on origin 5xx, connect failure, or while
+  another request is already refreshing (`updating`, served immediately without queueing on the
+  lock). `bypass` skips reads but still stores the fresh response; `no_cache` skips both. HEAD
+  requests can be served from a GET-populated entry (the HTTP layer suppresses the body) but never
+  populate the cache themselves, so an empty HEAD response cannot poison the shared GET key. Zones
+  evict least-recently-used entries at capacity, expired entries are cleaned as writes accumulate, and a
+  config reload applies new `keys_zone` sizes to live zones. Every response through a cached
+  location carries `X-Cache-Status: HIT|MISS|EXPIRED|BYPASS|STALE`, and the same status feeds
+  `onrouter_cache_requests_total{status=…}` on `/metrics`.
+  (Verified by `tools/proxy_cache_e2e.py` 13/13 and `tools/cache_advanced_e2e.py` 32/32: concurrent
+  coalescing, 502/error/updating stale replay, bypass/no_cache, keys_zone-driven LRU, and HEAD
+  non-poisoning; `tools/observability_e2e.py` asserts the status→counter mapping 1:1.) Not yet
+  implemented: revalidation (`If-None-Match` to origin), `proxy_cache_purge`, `proxy_cache_lock_age`,
+  on-disk persistence, `Vary`-aware keying, and the `$upstream_cache_status` variable.
 - **HTTP/2 serving**: ONRouter serves HTTP/2 over both transports. On TLS endpoints the `h2` protocol is
   negotiated through ALPN (`listen … ssl http2`). On cleartext endpoints `http2 on;` turns on
   prior-knowledge h2c: the connection layer peeks the first 24 bytes with `MSG_PEEK` (`TcpStream::peek`,
@@ -589,6 +798,17 @@ Already done (previously listed as gaps, now implemented):
   conf is edited in place; a fresh connection opened every 40ms records zero failures across the whole
   reload window (no accept gap); an intentionally broken (unbalanced-brace) config leaves the old routing
   serving and is not adopted; the child process stays alive with an unchanged pid file throughout.)
+- **Lua script files reload by periodic self-check**: `*_by_lua_file` sources live in an in-memory
+  cache and the request path only does a map lookup — it never `stat()`s. A background task `stat`s
+  the cached scripts once per second (`lua_engine::LUA_FILE_CHECK_INTERVAL`; always on, independent
+  of `reload off`) and re-reads only the ones whose mtime moved, so an edit lands within ~1s without
+  a restart. The new source is then compiled once per VM into that VM's chunk cache, which mirrors
+  OpenResty's `lua_code_cache on` (mlua's `Function` is `!Send`, so the cache holds `RegistryKey`
+  handles instead). A half-written file keeps serving the previous version instead of returning 500,
+  and each phase's bucket is capped so repeated edits cannot grow the cache without bound.
+  (Verified by `tools/lua_watch_e2e.py`: with no `reload` directive in the config at all, six in-place
+  edits each converge in 0.5–1.0s, every sampled request stays `200`, and the error log records one
+  self-check reload per change.)
 - **HTTP/3 serving (`listen … quic`)**: `listen <addr> quic` implies TLS and additionally binds a
   **QUIC/UDP** endpoint on that address (separate from the TCP listener, so the same port serves
   h1/h2 over TCP and h3 over UDP). The QUIC server config is pinned to TLS 1.3 with ALPN `h3` and reuses
@@ -625,6 +845,24 @@ Already done (previously listed as gaps, now implemented):
   — a throwaway runtime-generated RSA cert (never committed) proves the `--features native-tls` binary
   handshakes **TLS 1.0 and 1.1** and returns the configured body, while the same conf on the **default**
   rustls binary refuses 1.0/1.1 and still serves 1.2/1.3.)
+- **HTTPS business matrix (multi-port / multi-domain / multi-cert)**: `tools/https_matrix_e2e.py` spins
+  one process with five listeners (18443 multi-vhost TLS1.2+1.3, 18444 TLS1.2-only, 18445 TLS1.3-only,
+  18446 cleartext, 18447 TLS+h2) and five self-signed certs generated on demand into `certs_https/`
+  (git-ignored). 60 checks cover: SNI exact > wildcard > default (no-SNI, unknown SNI, wildcard-vs-apex,
+  case-insensitivity, exact-beats-wildcard); hostname verification with each PEM used as its own CA
+  (wrong name rejected); Host-vs-SNI cross-cases (certificate follows SNI, routing follows Host); port
+  isolation; TLS1.2/1.3 trimming and cipher families (Python `ssl` plus independent `openssl s_client`
+  probes); ALPN `h2` vs `http/1.1` with a real Node h2 request; same-port session resumption (TLS1.2
+  session IDs, TLS1.3 stateful tickets, independently proven with `openssl -sess_out/-sess_in`); 480
+  concurrent mixed requests with zero errors; and new-connection/handshake p50/p90/p99 at 8 threads.
+  Observed gaps (reported as `GAP`, not failures): the session store/ticketer are now **process-wide**
+  (a session established on one port resumes on another, verified by `tools/tls_session_e2e.py`), but
+  they are still in-memory and ticket keys are ephemeral, so sessions do not survive a process restart;
+  a client whose ALPN list has no overlap with a
+  non-h2 listener gets rustls's fatal `no_application_protocol` alert, whereas nginx/OpenSSL continues
+  with HTTP/1.1 and no ALPN. `ssl_certificate_by_lua*` is implemented
+  (`tools/ssl_cert_lua_e2e.py`); still unimplemented: `ssl_session_store_by_lua`, OCSP stapling and
+  server-side client-certificate verification (mTLS termination).
 
 Remaining tradeoffs / roadmap:
 

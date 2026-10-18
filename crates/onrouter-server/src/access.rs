@@ -13,7 +13,7 @@
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -21,9 +21,10 @@ use std::time::SystemTime;
 
 /// 进程级 htpasswd 缓存：按路径缓存解析结果，文件 mtime 变化时重载（对标 nginx open_file_cache
 /// 的被动失效）。读不到文件或解析失败返回 `None`，调用方按“认证失败”处理。
-static HTPASSWD_CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, Htpasswd)>>> = OnceLock::new();
+/// 存 Arc：缓存命中只克隆指针，不再整份复制用户表。
+static HTPASSWD_CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, Arc<Htpasswd>)>>> = OnceLock::new();
 
-pub fn load_htpasswd(path: &Path) -> Option<Htpasswd> {
+pub fn load_htpasswd(path: &Path) -> Option<Arc<Htpasswd>> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
     let cache = HTPASSWD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -31,12 +32,12 @@ pub fn load_htpasswd(path: &Path) -> Option<Htpasswd> {
     let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((t, users)) = map.get(path) {
         if *t == mtime {
-            return Some(users.clone());
+            return Some(Arc::clone(users));
         }
     }
     let text = std::fs::read_to_string(path).ok()?;
-    let users = Htpasswd::parse(&text);
-    map.insert(path.to_path_buf(), (mtime, users.clone()));
+    let users = Arc::new(Htpasswd::parse(&text));
+    map.insert(path.to_path_buf(), (mtime, Arc::clone(&users)));
     Some(users)
 }
 

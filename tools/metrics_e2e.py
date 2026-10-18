@@ -79,7 +79,8 @@ def main():
         m1 = parse_prom(text1)
         for fam in ["onrouter_uptime_seconds", "onrouter_connections_accepted",
                     "onrouter_connections_active", "onrouter_connections_capacity",
-                    "onrouter_http_requests_total"]:
+                    "onrouter_http_requests_total", "onrouter_lua_phase_inline_total",
+                    "onrouter_lua_phase_adopted_total", "onrouter_lua_phase_scheduled_total"]:
             check(f"渲染含 {fam}", fam in m1, f"文本={text1!r}")
         for cls in ["2xx", "3xx", "4xx", "5xx"]:
             check(f"渲染含 onrouter_http_responses_total{{class=\"{cls}\"}}",
@@ -97,9 +98,31 @@ def main():
         for _ in range(N_404):
             get("/notfound")
 
+        # === Lua 调度快速路径：无让出 + 有让出各打若干真实请求 ===
+        N_INLINE, N_SLEEP = 10, 5
+        for _ in range(N_INLINE):
+            st, body = get("/lua-inline")
+            check("/lua-inline 返回 200", st == 200 and "inline-ok" in body, f"st={st} body={body!r}")
+        for _ in range(N_SLEEP):
+            st, body = get("/lua-sleep")
+            check("/lua-sleep 返回 200", st == 200 and "slept" in body, f"st={st} body={body!r}")
+
         # 快照 2
         st, text2 = get("/metrics")
         m2 = parse_prom(text2)
+        d_inline = (m2["onrouter_lua_phase_inline_total"]
+                    - m1["onrouter_lua_phase_inline_total"])
+        d_adopted = (m2["onrouter_lua_phase_adopted_total"]
+                     - m1["onrouter_lua_phase_adopted_total"])
+        d_sched = (m2["onrouter_lua_phase_scheduled_total"]
+                   - m1["onrouter_lua_phase_scheduled_total"])
+        check("无让出的 Lua 阶段走 inline 快速路径", d_inline >= N_INLINE,
+              f"delta={d_inline}（若并发抢占 VM 锁会退回调度器）")
+        check("让出的 Lua 阶段被 adopt 给调度器", d_adopted >= N_SLEEP,
+              f"delta={d_adopted}")
+        check("Lua 阶段计数覆盖全部请求",
+              d_inline + d_adopted + d_sched >= N_INLINE + N_SLEEP,
+              f"inline={d_inline} adopted={d_adopted} scheduled={d_sched}")
         d_req = m2["onrouter_http_requests_total"] - m1["onrouter_http_requests_total"]
         d_2xx = m2['onrouter_http_responses_total{class="2xx"}'] - m1['onrouter_http_responses_total{class="2xx"}']
         d_4xx = m2['onrouter_http_responses_total{class="4xx"}'] - m1['onrouter_http_responses_total{class="4xx"}']

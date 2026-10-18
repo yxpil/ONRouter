@@ -88,7 +88,7 @@ def main():
         st, h, b = req("GET", "/api/protected", {"x-token": "secret123"})
         check("鉴权 200", st == 200 and b"welcome" in b, f"{st} {b[:60]}")
         st, h, b = req("GET", "/api/slow")
-        check("ngx.sleep 异步", st == 200 and b"100ms" in b, f"{st} {b[:60]}")
+        check("ngx.sleep 异步", st == 200 and b"0.1s" in b, f"{st} {b[:60]}")
 
         # 3 反代 + LB 轮询
         bodies = set()
@@ -130,7 +130,7 @@ def main():
         check("ngx.re 正则捕获", st == 200 and "re-capture=tools" in txt, f"{st} {b[:100]}")
         check("escape_uri/unescape_uri", "a%20b%2Fc%3Fd" in txt and "你好" in txt, txt[:150])
         st, h, b = req("POST", "/api/tools", data=b"hello-onrouter-body")
-        check("请求体读取", st == 200 and "body_len=18" in b.decode("utf-8", "ignore"),
+        check("请求体读取", st == 200 and "body_len=19" in b.decode("utf-8", "ignore"),
               f"{st} {b.decode('utf-8', 'ignore')[:150]}")
 
         # 6 add_header

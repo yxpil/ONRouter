@@ -330,7 +330,10 @@ async fn run(
     let pool = UpstreamPool::parse_all(&config)?;
     let pool = Arc::new(pool);
     let handlers = Arc::new(HandlerRegistry::with_builtins());
-    let lua = Arc::new(LuaEngine::new(&config, &base_dir)?);
+    let lua = LuaEngine::new(&config, &base_dir)?;
+    // init_worker_by_lua*：调度器已随 VM 池启动，此处逐 VM 执行（对标每 worker 一次）
+    lua.run_init_workers().await?;
+    let lua = Arc::new(lua);
     let proxy = match dns::DnsResolver::from_config(&config) {
         Some(r) => {
             println!("[onrouter] 异步 DNS 解析器就绪：nameserver {:?}", r.nameservers());
@@ -338,10 +341,11 @@ async fn run(
         }
         None => Arc::new(ProxyEngine::new(Arc::clone(&pool))),
     };
-    let proxy_cache = proxy_cache::ProxyCache::new();
+    let proxy_cache = proxy_cache::ProxyCache::with_capacities(router.cache_zones.clone());
     let access_log = access_log::AccessLog::new(&config, &base_dir);
 
     let listener_specs = router.listeners.clone();
+    let cert_files = crate::tls::cert_files(&router.listeners);
     let stream_specs: Vec<Arc<router::StreamServer>> =
         router.stream.clone().into_iter().map(Arc::new).collect();
     if listener_specs.is_empty() && stream_specs.is_empty() {
@@ -358,6 +362,8 @@ async fn run(
         settings: settings.clone(),
         limits: Arc::clone(&limits),
         permits: server::permits_for(&settings),
+        tls_registry: crate::tls::TlsRegistry::new(),
+        cert_files: std::sync::RwLock::new(cert_files),
     });
 
     // 子请求（ngx.location.capture）晚绑定：LuaEngine 早于 AppState 构造，这里回填其运行句柄
@@ -365,6 +371,8 @@ async fn run(
 
     // 运行时指标单例：记录 worker_connections 容量与进程启动时刻，供 /metrics 渲染
     crate::metrics::global(settings.worker_connections);
+    // upstream 每节点连接数/健康/成败计数：注册的是运行中的 Arc，渲染时直接读原子量
+    crate::metrics::register_upstreams(&pool);
 
     // 先全部绑定再开始服务：端口冲突要在启动阶段就失败，而不是半启动状态
     let mut bound = Vec::with_capacity(listener_specs.len());
@@ -383,6 +391,7 @@ async fn run(
         let l = router::Listener {
             addr: s.listen,
             tls: None,
+            ssl_cert_scripts: Vec::new(),
             http2: false,
             quic: false,
             backlog: None,
@@ -456,9 +465,15 @@ async fn run(
         }
         tasks.spawn(server::serve(state, l, tcp, rx.clone()));
     }
-    // 四层 stream 隧道：与 HTTP 共用停机信号，接受同一个 shutdown watch。
+    // 四层 stream 隧道：与 HTTP 共用停机信号与 worker_connections 额度。
     for (s, tcp) in bound_stream {
-        tasks.spawn(stream::serve_stream(Arc::clone(&pool), s, tcp, rx.clone()));
+        tasks.spawn(stream::serve_stream(
+            Arc::clone(&state),
+            Arc::clone(&pool),
+            s,
+            tcp,
+            rx.clone(),
+        ));
     }
 
     println!(
@@ -512,8 +527,16 @@ fn spawn_signal_handlers(
             let mut user1 = signal(SignalKind::user_defined1()).expect("SIGUSR1 注册失败");
             loop {
                 tokio::select! {
-                    _ = terminate.recv() => { log_info!("收到 SIGTERM，开始优雅停机"); break; }
-                    _ = interrupt.recv() => { log_info!("收到 SIGINT，开始优雅停机"); break; }
+                    _ = terminate.recv() => {
+                        lua_engine::mark_worker_exiting();
+                        log_info!("收到 SIGTERM，开始优雅停机");
+                        break;
+                    }
+                    _ = interrupt.recv() => {
+                        lua_engine::mark_worker_exiting();
+                        log_info!("收到 SIGINT，开始优雅停机");
+                        break;
+                    }
                     // nginx: SIGHUP = 重载配置（这里同时重开日志）；SIGUSR1 = 仅重开日志
                     _ = hangup.recv() => {
                         log::reopen();
@@ -535,11 +558,23 @@ fn spawn_signal_handlers(
     {
         let _ = reload; // Windows 无信号式重载；用 conf 的 `reload <interval>;` 轮询
         Some(tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            log_info!("收到 Ctrl+C，开始优雅停机");
+            // CTRL_BREAK_EVENT 是 Windows 上可从外部（服务管理器/taskkill 之外的
+            // GenerateConsoleCtrlEvent）投递的优雅停机事件，和 Ctrl+C 同语义处理。
+            use tokio::signal::windows::{ctrl_break, ctrl_c};
+            let mut interrupt = ctrl_c().expect("Ctrl+C 注册失败");
+            let mut brk = ctrl_break().expect("Ctrl+Break 注册失败");
+            let how = tokio::select! {
+                _ = interrupt.recv() => "Ctrl+C",
+                _ = brk.recv() => "Ctrl+Break",
+            };
+            lua_engine::mark_worker_exiting();
+            log_info!("收到 {how}，开始优雅停机");
             let _ = tx.send(true);
-            // 二次 Ctrl+C 立即退出
-            let _ = tokio::signal::ctrl_c().await;
+            // 二次中断立即退出
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = brk.recv() => {}
+            }
             log_warn!("再次收到中断信号，强制退出");
             std::process::exit(1);
         }))
@@ -547,8 +582,12 @@ fn spawn_signal_handlers(
 }
 
 /// 配置热重载后台任务：监听 SIGHUP 通知与（可选）`reload <interval>` 轮询；
-/// 检测到主配置文件 mtime 变化即重建路由表并原子替换（Router::rebuild_routing 复用
+/// 检测到主配置文件 mtime 变化即重建路由表并原子替换（Router::rebuild_routing_with_specs 复用
 /// 已绑定的监听集合，绝不 rebind socket → 无 accept 空窗）。构建失败则保留旧路由并记日志。
+/// 同时监视证书/私钥文件的大小与 mtime：证书原地续期（不动 conf）也会触发 TLS 接受器刷新。
+///
+/// 顺带承担 `*.lua` 脚本文件的定期自检：请求路径只查内存缓存、从不 stat，
+/// 文件是否变过由这里的节拍统一检查（未配 `reload` 时自检照样跑，间隔 1s）。
 fn spawn_reload_task(
     state: Arc<server::AppState>,
     conf_path: PathBuf,
@@ -563,11 +602,18 @@ fn spawn_reload_task(
         let poll = poll.unwrap_or_else(|| Duration::from_secs(3600));
         let mut tick = tokio::time::interval(poll);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut lua_tick = tokio::time::interval(lua_engine::LUA_FILE_CHECK_INTERVAL);
+        lua_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last = conf_mtime(&conf_path);
+        let mut last_certs = cert_stamp(&state.cert_files());
         loop {
             let from_signal = tokio::select! {
                 _ = notify.notified() => true,
                 _ = tick.tick() => false,
+                _ = lua_tick.tick() => {
+                    check_lua_files();
+                    continue;
+                }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow_and_update() {
                         break;
@@ -575,18 +621,46 @@ fn spawn_reload_task(
                     continue;
                 }
             };
-            // 轮询触发时以 mtime 变化为准；SIGHUP 触发时无条件尝试
-            if !from_signal && conf_mtime(&conf_path) == last {
+            // 轮询触发：配置或任一证书/私钥文件变了才重建；SIGHUP 触发时无条件尝试。
+            // 证书监视让自动续期（只替换证书文件、不写 conf）也能生效。
+            if !from_signal
+                && conf_mtime(&conf_path) == last
+                && cert_stamp(&state.cert_files()) == last_certs
+            {
                 continue;
             }
+            check_lua_files();
             do_reload(&state, &conf_path, &base_dir, &listeners);
             last = conf_mtime(&conf_path);
+            last_certs = cert_stamp(&state.cert_files());
         }
     })
 }
 
+/// 定期自检 Lua 脚本文件：mtime 变了的重读进缓存，下一个请求即编译新版本。
+fn check_lua_files() {
+    for p in lua_engine::recheck_cached_files() {
+        log_info!("定期自检：Lua 脚本有变更，缓存已更新（重读或失效） {}", p.display());
+    }
+}
+
 fn conf_mtime(path: &PathBuf) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// 证书/私钥文件指纹：(路径, 大小, mtime)。任一文件被替换或续期都会变化。
+fn cert_stamp(paths: &[PathBuf]) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>)> {
+    paths
+        .iter()
+        .map(|p| {
+            let meta = std::fs::metadata(p).ok();
+            (
+                p.clone(),
+                meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                meta.and_then(|m| m.modified().ok()),
+            )
+        })
+        .collect()
 }
 
 /// 真正执行一次重载：重新读盘 → 仅重建路由（保留监听）→ 成功则原子替换，失败保留旧配置。
@@ -598,15 +672,23 @@ fn do_reload(
 ) {
     match onrouter_config::Config::load(conf_path) {
         Err(e) => log_error!("热重载失败：配置解析出错，保持旧配置继续服务: {e}"),
-        Ok(cfg) => match router::Router::rebuild_routing(&cfg, base_dir, listeners) {
+        Ok(cfg) => match router::Router::rebuild_routing_with_specs(&cfg, base_dir, listeners) {
             Err(e) => log_error!("热重载失败：路由构建出错，保持旧配置继续服务: {e}"),
-            Ok(new_router) => {
+            Ok((new_router, fresh_listeners)) => {
                 let warnings = new_router.warnings.clone();
                 state.swap_router(new_router);
+                // 证书 / ssl_protocols / ssl_certificate_by_lua 脚本按新配置原地刷新；
+                // 监听 socket 不动，新连接下一次握手即用新证书
+                state.tls_registry.reload(
+                    &fresh_listeners,
+                    Arc::clone(&state.lua),
+                    server::MAX_CONCURRENT_STREAMS,
+                );
+                state.set_cert_files(crate::tls::cert_files(&fresh_listeners));
                 for w in warnings {
                     log_warn!("热重载告警: {w}");
                 }
-                log_info!("热重载完成：路由表已原子替换（监听未变动，无停机）");
+                log_info!("热重载完成：路由表与 TLS 配置已原子替换（监听未变动，无停机）");
             }
         },
     }

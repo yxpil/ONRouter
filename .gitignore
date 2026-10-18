@@ -8,6 +8,7 @@
 /certs_https/
 /certs_mtls/
 /certs_stream/
+/certs_tls_reload/
 
 # 运行日志
 /logs/
@@ -19,6 +20,9 @@
 _*.py
 _*.txt
 *.out
+__pycache__/
+/conf/.tmp_*/
+bench_*.json
 
 # 系统文件
 Thumbs.db
@@ -33,3 +37,6 @@ natb.exe
 /.dbg-*/
 /.probe/
 /.tmp-legacy/
+
+# Linux A/B 临时 OpenResty 前缀（tools/linux_ab.sh）
+/.bench_openresty/

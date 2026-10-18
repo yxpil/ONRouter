@@ -122,25 +122,21 @@ impl ReqZone {
         }
     }
 
-    /// 清理长期闲置 key（后台定时调用，防表膨胀）
+    /// 清理长期闲置 key（后台定时调用，防表膨胀）。
+    /// map 与 order 都一次 retain 完成：旧实现逐 key `position + remove`，大表时是 O(n²)。
     pub fn purge_idle(&self, idle_ms: i64) -> usize {
         let now = now_ms();
         let mut removed = 0usize;
         for s in &self.shards {
             let mut shard = s.lock().unwrap_or_else(|e| e.into_inner());
-            let stale: Vec<String> = shard
-                .map
-                .iter()
-                .filter(|(_, st)| now - st.updated_ms > idle_ms)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for k in &stale {
-                shard.map.remove(k);
-                if let Some(pos) = shard.order.iter().position(|x| x == k) {
-                    shard.order.remove(pos);
-                }
+            let shard = &mut *shard;
+            let (map, order) = (&mut shard.map, &mut shard.order);
+            let before = map.len();
+            map.retain(|_, st| now - st.updated_ms <= idle_ms);
+            removed += before - map.len();
+            if map.len() != before {
+                order.retain(|k| map.contains_key(k));
             }
-            removed += stale.len();
         }
         removed
     }
@@ -415,7 +411,9 @@ mod tests {
 
     #[test]
     fn rejects_after_burst_is_consumed() {
-        let z = ReqZone::new("t", 1000.0, 3.0, "$remote_addr");
+        // 速率取 1r/s：测试并行跑满 CPU 时几次调用的间隔也远小于 1s，
+        // 不会像 1000r/s 那样在几毫秒里补出新令牌而偶发误判。
+        let z = ReqZone::new("t", 1.0, 3.0, "$remote_addr");
         for _ in 0..4 {
             assert!(z.check("1.2.3.4", None).is_none());
         }

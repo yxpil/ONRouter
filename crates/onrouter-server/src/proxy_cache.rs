@@ -1,18 +1,25 @@
 //! `proxy_cache`：反向代理响应缓存（对标 nginx ngx_http_proxy_cache_module）。
 //!
-//! 纯内存实现（不做磁盘持久化，也不做 keys_zone 的共享内存段），语义对齐 nginx 的常用子集：
+//! 纯内存实现（不做磁盘持久化；`proxy_cache_path` 只取 `keys_zone` 容量用于 LRU，
+//! 不建共享内存段），语义对齐 nginx 的常用子集：
 //!   * `proxy_cache <zone>|off;`     —— 命中且未过期直接返回缓存，不再打后端
 //!   * `proxy_cache_key <模板>;`      —— 默认 `$scheme$proxy_host$request_uri`
 //!   * `proxy_cache_valid [码...] <时长>;` —— 哪些状态码缓存多久；`any` 兜底
 //!   * `proxy_cache_methods GET HEAD;`—— 只缓存幂等方法
 //!   * `proxy_cache_min_uses N;`      —— 同一 key 至少第 N 次请求才写入（默认 1）
+//!   * `proxy_cache_lock on` + `proxy_cache_lock_timeout` —— 同 key 并发 MISS 只回源一次
+//!   * `proxy_cache_use_stale error|timeout|updating|http_xxx` —— 失败/刷新中回放过期内容
+//!   * `proxy_cache_bypass` / `proxy_no_cache` —— 按表达式跳过读取 / 跳过写入
+//!   * `proxy_cache_path ... keys_zone=<名>:<容量>` —— 容量按 128 B/条换算，LRU 淘汰
 //! 未写 `proxy_cache_valid` 时回落到上游的 `Cache-Control: max-age` / `Expires`；都没有则不缓存。
 //!
-//! 有意未实现（README 已标注）：`proxy_cache_use_stale`、revalidation（If-None-Match 回源校验）、
-//! `purge`、`$upstream_cache_status` 之外的 STALE 语义、磁盘 keys_zone。缓存响应统一带
-//! `X-Cache-Status: HIT|MISS|BYPASS|EXPIRED` 头，便于外部验证。
+//! 过期条目在内存里额外滞留 `STALE_GRACE`，供 `use_stale` 回放；之后由写入计数触发的
+//! 清理逻辑释放（容量本身由 LRU 上限兜底）。
+//! 有意未实现（README 已标注）：revalidation（If-None-Match 回源校验）、`purge`、Vary、
+//! `proxy_cache_lock_age`、磁盘持久化。缓存响应统一带
+//! `X-Cache-Status: HIT|MISS|EXPIRED|BYPASS|STALE` 头，便于外部验证。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,78 +36,268 @@ pub struct CachedResponse {
 struct Slot {
     resp: Arc<CachedResponse>,
     expires: Instant,
+    /// 过期后仍保留到此时刻：期间可被 `proxy_cache_use_stale` 回放，
+    /// 超过后由清理逻辑移除（内存缓存没有磁盘回退，必须给出明确的滞留上限）。
+    stale_until: Instant,
+    /// LRU 序号（每个 zone 内单调递增）
+    tick: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheHit {
     /// 命中且新鲜
     Hit,
-    /// 命中但已过期（当前无 use_stale，会回源重取 → 记为 MISS）
+    /// 命中但已过期（stale 滞留期内可被 `use_stale` 回放；否则回源重取）
     Expired,
     /// 无缓存条目
     Miss,
 }
 
-#[derive(Default)]
 struct Zone {
     entries: HashMap<String, Slot>,
+    /// tick → key，用于 O(log n) 找出最久未使用的条目
+    lru: BTreeMap<u64, String>,
     /// 每个 key 被请求过多少次（用于 min_uses）
     uses: HashMap<String, u32>,
+    tick: u64,
+    capacity: usize,
+    stores: u64,
 }
 
-/// 每区上限，超过按插入序粗淘汰（够用即可，不追求 LRU 精度）。
-const MAX_ENTRIES_PER_ZONE: usize = 4096;
+impl Zone {
+    fn new(capacity: usize) -> Self {
+        Zone {
+            entries: HashMap::new(),
+            lru: BTreeMap::new(),
+            uses: HashMap::new(),
+            tick: 0,
+            capacity,
+            stores: 0,
+        }
+    }
+}
+
+pub const DEFAULT_MAX_ENTRIES_PER_ZONE: usize = 4096;
+
+/// 过期条目在内存中额外滞留的时长（供 use_stale 回放）；内存缓存没有磁盘层，
+/// 超过后必须真正释放，否则被淘汰策略遗忘的 key 会永久占内存。
+const STALE_GRACE: Duration = Duration::from_secs(3600);
 
 pub struct ProxyCache {
     zones: Mutex<HashMap<String, Zone>>,
+    /// `proxy_cache_path ... keys_zone=name:size` 换算出的每区条目上限
+    capacities: Mutex<HashMap<String, usize>>,
+    /// `proxy_cache_lock` 的每 key 异步互斥量：同 key 并发 MISS 只放一个请求回源
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl ProxyCache {
-    pub fn new() -> Arc<Self> {
+    #[cfg(test)]
+    fn new() -> Arc<Self> {
+        Self::with_capacities(HashMap::new())
+    }
+
+    pub fn with_capacities(capacities: HashMap<String, usize>) -> Arc<Self> {
         Arc::new(ProxyCache {
             zones: Mutex::new(HashMap::new()),
+            capacities: Mutex::new(capacities),
+            locks: Mutex::new(HashMap::new()),
         })
     }
 
-    /// 查缓存并把该 key 的请求计数 +1（返回自增后的计数，用于 min_uses 判定）。
-    /// 对 zone/key 做一次加锁即可完成「查 + 计数」，避免两次加锁间的竞态。
-    pub fn lookup(&self, zone: &str, key: &str) -> (CacheHit, Option<Arc<CachedResponse>>, u32) {
-        let mut g = self.zones.lock().unwrap_or_else(|e| e.into_inner());
-        let z = g.entry(zone.to_string()).or_default();
-        let count = {
-            let c = z.uses.entry(key.to_string()).or_insert(0);
-            *c += 1;
-            *c
-        };
-        match z.entries.get(key) {
-            Some(s) if s.expires > Instant::now() => (CacheHit::Hit, Some(s.resp.clone()), count),
-            Some(s) => (CacheHit::Expired, Some(s.resp.clone()), count),
-            None => (CacheHit::Miss, None, count),
+    /// 热重载时应用新的 keys_zone 容量：已有 zone 立即按新上限裁剪。
+    pub fn apply_capacities(&self, capacities: &HashMap<String, usize>) {
+        {
+            let mut caps = self.capacities.lock().unwrap_or_else(|e| e.into_inner());
+            *caps = capacities.clone();
+        }
+        let mut zones = self.zones.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, z) in zones.iter_mut() {
+            z.capacity = capacities
+                .get(name)
+                .copied()
+                .unwrap_or(DEFAULT_MAX_ENTRIES_PER_ZONE);
+            Self::trim(z);
         }
     }
 
-    /// 写入/覆盖一条缓存。ttl<=0 视为不缓存。
+    fn capacity_for(&self, zone: &str) -> usize {
+        self.capacities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(zone)
+            .copied()
+            .unwrap_or(DEFAULT_MAX_ENTRIES_PER_ZONE)
+    }
+
+    /// 查缓存并把该 key 的请求计数 +1（返回自增后的计数，用于 min_uses 判定）。
+    /// 对 zone/key 做一次加锁即可完成「查 + 计数 + 刷新 LRU」，避免多次加锁间的竞态。
+    pub fn lookup(&self, zone: &str, key: &str) -> (CacheHit, Option<Arc<CachedResponse>>, u32) {
+        self.lookup_impl(zone, key, true)
+    }
+
+    /// 拿到 proxy_cache_lock 之后的二次检查：命中的话直接返回，且不重复累计 min_uses。
+    pub fn peek(&self, zone: &str, key: &str) -> (CacheHit, Option<Arc<CachedResponse>>) {
+        let (hit, resp, _) = self.lookup_impl(zone, key, false);
+        (hit, resp)
+    }
+
+    fn lookup_impl(
+        &self,
+        zone: &str,
+        key: &str,
+        count_use: bool,
+    ) -> (CacheHit, Option<Arc<CachedResponse>>, u32) {
+        let now = Instant::now();
+        let capacity = self.capacity_for(zone);
+        let mut g = self.zones.lock().unwrap_or_else(|e| e.into_inner());
+        let z = g
+            .entry(zone.to_string())
+            .or_insert_with(|| Zone::new(capacity));
+        z.capacity = capacity;
+        let count = if count_use {
+            let c = z.uses.entry(key.to_string()).or_insert(0);
+            *c = c.saturating_add(1);
+            *c
+        } else {
+            z.uses.get(key).copied().unwrap_or(0)
+        };
+
+        enum Kind {
+            Fresh(Arc<CachedResponse>),
+            Stale(Arc<CachedResponse>),
+            Dead,
+        }
+        let kind = match z.entries.get(key) {
+            Some(s) if s.expires > now => Kind::Fresh(s.resp.clone()),
+            Some(s) if s.stale_until > now => Kind::Stale(s.resp.clone()),
+            Some(_) => Kind::Dead,
+            None => return (CacheHit::Miss, None, count),
+        };
+        match kind {
+            Kind::Fresh(resp) => {
+                Self::touch(z, key);
+                (CacheHit::Hit, Some(resp), count)
+            }
+            Kind::Stale(resp) => {
+                Self::touch(z, key);
+                (CacheHit::Expired, Some(resp), count)
+            }
+            Kind::Dead => {
+                if let Some(s) = z.entries.remove(key) {
+                    z.lru.remove(&s.tick);
+                }
+                (CacheHit::Miss, None, count)
+            }
+        }
+    }
+
+    fn touch(z: &mut Zone, key: &str) {
+        z.tick = z.tick.wrapping_add(1);
+        let tick = z.tick;
+        if let Some(s) = z.entries.get_mut(key) {
+            z.lru.remove(&s.tick);
+            s.tick = tick;
+        }
+        z.lru.insert(tick, key.to_string());
+    }
+
+    /// 仅累计 min_uses 计数（命中被 bypass 的请求仍需计数，才能与 nginx 的
+    /// “第 N 次请求起写入缓存”语义一致）。
+    pub fn note_use(&self, zone: &str, key: &str) -> u32 {
+        let capacity = self.capacity_for(zone);
+        let mut g = self.zones.lock().unwrap_or_else(|e| e.into_inner());
+        let z = g
+            .entry(zone.to_string())
+            .or_insert_with(|| Zone::new(capacity));
+        let c = z.uses.entry(key.to_string()).or_insert(0);
+        *c = c.saturating_add(1);
+        *c
+    }
+
+    /// 写入/覆盖一条缓存。ttl=0 视为不缓存。
     pub fn store(&self, zone: &str, key: &str, resp: CachedResponse, ttl: Duration) {
+        self.store_with_grace(zone, key, resp, ttl, STALE_GRACE);
+    }
+
+    fn store_with_grace(
+        &self,
+        zone: &str,
+        key: &str,
+        resp: CachedResponse,
+        ttl: Duration,
+        grace: Duration,
+    ) {
         if ttl.is_zero() {
             return;
         }
+        let capacity = self.capacity_for(zone);
+        let now = Instant::now();
         let mut g = self.zones.lock().unwrap_or_else(|e| e.into_inner());
-        let z = g.entry(zone.to_string()).or_default();
-        if z.entries.len() >= MAX_ENTRIES_PER_ZONE && !z.entries.contains_key(key) {
-            // 粗淘汰：清掉最早一半（HashMap 无序，这里近似即可）
-            let drop_n = z.entries.len() / 2;
-            let keys: Vec<String> = z.entries.keys().take(drop_n).cloned().collect();
-            for k in keys {
-                z.entries.remove(&k);
-            }
+        let z = g
+            .entry(zone.to_string())
+            .or_insert_with(|| Zone::new(capacity));
+        z.capacity = capacity;
+        if let Some(old) = z.entries.remove(key) {
+            z.lru.remove(&old.tick);
         }
+        z.tick = z.tick.wrapping_add(1);
+        let tick = z.tick;
         z.entries.insert(
             key.to_string(),
             Slot {
                 resp: Arc::new(resp),
-                expires: Instant::now() + ttl,
+                expires: now + ttl,
+                stale_until: now + ttl + grace,
+                tick,
             },
         );
+        z.lru.insert(tick, key.to_string());
+        z.stores = z.stores.wrapping_add(1);
+        if z.stores % 128 == 0 {
+            Self::cleanup(z, now);
+        }
+        Self::trim(z);
+    }
+
+    /// 按 LRU 淘汰到容量上限。
+    fn trim(z: &mut Zone) {
+        while z.entries.len() > z.capacity {
+            let Some((_, key)) = z.lru.pop_first() else {
+                break;
+            };
+            z.entries.remove(&key);
+        }
+    }
+
+    /// 清理超过 stale 滞留期的条目，并压缩无人再查询的 min_uses 计数。
+    fn cleanup(z: &mut Zone, now: Instant) {
+        let dead: Vec<(String, u64)> = z
+            .entries
+            .iter()
+            .filter(|(_, s)| s.stale_until <= now)
+            .map(|(k, s)| (k.clone(), s.tick))
+            .collect();
+        for (key, tick) in dead {
+            z.entries.remove(&key);
+            z.lru.remove(&tick);
+        }
+        let limit = z.capacity.saturating_mul(4).max(64);
+        if z.uses.len() > limit {
+            let entries = &z.entries;
+            z.uses.retain(|k, _| entries.contains_key(k));
+        }
+    }
+
+    /// 取得某个 key 的回源锁（Arc 便于跨 await 持有；空闲锁会在表过大时回收）。
+    pub fn cache_lock(&self, zone: &str, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut g = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() >= 4096 {
+            g.retain(|_, v| Arc::strong_count(v) > 1);
+        }
+        g.entry(format!("{zone}\u{0}{key}"))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// 主动失效一个 key（proxy_cache off/配置变更时可用），返回是否删除。
@@ -109,7 +306,10 @@ impl ProxyCache {
         let mut g = self.zones.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(z) = g.get_mut(zone) {
             z.uses.remove(key);
-            return z.entries.remove(key).is_some();
+            if let Some(s) = z.entries.remove(key) {
+                z.lru.remove(&s.tick);
+                return true;
+            }
         }
         false
     }
@@ -122,6 +322,18 @@ impl ProxyCache {
             .get(zone)
             .map(|z| z.entries.len())
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn force_expire(&self, zone: &str, key: &str, stale_for: Duration) {
+        let mut g = self.zones.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(z) = g.get_mut(zone) {
+            if let Some(s) = z.entries.get_mut(key) {
+                let now = Instant::now();
+                s.expires = now;
+                s.stale_until = now + stale_for;
+            }
+        }
     }
 }
 
@@ -353,5 +565,57 @@ mod tests {
         c.store("z", "k", entry(), Duration::from_secs(60));
         assert!(c.invalidate("z", "k"));
         assert!(!c.invalidate("z", "k"));
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used() {
+        let c = ProxyCache::with_capacities(HashMap::from([("z".to_string(), 2)]));
+        c.store("z", "a", entry(), Duration::from_secs(60));
+        c.store("z", "b", entry(), Duration::from_secs(60));
+        // 访问 a，使 b 成为最久未使用
+        assert_eq!(c.lookup("z", "a").0, CacheHit::Hit);
+        c.store("z", "c", entry(), Duration::from_secs(60));
+        assert_eq!(c.len("z"), 2);
+        assert_eq!(c.peek("z", "a").0, CacheHit::Hit);
+        assert_eq!(c.peek("z", "b").0, CacheHit::Miss);
+        assert_eq!(c.peek("z", "c").0, CacheHit::Hit);
+    }
+
+    #[test]
+    fn apply_capacities_trims_existing_zone() {
+        let c = ProxyCache::new();
+        for i in 0..10 {
+            c.store("z", &format!("k{i}"), entry(), Duration::from_secs(60));
+        }
+        c.apply_capacities(&HashMap::from([("z".to_string(), 3)]));
+        assert_eq!(c.len("z"), 3);
+    }
+
+    #[test]
+    fn stale_entry_survives_expiry_then_is_removed() {
+        let c = ProxyCache::new();
+        c.store("z", "k", entry(), Duration::from_secs(60));
+        c.force_expire("z", "k", Duration::from_secs(30));
+        let (hit, resp, _) = c.lookup("z", "k");
+        assert_eq!(hit, CacheHit::Expired);
+        assert_eq!(&resp.unwrap().body[..], b"hi");
+        // 超过 stale 滞留期 → 真正删除，避免内存永久占用
+        c.force_expire("z", "k", Duration::ZERO);
+        assert_eq!(c.lookup("z", "k").0, CacheHit::Miss);
+        assert_eq!(c.len("z"), 0);
+    }
+
+    #[tokio::test]
+    async fn same_key_lock_is_exclusive() {
+        let c = ProxyCache::new();
+        let l1 = c.cache_lock("z", "k");
+        let l2 = c.cache_lock("z", "k");
+        assert!(Arc::ptr_eq(&l1, &l2), "同 key 必须拿到同一把锁");
+        let guard = l1.clone().lock_owned().await;
+        assert!(l1.clone().try_lock_owned().is_err(), "leader 持锁期间 waiter 必须等待");
+        drop(guard);
+        assert!(l2.try_lock_owned().is_ok());
+        // 不同 key 互不影响
+        assert!(!Arc::ptr_eq(&c.cache_lock("z", "k2"), &l1));
     }
 }

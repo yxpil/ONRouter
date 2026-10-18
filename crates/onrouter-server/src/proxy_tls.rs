@@ -26,11 +26,58 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-/// hyper 与后端之间统一的流：明文 TCP 或 rustls 客户端 TLS 流。
-/// Box TLS 变体以保证 `Unpin`（连接池/隧道要求）。
-pub enum ProxyStream {
+enum ProxyStreamInner {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+/// hyper 与后端之间统一的流：明文 TCP 或 rustls 客户端 TLS 流。
+/// 额外携带 `proxy_send_timeout` 看门狗：单次写操作（headers/body/flush）一旦在内核
+/// 写缓冲上阻塞超过该时长即报错断开，语义对齐 nginx 的"两次写操作之间"。
+pub struct ProxyStream {
+    inner: ProxyStreamInner,
+    send_timeout: Option<Duration>,
+    /// 当前这次写操作已经等待的时长；Ready 时清空，下次写重新计时。
+    write_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+/// 单次内核写的上限。Windows IOCP 的 loopback 快速路径会把超大 send 整块入队
+/// （实测 64MB 一次 poll_write 立即返回），内核背压不体现在 Pending 上，
+/// send 看门狗就永远等不到超时；切成 64KB 后各平台都能看到真实背压。
+const MAX_WRITE_CHUNK: usize = 64 * 1024;
+
+impl ProxyStream {
+    fn plain(tcp: TcpStream, send_timeout: Option<Duration>) -> Self {
+        ProxyStream {
+            inner: ProxyStreamInner::Plain(tcp),
+            send_timeout,
+            write_deadline: None,
+        }
+    }
+
+    fn tls(stream: tokio_rustls::client::TlsStream<TcpStream>, send_timeout: Option<Duration>) -> Self {
+        ProxyStream {
+            inner: ProxyStreamInner::Tls(Box::new(stream)),
+            send_timeout,
+            write_deadline: None,
+        }
+    }
+
+    /// 写/刷盘阻塞时启用的看门狗；返回 true 表示已经超时（内部计时器已复位）。
+    fn write_timed_out(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(t) = self.send_timeout else {
+            return false;
+        };
+        let deadline = self
+            .write_deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(t)));
+        if deadline.as_mut().poll(cx).is_ready() {
+            self.write_deadline = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl AsyncRead for ProxyStream {
@@ -39,9 +86,10 @@ impl AsyncRead for ProxyStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            ProxyStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            ProxyStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        let this = self.get_mut();
+        match &mut this.inner {
+            ProxyStreamInner::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            ProxyStreamInner::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -52,21 +100,76 @@ impl AsyncWrite for ProxyStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            ProxyStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            ProxyStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        let this = self.get_mut();
+        let chunk = if buf.len() > MAX_WRITE_CHUNK {
+            &buf[..MAX_WRITE_CHUNK]
+        } else {
+            buf
+        };
+        let polled = match &mut this.inner {
+            ProxyStreamInner::Plain(s) => Pin::new(s).poll_write(cx, chunk),
+            ProxyStreamInner::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, chunk),
+        };
+        match polled {
+            Poll::Ready(r) => {
+                this.write_deadline = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => {
+                if this.write_timed_out(cx) {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "proxy_send_timeout: 上游写空闲超时",
+                    )));
+                }
+                Poll::Pending
+            }
         }
     }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            ProxyStream::Plain(s) => Pin::new(s).poll_flush(cx),
-            ProxyStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        let this = self.get_mut();
+        let polled = match &mut this.inner {
+            ProxyStreamInner::Plain(s) => Pin::new(s).poll_flush(cx),
+            ProxyStreamInner::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        };
+        match polled {
+            Poll::Ready(r) => {
+                this.write_deadline = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => {
+                if this.write_timed_out(cx) {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "proxy_send_timeout: 上游写空闲超时",
+                    )));
+                }
+                Poll::Pending
+            }
         }
     }
+
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            ProxyStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            ProxyStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        let this = self.get_mut();
+        let polled = match &mut this.inner {
+            ProxyStreamInner::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            ProxyStreamInner::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        };
+        match polled {
+            Poll::Ready(r) => {
+                this.write_deadline = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => {
+                if this.write_timed_out(cx) {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "proxy_send_timeout: 上游写空闲超时",
+                    )));
+                }
+                Poll::Pending
+            }
         }
     }
 }
@@ -313,6 +416,8 @@ pub fn verify_client_config(ca_pem_path: &str) -> Result<Arc<ClientConfig>, Stri
 #[derive(Clone)]
 pub struct ProxyConnector {
     pub connect_timeout: Duration,
+    /// `proxy_send_timeout`：0 表示不限制（nginx 语义）。
+    pub send_timeout: Duration,
     /// https/wss 时才需要；None 表示本连接器不带 TLS（纯 http）。
     pub tls: Option<Arc<ClientConfig>>,
     sni_override: Option<String>,
@@ -321,11 +426,13 @@ pub struct ProxyConnector {
 impl ProxyConnector {
     pub fn new(
         connect_timeout: Duration,
+        send_timeout: Duration,
         tls: Option<Arc<ClientConfig>>,
         policy: &TlsPolicy,
     ) -> Self {
         ProxyConnector {
             connect_timeout,
+            send_timeout,
             tls,
             sni_override: policy.server_name.clone(),
         }
@@ -344,6 +451,7 @@ impl tower_service::Service<Uri> for ProxyConnector {
     fn call(&mut self, dst: Uri) -> Self::Future {
         let tls = self.tls.clone();
         let timeout = self.connect_timeout;
+        let send_timeout = (!self.send_timeout.is_zero()).then_some(self.send_timeout);
         let sni_override = self.sni_override.clone();
         Box::pin(async move {
             let is_https = dst.scheme_str() == Some("https");
@@ -360,7 +468,7 @@ impl tower_service::Service<Uri> for ProxyConnector {
                 })?;
             let _ = tcp.set_nodelay(true);
             if !is_https {
-                return Ok(ProxyStream::Plain(tcp));
+                return Ok(ProxyStream::plain(tcp, send_timeout));
             }
             let cfg = tls.ok_or_else(|| {
                 io::Error::new(
@@ -385,7 +493,7 @@ impl tower_service::Service<Uri> for ProxyConnector {
                         format!("后端 TLS 握手失败 {sni_host}: {e}"),
                     )
                 })?;
-            Ok(ProxyStream::Tls(Box::new(stream)))
+            Ok(ProxyStream::tls(stream, send_timeout))
         })
     }
 }
@@ -457,5 +565,72 @@ mod tests {
         };
         let err = policy.build_client_config().unwrap_err();
         assert!(err.contains("proxy_ssl_certificate"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn send_timeout_fires_when_upstream_stops_reading() {
+        use tokio::io::AsyncWriteExt;
+        use tower_service::Service;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_s, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let policy = TlsPolicy {
+            verify: false,
+            ..Default::default()
+        };
+        let mut conn = ProxyConnector::new(
+            Duration::from_secs(1),
+            Duration::from_millis(300),
+            None,
+            &policy,
+        );
+        let uri: Uri = format!("http://{addr}").parse().unwrap();
+        let mut stream = conn.call(uri).await.unwrap();
+        // Windows loopback 对单次超大 send 有快速入队路径；按 TLS 记录/分块体的大小循环写，
+        // 才会真正压到内核缓冲并返回 Pending。
+        let chunk = vec![0u8; 64 * 1024];
+        let write = async {
+            loop {
+                stream.write_all(&chunk).await?;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), std::io::Error>(())
+        };
+        let err = tokio::time::timeout(Duration::from_secs(3), write)
+            .await
+            .expect("写入不应挂死")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+    }
+
+    #[tokio::test]
+    async fn send_timeout_disabled_does_not_abort_writes() {
+        use tokio::io::AsyncWriteExt;
+        use tower_service::Service;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut sink = vec![0u8; 64 * 1024];
+            while let Ok(n) = tokio::io::AsyncReadExt::read(&mut s, &mut sink).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let policy = TlsPolicy::default();
+        let mut conn = ProxyConnector::new(Duration::from_secs(1), Duration::ZERO, None, &policy);
+        let uri: Uri = format!("http://{addr}").parse().unwrap();
+        let mut stream = conn.call(uri).await.unwrap();
+        let payload = vec![0u8; 1024 * 1024];
+        tokio::time::timeout(Duration::from_secs(5), stream.write_all(&payload))
+            .await
+            .expect("禁用看门狗后写入应正常完成")
+            .unwrap();
     }
 }

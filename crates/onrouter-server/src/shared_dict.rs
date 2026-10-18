@@ -33,6 +33,15 @@ fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// OpenResty 语义：exptime 为 nil 或 0 → 永不过期；负数 → 立即过期。
+fn expiry_at(now: f64, ex: Option<f64>) -> Option<f64> {
+    match ex {
+        None => None,
+        Some(t) if t == 0.0 => None,
+        Some(t) => Some(now + t),
+    }
+}
+
 /// 单个条目的成本：key + value + 固定开销（对标 nginx slab node overhead ~64B）
 const NODE_OVERHEAD: usize = 64;
 
@@ -97,6 +106,22 @@ impl ZoneInner {
         self.clock.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// 释放字节数。用 CAS 夹在 0：used 是跨分片近似值，
+    /// 万一并发窗口里出现重复扣减也不能让 usize 回绕成天文数字。
+    fn release(&self, bytes: usize) {
+        let mut cur = self.used.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(bytes);
+            match self
+                .used
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
     /// 从随机分片中采样若干 entry，淘汰 last_used 最小的那个（Redis 式近似 LRU）
     fn evict_one(&self) -> bool {
         // 尝试多个分片直到找到一个有 entry 的
@@ -118,7 +143,7 @@ impl ZoneInner {
             }
             if let Some(key) = best_key {
                 if let Some(entry) = map.remove(&key) {
-                    self.used.fetch_sub(entry.cost, Ordering::Relaxed);
+                    self.release(entry.cost);
                     return true;
                 }
             }
@@ -126,28 +151,35 @@ impl ZoneInner {
         false
     }
 
-    /// 尝试为给定成本腾出空间：先清理过期项，再 LRU 淘汰
+    /// 尝试为给定成本腾出空间：先清理过期项，再 LRU 淘汰。
+    /// 常见路径（空间足够）不碰任何分片锁——旧实现在每次 set 时都遍历 16 片，
+    /// 且为过期项分配 key 向量，使热路径变成 O(全表)。
     fn make_room(&self, cost: usize) -> bool {
         if self.capacity == 0 {
             return true; // 无容量限制
         }
-        // 第一轮：清理所有分片中的过期项
+        if self.used.load(Ordering::Relaxed).saturating_add(cost) <= self.capacity {
+            return true;
+        }
+        // 第一轮（仅空间不足时）：就地清理各分片中的过期项
         let now = now_epoch();
         for shard in &self.shards {
             let mut map = shard.lock().unwrap();
-            let expired: Vec<String> = map
-                .iter()
-                .filter(|(_, e)| !e.alive(now))
-                .map(|(k, _)| k.clone())
-                .collect();
-            for k in expired {
-                if let Some(e) = map.remove(&k) {
-                    self.used.fetch_sub(e.cost, Ordering::Relaxed);
+            let mut freed = 0usize;
+            map.retain(|_, e| {
+                if e.alive(now) {
+                    true
+                } else {
+                    freed += e.cost;
+                    false
                 }
+            });
+            if freed > 0 {
+                self.release(freed);
             }
         }
         // 第二轮：如果还不够，LRU 淘汰
-        while self.used.load(Ordering::Relaxed) + cost > self.capacity {
+        while self.used.load(Ordering::Relaxed).saturating_add(cost) > self.capacity {
             if !self.evict_one() {
                 return false; // 没有可淘汰的了
             }
@@ -189,25 +221,25 @@ impl SharedZone {
     /// 写入：空间不足时 LRU 淘汰；单项超过整区容量时返回 Err("no memory")
     pub fn set(&self, key: &str, value: Vec<u8>, ex: Option<f64>) -> Result<(), String> {
         let now = now_epoch();
-        let expires_at = ex.map(|t| now + t);
+        let expires_at = expiry_at(now, ex);
         let cost = key.len() + value.len() + NODE_OVERHEAD;
         if self.inner.capacity > 0 && cost > self.inner.capacity {
             return Err("no memory".to_string());
         }
-        // 先计算净增量（需要临时锁一下当前分片读取旧值）
+        // 先估算净增量（每次 set 只锁一次当前分片），再释放旧成本/记入新成本
         let shard = self.inner.shard(key);
         let old_cost = {
             let map = shard.lock().unwrap();
             map.get(key).map(|e| e.cost).unwrap_or(0)
         };
-        let net_cost = if cost > old_cost { cost - old_cost } else { 0 };
+        let net_cost = cost.saturating_sub(old_cost);
         // 腾空间（不持有任何锁）
         if !self.inner.make_room(net_cost) {
             return Err("no memory".to_string());
         }
         let tick = self.inner.tick();
         let mut map = shard.lock().unwrap();
-        map.insert(
+        if let Some(prev) = map.insert(
             key.to_string(),
             Entry {
                 value,
@@ -215,15 +247,19 @@ impl SharedZone {
                 last_used: tick,
                 cost,
             },
-        );
-        self.inner.used.fetch_add(net_cost, Ordering::Relaxed);
+        ) {
+            // 用最终替换掉的条目做精确结算：旧实现只在 cost 变大时加差额，
+            // 值变小时从不减，used 会一路虚高直到容量假满。
+            self.inner.release(prev.cost);
+        }
+        self.inner.used.fetch_add(cost, Ordering::Relaxed);
         Ok(())
     }
 
     /// safe_set：不淘汰，空间不足直接返回 Err("no memory")
     pub fn safe_set(&self, key: &str, value: Vec<u8>, ex: Option<f64>) -> Result<(), String> {
         let now = now_epoch();
-        let expires_at = ex.map(|t| now + t);
+        let expires_at = expiry_at(now, ex);
         let cost = key.len() + value.len() + NODE_OVERHEAD;
         if self.inner.capacity > 0 && cost > self.inner.capacity {
             return Err("no memory".to_string());
@@ -249,7 +285,7 @@ impl SharedZone {
         );
         // 更新 used：减去旧值，加上新值
         if old_cost > 0 {
-            self.inner.used.fetch_sub(old_cost, Ordering::Relaxed);
+            self.inner.release(old_cost);
         }
         self.inner.used.fetch_add(cost, Ordering::Relaxed);
         Ok(())
@@ -259,22 +295,31 @@ impl SharedZone {
     pub fn add(&self, key: &str, value: Vec<u8>, ex: Option<f64>) -> Result<bool, String> {
         let now = now_epoch();
         let mut map = self.inner.shard(key).lock().unwrap();
-        if map.get(key).is_some_and(|e| e.alive(now)) {
-            return Ok(false);
-        }
+        // 过期项仍计入 used，但它会被本次写入替换，容量检查按净增量算
+        let old_cost = match map.get(key) {
+            Some(e) if e.alive(now) => return Ok(false),
+            Some(e) => e.cost,
+            None => 0,
+        };
         let cost = key.len() + value.len() + NODE_OVERHEAD;
         if self.inner.capacity > 0 && cost > self.inner.capacity {
             return Err("no memory".to_string());
         }
         // 检查空间（add 不淘汰，直接失败）
+        let net = cost.saturating_sub(old_cost);
         if self.inner.capacity > 0
-            && self.inner.used.load(Ordering::Relaxed) + cost > self.inner.capacity
+            && self
+                .inner
+                .used
+                .load(Ordering::Relaxed)
+                .saturating_add(net)
+                > self.inner.capacity
         {
             return Err("no memory".to_string());
         }
-        let expires_at = ex.map(|t| now + t);
+        let expires_at = expiry_at(now, ex);
         let tick = self.inner.tick();
-        map.insert(
+        if let Some(prev) = map.insert(
             key.to_string(),
             Entry {
                 value,
@@ -282,7 +327,10 @@ impl SharedZone {
                 last_used: tick,
                 cost,
             },
-        );
+        ) {
+            // 覆盖的是过期项：先释放旧成本，否则同一 key 会被重复计费
+            self.inner.release(prev.cost);
+        }
         self.inner.used.fetch_add(cost, Ordering::Relaxed);
         Ok(true)
     }
@@ -308,8 +356,8 @@ impl SharedZone {
             return Err("no memory".to_string());
         }
         map.remove(key); // 释放旧成本
-        self.inner.used.fetch_sub(old_cost, Ordering::Relaxed);
-        let expires_at = ex.map(|t| now + t);
+        self.inner.release(old_cost);
+        let expires_at = expiry_at(now, ex);
         let tick = self.inner.tick();
         map.insert(
             key.to_string(),
@@ -327,7 +375,7 @@ impl SharedZone {
     pub fn delete(&self, key: &str) {
         let mut map = self.inner.shard(key).lock().unwrap();
         if let Some(e) = map.remove(key) {
-            self.inner.used.fetch_sub(e.cost, Ordering::Relaxed);
+            self.inner.release(e.cost);
         }
     }
 
@@ -345,8 +393,18 @@ impl SharedZone {
                         .parse()
                         .map_err(|_| format!("incr: '{key}' 的值不是数字 ({text})"))?;
                     let new = cur + delta;
-                    e.value = new.to_string().into_bytes();
+                    let new_val = new.to_string().into_bytes();
+                    let new_cost = key.len() + new_val.len() + NODE_OVERHEAD;
+                    let old_cost = e.cost;
+                    e.value = new_val;
+                    e.cost = new_cost;
                     e.last_used = self.inner.tick();
+                    // 数字位数变化会改变条目成本：同步 used，否则 free_space 会越走越偏
+                    if new_cost >= old_cost {
+                        self.inner.used.fetch_add(new_cost - old_cost, Ordering::Relaxed);
+                    } else {
+                        self.inner.release(old_cost - new_cost);
+                    }
                     return Ok(new);
                 }
             }
@@ -362,7 +420,15 @@ impl SharedZone {
         if self.inner.capacity > 0 && cost > self.inner.capacity {
             return Err("no memory".to_string());
         }
-        if !self.inner.make_room(cost) {
+        // 同 key 的过期项会被替换，其成本按"即将释放"计入净增量
+        let old_expired = {
+            let map = shard.lock().unwrap();
+            map.get(key)
+                .filter(|e| !e.alive(now))
+                .map(|e| e.cost)
+                .unwrap_or(0)
+        };
+        if !self.inner.make_room(cost.saturating_sub(old_expired)) {
             return Err("no memory".to_string());
         }
         let tick = self.inner.tick();
@@ -373,13 +439,22 @@ impl SharedZone {
                 let text = String::from_utf8_lossy(&e.value).trim().to_string();
                 if let Ok(cur) = text.parse::<i64>() {
                     let new2 = cur + delta;
-                    e.value = new2.to_string().into_bytes();
+                    let new_val = new2.to_string().into_bytes();
+                    let new_cost = key.len() + new_val.len() + NODE_OVERHEAD;
+                    let old_cost = e.cost;
+                    e.value = new_val;
+                    e.cost = new_cost;
                     e.last_used = tick;
+                    if new_cost >= old_cost {
+                        self.inner.used.fetch_add(new_cost - old_cost, Ordering::Relaxed);
+                    } else {
+                        self.inner.release(old_cost - new_cost);
+                    }
                     return Ok(new2);
                 }
             }
         }
-        map.insert(
+        if let Some(prev) = map.insert(
             key.to_string(),
             Entry {
                 value: val,
@@ -387,7 +462,9 @@ impl SharedZone {
                 last_used: tick,
                 cost,
             },
-        );
+        ) {
+            self.inner.release(prev.cost); // 覆盖的是过期项
+        }
         self.inner.used.fetch_add(cost, Ordering::Relaxed);
         Ok(new)
     }
@@ -406,8 +483,41 @@ impl SharedZone {
         for s in &self.inner.shards {
             let mut map = s.lock().unwrap();
             let total: usize = map.values().map(|e| e.cost).sum();
-            self.inner.used.fetch_sub(total, Ordering::Relaxed);
+            self.inner.release(total);
             map.clear();
+        }
+    }
+
+    /// 枚举现存（未过期）键：最多 max 个；第二返回值表示是否还有更多。
+    /// 对标 ngx.shared.DICT:get_keys(max_count)。
+    pub fn get_keys(&self, max: usize) -> (Vec<String>, bool) {
+        let now = now_epoch();
+        let mut keys = Vec::new();
+        for s in &self.inner.shards {
+            let map = s.lock().unwrap();
+            for (k, e) in map.iter() {
+                if !e.alive(now) {
+                    continue;
+                }
+                if keys.len() >= max {
+                    return (keys, true);
+                }
+                keys.push(k.clone());
+            }
+        }
+        (keys, false)
+    }
+
+    /// 重设过期时间：ex <= 0 表示永不过期。key 不存在/已过期返回 false。
+    pub fn expire(&self, key: &str, ex: f64) -> bool {
+        let now = now_epoch();
+        let mut map = self.inner.shard(key).lock().unwrap();
+        match map.get_mut(key) {
+            Some(e) if e.alive(now) => {
+                e.expires_at = if ex == 0.0 { None } else { Some(now + ex) };
+                true
+            }
+            _ => false,
         }
     }
 
@@ -424,7 +534,7 @@ impl SharedZone {
                 .collect();
             for k in expired {
                 if let Some(e) = map.remove(&k) {
-                    self.inner.used.fetch_sub(e.cost, Ordering::Relaxed);
+                    self.inner.release(e.cost);
                     count += 1;
                 }
             }
@@ -500,24 +610,34 @@ impl SharedZone {
         if self.key_present(key) {
             return Ok(false);
         }
-        if !self.inner.make_room(cost) {
+        let shard = self.inner.shard(key);
+        // 同 key 的过期项会被替换，按净增量腾空间
+        let old_expired = {
+            let map = shard.lock().unwrap();
+            map.get(key)
+                .filter(|e| !e.alive(now))
+                .map(|e| e.cost)
+                .unwrap_or(0)
+        };
+        if !self.inner.make_room(cost.saturating_sub(old_expired)) {
             return Err("no memory".to_string());
         }
-        let shard = self.inner.shard(key);
         let mut map = shard.lock().unwrap();
         if map.get(key).is_some_and(|e| e.alive(now)) {
             return Ok(false); // 竞争窗口里已被写入
         }
         let tick = self.inner.tick();
-        map.insert(
+        if let Some(prev) = map.insert(
             key.to_string(),
             Entry {
                 value,
-                expires_at: ex.map(|t| now + t),
+                expires_at: expiry_at(now, ex),
                 last_used: tick,
                 cost,
             },
-        );
+        ) {
+            self.inner.release(prev.cost); // 覆盖的是过期项
+        }
         self.inner.used.fetch_add(cost, Ordering::Relaxed);
         Ok(true)
     }
@@ -539,8 +659,17 @@ impl SharedZone {
             .parse()
             .map_err(|_| format!("bump: '{key}' 的值不是数字 ({text})"))?;
         let new = cur + by;
-        e.value = new.to_string().into_bytes();
+        let new_val = new.to_string().into_bytes();
+        let new_cost = key.len() + new_val.len() + NODE_OVERHEAD;
+        let old_cost = e.cost;
+        e.value = new_val;
+        e.cost = new_cost;
         e.last_used = self.inner.tick();
+        if new_cost >= old_cost {
+            self.inner.used.fetch_add(new_cost - old_cost, Ordering::Relaxed);
+        } else {
+            self.inner.release(old_cost - new_cost);
+        }
         Ok(new)
     }
 }
@@ -749,6 +878,45 @@ mod tests {
     }
 
     #[test]
+    fn set_shrinking_value_releases_space() {
+        let z = zone(1024);
+        z.set("k", vec![0u8; 500], None).unwrap();
+        z.set("k", b"small".to_vec(), None).unwrap();
+        assert_eq!(
+            z.free_space(),
+            1024 - (1 + "small".len() + NODE_OVERHEAD),
+            "覆盖为更小的值必须释放旧成本"
+        );
+    }
+
+    #[test]
+    fn add_over_expired_entry_does_not_double_count() {
+        let z = zone(400);
+        z.set("k", vec![0u8; 200], Some(0.02)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert_eq!(z.add("k", b"v".to_vec(), None), Ok(true));
+        assert_eq!(
+            z.free_space(),
+            400 - (1 + 1 + NODE_OVERHEAD),
+            "替换过期项时应释放它占的成本"
+        );
+    }
+
+    #[test]
+    fn incr_and_bump_track_digit_growth() {
+        let z = zone(1024);
+        assert_eq!(z.incr("c", 0, Some(0)), Ok(0));
+        let base = z.free_space();
+        assert_eq!(z.incr("c", 99999, None), Ok(99999));
+        assert_eq!(base - z.free_space(), 4, "\"0\" → \"99999\" 成本 +4");
+
+        z.set("n", b"1".to_vec(), None).unwrap();
+        let base2 = z.free_space();
+        assert_eq!(z.bump("n", 1000), Ok(1001));
+        assert_eq!(base2 - z.free_space(), 3, "\"1\" → \"1001\" 成本 +3");
+    }
+
+    #[test]
     fn get_bumps_lru_clock() {
         let z = zone(1024);
         z.set("a", b"1".to_vec(), None).unwrap();
@@ -762,5 +930,23 @@ mod tests {
         z.set("c", vec![0u8; 200], None).unwrap(); // 可能触发淘汰
         // b 可能被淘汰，a 更可能保留
         // 不做硬断言，只验证不 panic
+    }
+
+    #[test]
+    fn zero_exptime_never_expires_and_negative_expires_now() {
+        let z = zone(1024);
+        z.set("forever", b"v".to_vec(), Some(0.0)).unwrap();
+        assert!(z.key_present("forever"));
+        assert_eq!(z.ttl("forever"), Some(-1.0), "exptime=0 对标 OpenResty：永不过期");
+
+        z.set("dead", b"v".to_vec(), Some(-1.0)).unwrap();
+        assert!(!z.key_present("dead"), "负 exptime 应立即过期");
+        assert!(z.get_stale_flagged("dead").1, "过期项仍可 get_stale 读取并标记 stale");
+
+        assert_eq!(z.add("forever", b"new".to_vec(), None), Ok(false));
+        assert_eq!(z.get("forever"), Some(b"v".to_vec()), "未过期项 add 应失败");
+
+        assert!(z.expire("forever", 0.0));
+        assert_eq!(z.ttl("forever"), Some(-1.0));
     }
 }

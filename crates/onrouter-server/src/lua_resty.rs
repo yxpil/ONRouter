@@ -577,6 +577,470 @@ end
 
 return _M
 "##;
+/// ngx.semaphore —— 信号量。OpenResty 原生实现基于事件；这里用
+/// `ngx.sleep` 让出轮询（步长从 1ms 指数退避到 20ms），语义一致且不占死 VM。
+/// 计数器是每个 VM（≈每个 worker）独立的，与 OpenResty 的 per-worker 语义一致。
+const NGX_SEMAPHORE: &str = r##"
+local _M = {}
+local mt = { __index = _M }
+
+local min, max = math.min, math.max
+
+-- new([n])：初始计数，默认 0
+function _M.new(n)
+    n = tonumber(n) or 0
+    if n < 0 then
+        return nil, "invalid initial count"
+    end
+    return setmetatable({ _count = n }, mt)
+end
+
+-- count()：当前计数（不等待）
+function _M:count()
+    return self._count
+end
+
+-- post([n])：增加计数并唤醒等待者（轮询模型下等待者下一拍看到）
+function _M:post(n)
+    n = tonumber(n) or 1
+    if n < 0 then
+        return nil, "invalid post value"
+    end
+    self._count = self._count + n
+    return true
+end
+
+-- wait([timeout])：计数 > 0 则消耗并返回 true；超时返回 nil, "timeout"。
+-- timeout = 0 表示非阻塞试取。
+function _M:wait(timeout)
+    if timeout ~= nil then
+        timeout = tonumber(timeout)
+        if not timeout or timeout < 0 then
+            return nil, "invalid timeout value"
+        end
+    end
+    if self._count > 0 then
+        self._count = self._count - 1
+        return true
+    end
+    if timeout == 0 then
+        return nil, "timeout"
+    end
+
+    local start = ngx.now()
+    local step = 0.001
+    while true do
+        ngx.sleep(step)
+        if self._count > 0 then
+            self._count = self._count - 1
+            return true
+        end
+        if timeout then
+            local left = timeout - (ngx.now() - start)
+            if left <= 0 then
+                return nil, "timeout"
+            end
+            step = min(step * 2, left, 0.02)
+        else
+            step = min(step * 2, 0.02)
+        end
+    end
+end
+
+return _M
+"##;
+
+/// resty.cookie —— 请求 Cookie 解析与 Set-Cookie 生成（对照公开 API 语义手写）。
+const RESTY_COOKIE: &str = r##"
+local _M = {}
+local mt = { __index = _M }
+
+local byte, sub, find, gsub = string.byte, string.sub, string.find, string.gsub
+local concat = table.concat
+local tonumber, tostring, type = tonumber, tostring, type
+
+local function trim(s)
+    return (gsub(s, "^%s*(.-)%s*$", "%1"))
+end
+
+local function parse(str)
+    local cookies = {}
+    if not str or str == "" then
+        return cookies
+    end
+    for pair in (str .. ";"):gmatch("([^;]*);") do
+        local eq = find(pair, "=", 1, true)
+        if eq then
+            local k = trim(sub(pair, 1, eq - 1))
+            local v = trim(sub(pair, eq + 1))
+            if k ~= "" then
+                if #v >= 2 and byte(v, 1) == 34 and byte(v, #v) == 34 then
+                    v = sub(v, 2, #v - 1)
+                end
+                cookies[k] = v
+            end
+        end
+    end
+    return cookies
+end
+
+-- new([cookie_header])：不传则读当前请求的 Cookie 头
+function _M.new(self, cookie_str)
+    if cookie_str == nil then
+        cookie_str = ngx.var.http_cookie
+    end
+    return setmetatable({ _cookies = parse(cookie_str), _raw = cookie_str }, mt)
+end
+
+function _M.get(self, key)
+    local v = self._cookies[key]
+    if v == nil then
+        return nil, "cookie not found"
+    end
+    return v
+end
+
+function _M.get_all(self)
+    if not self._raw or self._raw == "" then
+        return nil, "no cookies found"
+    end
+    local t = {}
+    for k, v in pairs(self._cookies) do
+        t[k] = v
+    end
+    return t
+end
+
+-- 不依赖 os.date/os.time（可能受沙箱影响），按 UTC 手算 epoch 秒。
+local function mktime(t)
+    local year, month, day = tonumber(t.year), tonumber(t.month), tonumber(t.day)
+    if not (year and month and day) then
+        return nil
+    end
+    local hour, min, sec = tonumber(t.hour) or 0, tonumber(t.min) or 0, tonumber(t.sec) or 0
+    local y = month <= 2 and year - 1 or year
+    local era = math.floor(y / 400)
+    local yoe = y - era * 400
+    local mp = (month + 9) % 12
+    local doy = math.floor((153 * mp + 2) / 5) + day - 1
+    local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+    local days = era * 146097 + doe - 719468
+    return days * 86400 + hour * 3600 + min * 60 + sec
+end
+
+local function expires_str(expires)
+    if type(expires) == "number" then
+        return ngx.cookie_time(expires)
+    end
+    if type(expires) == "table" then
+        local ts = mktime(expires)
+        if ts then
+            return ngx.cookie_time(ts)
+        end
+    end
+    return tostring(expires)
+end
+
+local function add_set_cookie(s)
+    local cur = ngx.header["Set-Cookie"]
+    if cur == nil then
+        ngx.header["Set-Cookie"] = s
+    elseif type(cur) == "table" then
+        -- __index 返回的是副本，必须整体重新赋值才能写回响应头集合
+        local list = {}
+        for i = 1, #cur do list[i] = cur[i] end
+        list[#list + 1] = s
+        ngx.header["Set-Cookie"] = list
+    else
+        ngx.header["Set-Cookie"] = { cur, s }
+    end
+end
+
+-- set({ key=..., value=..., path=..., domain=..., expires=..., max_age=...,
+--       secure=..., httponly=..., samesite=..., version=..., comment=... })
+-- value = false 表示删除该 cookie（value 置空 + expires 置过去）。
+function _M.set(self, opts)
+    if type(opts) ~= "table" then
+        return nil, "opts must be a table"
+    end
+    local key = opts.key
+    if not key or key == "" then
+        return nil, "missing cookie key"
+    end
+    local value = opts.value
+    local deleting = value == false
+    if value == nil or deleting then
+        value = ""
+    else
+        value = tostring(value)
+    end
+
+    local parts = { key .. "=" .. value }
+    local path = opts.path
+    if path == nil and not deleting then
+        path = "/"
+    end
+    if path then
+        parts[#parts + 1] = "Path=" .. tostring(path)
+    end
+    if opts.domain then
+        parts[#parts + 1] = "Domain=" .. tostring(opts.domain)
+    end
+    if deleting then
+        parts[#parts + 1] = "Expires=" .. ngx.cookie_time(1)
+        parts[#parts + 1] = "Max-Age=0"
+    else
+        if opts.expires ~= nil then
+            parts[#parts + 1] = "Expires=" .. expires_str(opts.expires)
+        end
+        if opts.max_age ~= nil then
+            parts[#parts + 1] = "Max-Age=" .. tostring(opts.max_age)
+        end
+    end
+    if opts.secure then
+        parts[#parts + 1] = "Secure"
+    end
+    if opts.httponly then
+        parts[#parts + 1] = "HttpOnly"
+    end
+    if opts.samesite then
+        parts[#parts + 1] = "SameSite=" .. tostring(opts.samesite)
+    end
+    if opts.version then
+        parts[#parts + 1] = "Version=" .. tostring(opts.version)
+    end
+    if opts.comment then
+        parts[#parts + 1] = "Comment=" .. tostring(opts.comment)
+    end
+
+    add_set_cookie(concat(parts, "; "))
+    if deleting then
+        self._cookies[key] = nil
+    else
+        self._cookies[key] = value
+    end
+    return true
+end
+
+return _M
+"##;
+
+/// resty.limit.req —— 漏桶限速（rate r/s + burst 余量），语义对齐
+/// lua-resty-limit-traffic 的 resty.limit.req：incoming() 返回需要延迟的秒数，
+/// 超出 burst 返回 nil, "rejected"。
+const RESTY_LIMIT_REQ: &str = r##"
+local _M = {}
+local mt = { __index = _M }
+
+local tonumber, tostring = tonumber, tostring
+local max, ceil = math.max, math.ceil
+
+function _M.new(self, dict_name, rate, burst)
+    local dict = ngx.shared[dict_name]
+    if not dict then
+        return nil, "shared dict not found: " .. tostring(dict_name)
+    end
+    rate = tonumber(rate)
+    burst = tonumber(burst) or 0
+    if not rate or rate <= 0 then
+        return nil, "rate must be positive"
+    end
+    if burst < 0 then
+        return nil, "burst must be non-negative"
+    end
+    return setmetatable({ dict = dict, rate = rate, burst = burst, key = nil }, mt)
+end
+
+local function decode(v)
+    if not v then return 0, 0 end
+    local s = tostring(v)
+    local a, b = s:match("^([%d%.]+),([%d%.]+)$")
+    if not a then return 0, 0 end
+    return tonumber(a) or 0, tonumber(b) or 0
+end
+
+function _M.incoming(self, key, commit)
+    if key == nil then
+        return 0
+    end
+    if commit == nil then
+        commit = false
+    end
+    self.key = key
+    local now = ngx.now() * 1000
+    local last, excess = decode(self.dict:get(key))
+    local elapsed = now - last
+    if elapsed < 0 then elapsed = 0 end
+    excess = max(0, excess - elapsed * self.rate / 1000) + 1
+    if excess > self.burst + 1 then
+        return nil, "rejected"
+    end
+    if commit then
+        local ttl = max(60, ceil((self.burst + 1) / self.rate * 2))
+        self.dict:set(key, tostring(now) .. "," .. tostring(excess), ttl)
+    end
+    if excess <= 1 then
+        return 0
+    end
+    return (excess - 1) / self.rate
+end
+
+function _M.uncommit(self, key)
+    local k = key or self.key
+    if not k then return nil, "no key" end
+    local last, excess = decode(self.dict:get(k))
+    if excess > 0 then
+        self.dict:set(k, tostring(last) .. "," .. tostring(excess - 1), 60)
+    end
+    return true
+end
+
+return _M
+"##;
+
+/// resty.limit.count —— 固定 1 秒窗口计数限流，对齐 resty.limit.count。
+const RESTY_LIMIT_COUNT: &str = r##"
+local _M = {}
+local mt = { __index = _M }
+
+local tonumber, tostring = tonumber, tostring
+local max = math.max
+
+function _M.new(self, dict_name, count)
+    local dict = ngx.shared[dict_name]
+    if not dict then
+        return nil, "shared dict not found: " .. tostring(dict_name)
+    end
+    count = tonumber(count)
+    if not count or count <= 0 then
+        return nil, "count must be positive"
+    end
+    return setmetatable({ dict = dict, count = count, key = nil }, mt)
+end
+
+function _M.incoming(self, key, commit)
+    local dict, count = self.dict, self.count
+    if key == nil then
+        return count
+    end
+    if commit == nil then commit = false end
+    self.key = key
+
+    if not commit then
+        local v = tonumber(dict:get(key)) or 0
+        if v >= count then
+            return nil, "rejected"
+        end
+        return count - v
+    end
+
+    local n
+    local ok = dict:add(key, 1, 1)      -- 1 秒窗口
+    if ok then
+        n = 1
+    else
+        local v, err = dict:incr(key, 1)
+        if not v then
+            return nil, err
+        end
+        n = v
+    end
+    if n > count then
+        return nil, "rejected"
+    end
+    return count - n
+end
+
+function _M.remaining(self, key)
+    local v = tonumber(self.dict:get(key or self.key)) or 0
+    return max(0, self.count - v)
+end
+
+function _M.uncommit(self, key)
+    local k = key or self.key
+    if not k then return nil, "no key" end
+    self.dict:incr(k, -1)
+    return true
+end
+
+return _M
+"##;
+
+/// resty.limit.conn —— 并发连接数限制（incoming/leaving），对齐 resty.limit.conn。
+const RESTY_LIMIT_CONN: &str = r##"
+local _M = {}
+local mt = { __index = _M }
+
+local tonumber, tostring = tonumber, tostring
+local max = math.max
+
+function _M.new(self, dict_name, max_conn, burst)
+    local dict = ngx.shared[dict_name]
+    if not dict then
+        return nil, "shared dict not found: " .. tostring(dict_name)
+    end
+    max_conn = tonumber(max_conn)
+    burst = tonumber(burst) or 0
+    if not max_conn or max_conn <= 0 then
+        return nil, "max connections must be positive"
+    end
+    if burst < 0 then
+        return nil, "burst must be non-negative"
+    end
+    return setmetatable({ dict = dict, max = max_conn, burst = burst, key = nil }, mt)
+end
+
+function _M.incoming(self, key, commit)
+    if key == nil then
+        return 0
+    end
+    if commit == nil then commit = false end
+    self.key = key
+    local dict = self.dict
+    if not commit then
+        local cur = tonumber(dict:get(key)) or 0
+        if cur >= self.max + self.burst then
+            return nil, "rejected"
+        end
+        return cur
+    end
+    local n, err = dict:incr(key, 1, 0)
+    if not n then
+        return nil, err
+    end
+    dict:expire(key, 60)   -- 防止异常退出留下永久计数
+    if n > self.max + self.burst then
+        dict:incr(key, -1)
+        return nil, "rejected"
+    end
+    return n
+end
+
+function _M.leaving(self, key, commit)
+    local k = key or self.key
+    if not k then return nil, "no key" end
+    if commit == false then
+        return 0
+    end
+    local n = self.dict:incr(k, -1)
+    if n == nil then
+        return 0
+    end
+    if n < 0 then
+        self.dict:set(k, 0, 60)
+        return 0
+    end
+    return n
+end
+
+function _M.conn(self, key)
+    local k = key or self.key
+    return max(0, tonumber(self.dict:get(k)) or 0)
+end
+
+return _M
+"##;
+
 /// 这里对 `package`/`preload` 表做存在性兜底，避免个别精简运行时缺表时失败。
 pub fn install_modules(lua: &Lua) -> LuaResult<()> {
     let string_loader = lua.create_function(|lua, _: ()| {
@@ -590,6 +1054,21 @@ pub fn install_modules(lua: &Lua) -> LuaResult<()> {
     })?;
     let redis_loader = lua.create_function(|lua, _: ()| {
         lua.load(RESTY_REDIS).set_name("resty.redis").eval::<LuaValue>()
+    })?;
+    let semaphore_loader = lua.create_function(|lua, _: ()| {
+        lua.load(NGX_SEMAPHORE).set_name("ngx.semaphore").eval::<LuaValue>()
+    })?;
+    let cookie_loader = lua.create_function(|lua, _: ()| {
+        lua.load(RESTY_COOKIE).set_name("resty.cookie").eval::<LuaValue>()
+    })?;
+    let limit_req_loader = lua.create_function(|lua, _: ()| {
+        lua.load(RESTY_LIMIT_REQ).set_name("resty.limit.req").eval::<LuaValue>()
+    })?;
+    let limit_count_loader = lua.create_function(|lua, _: ()| {
+        lua.load(RESTY_LIMIT_COUNT).set_name("resty.limit.count").eval::<LuaValue>()
+    })?;
+    let limit_conn_loader = lua.create_function(|lua, _: ()| {
+        lua.load(RESTY_LIMIT_CONN).set_name("resty.limit.conn").eval::<LuaValue>()
     })?;
 
     let globals = lua.globals();
@@ -613,6 +1092,11 @@ pub fn install_modules(lua: &Lua) -> LuaResult<()> {
     preload.set("resty.lock", lock_loader)?;
     preload.set("resty.http", http_loader)?;
     preload.set("resty.redis", redis_loader)?;
+    preload.set("ngx.semaphore", semaphore_loader)?;
+    preload.set("resty.cookie", cookie_loader)?;
+    preload.set("resty.limit.req", limit_req_loader)?;
+    preload.set("resty.limit.count", limit_count_loader)?;
+    preload.set("resty.limit.conn", limit_conn_loader)?;
     Ok(())
 }
 
@@ -669,6 +1153,143 @@ mod tests {
             .eval()
             .unwrap();
         assert!(res);
+    }
+
+    #[test]
+    fn semaphore_post_wait_and_timeout() {
+        let lua = mlua::Lua::new();
+        install_modules(&lua).unwrap();
+        let ok: bool = lua
+            .load(
+                r#"
+                local t = 0
+                ngx = {
+                    now = function() return t end,
+                    sleep = function(s) t = t + s end,
+                }
+                local sem = require "ngx.semaphore".new(1)
+                assert(sem:count() == 1)
+                assert(sem:wait(0) == true)
+                assert(sem:wait(0) == nil)
+                sem:post(2)
+                assert(sem:count() == 2)
+                assert(sem:wait(0) == true)
+                assert(sem:wait(0) == true)
+                local ok, err = sem:wait(0.005)
+                assert(ok == nil and err == "timeout", "无信号时应超时")
+                assert(t >= 0.005)
+                sem:post()
+                return sem:wait(1) == true
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn cookie_parse_set_and_delete() {
+        let lua = mlua::Lua::new();
+        install_modules(&lua).unwrap();
+        let ok: bool = lua
+            .load(
+                r##"
+                ngx = {
+                    var = { http_cookie = 'a=1; b="x y"; empty=' },
+                    header = {},
+                    cookie_time = function(ts) return "TS(" .. ts .. ")" end,
+                }
+                local m = require "resty.cookie"
+                local ck = m:new()
+                assert(ck:get("a") == "1")
+                assert(ck:get("b") == "x y")
+                assert(ck:get("empty") == "")
+                local _, e = ck:get("missing")
+                assert(e == "cookie not found")
+                local all = ck:get_all()
+                assert(all.a == "1" and all.b == "x y")
+
+                assert(ck:set({ key = "s", value = "v", httponly = true, secure = true,
+                                max_age = 60, expires = 1700000000 }))
+                local sc = ngx.header["Set-Cookie"]
+                assert(type(sc) == "string" and sc:find("HttpOnly", 1, true)
+                       and sc:find("Secure", 1, true) and sc:find("Path=/", 1, true)
+                       and sc:find("Max%-Age=60") and sc:find("Expires=TS%(1700000000%)"))
+                assert(ck:get("s") == "v")
+
+                assert(ck:set({ key = "s", value = false }))
+                local list = ngx.header["Set-Cookie"]
+                assert(type(list) == "table" and #list == 2, "删除应追加第二条 Set-Cookie")
+                assert(list[2]:find("Max%-Age=0") and list[2]:find("TS%(1%)"))
+                assert(ck:get("s") == nil)
+                return true
+                "##,
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn limit_req_count_conn_semantics() {
+        let lua = mlua::Lua::new();
+        install_modules(&lua).unwrap();
+        let ok: bool = lua
+            .load(
+                r#"
+                local now = 0
+                local store = {}
+                local dict = {}
+                function dict:get(k) return store[k] end
+                function dict:set(k, v, ex) store[k] = v; return true end
+                function dict:add(k, v, ex)
+                    if store[k] ~= nil then return false, "exists" end
+                    store[k] = v
+                    return true
+                end
+                function dict:incr(k, d)
+                    local v = (tonumber(store[k]) or 0) + (d or 1)
+                    store[k] = v
+                    return v
+                end
+                function dict:expire(k, ex) return store[k] ~= nil end
+                ngx = { now = function() return now end, shared = { test = dict } }
+
+                -- 漏桶：rate=2/s, burst=1
+                local req = require "resty.limit.req"
+                local lim = assert(req:new("test", 2, 1))
+                assert(lim:incoming("r", true) == 0)
+                local d = assert(lim:incoming("r", true))
+                assert(math.abs(d - 0.5) < 1e-9, "第二个请求应延迟 0.5s，实际 " .. d)
+                local x, err = lim:incoming("r", true)
+                assert(x == nil and err == "rejected")
+                -- commit=false 不消耗
+                local y = assert(lim:incoming("r2", false))
+                assert(y == 0 and store["r2"] == nil)
+
+                -- 计数：窗口内 2 次
+                local count = require "resty.limit.count"
+                local cl = assert(count:new("test", 2))
+                assert(cl:incoming("c", true) == 1)
+                assert(cl:incoming("c", true) == 0)
+                local cr, ce = cl:incoming("c", true)
+                assert(cr == nil and ce == "rejected")
+                assert(cl:remaining("c") == 0)
+
+                -- 并发：max=1, burst=0
+                local conn = require "resty.limit.conn"
+                local co = assert(conn:new("test", 1, 0))
+                assert(co:incoming("x", true) == 1)
+                local nr, ne = co:incoming("x", true)
+                assert(nr == nil and ne == "rejected")
+                assert(co:leaving("x") == 0)
+                assert(co:conn("x") == 0)
+                return true
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
     }
 
     #[test]

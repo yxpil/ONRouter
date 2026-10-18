@@ -4,7 +4,7 @@ import subprocess, sys, time, os, threading
 import urllib.request, urllib.error
 import ssl as _ssl
 
-RUST = r"C:\Users\User\Desktop\LearnON\rust"
+RUST = os.path.dirname(os.path.abspath(__file__))
 BASE = "http://127.0.0.1:8080"
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -58,7 +58,7 @@ HTTPServer(('127.0.0.1',9001),B).serve_forever()
             for _ in range(n):
                 try:
                     st, b = req("/api/slow")
-                    if st != 200 or b"100ms" not in b:
+                    if st != 200 or b"slept" not in b:
                         errors.append(f"/api/slow {st}")
                 except Exception as e:
                     errors.append(f"/api/slow {type(e).__name__}")

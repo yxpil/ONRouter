@@ -23,7 +23,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use crate::router::StreamServer;
-use crate::upstream::UpstreamPool;
+use crate::upstream::{UpstreamGuard, UpstreamPool};
 use crate::{log_debug, log_error, log_info, log_warn};
 
 /// 窥探 ClientHello 的最大缓冲（16KB 足够容纳带大量扩展的握手第一条记录）。
@@ -140,17 +140,25 @@ pub fn pick_sni_target(srv: &StreamServer, sni: Option<&str>) -> Option<String> 
 
 /// 把 proxy_pass 目标解析成一个可 connect 的 "host:port" 串：
 /// 命中命名 upstream 则按池选一个节点，否则当作字面地址原样返回。
-fn resolve_target(pool: &UpstreamPool, spec: &str, client_ip: &str) -> Option<String> {
+/// 返回的 guard 必须由调用方持有到隧道结束，`max_conns` 的额度才覆盖整条连接。
+fn resolve_target(
+    pool: &UpstreamPool,
+    spec: &str,
+    client_ip: &str,
+) -> Option<(String, Option<UpstreamGuard>)> {
     if let Some(up) = pool.get(spec) {
         let guard = up.acquire(client_ip, &[])?;
         // UpstreamGuard Deref<Target=String> 到节点 addr
-        return Some((*guard).clone());
+        let addr = (*guard).clone();
+        return Some((addr, Some(guard)));
     }
-    Some(spec.to_string())
+    Some((spec.to_string(), None))
 }
 
-/// 四层监听 accept 循环（结构与 server.rs::serve 对齐：优雅停机、accept 退避、JoinSet 排空）。
+/// 四层监听 accept 循环（结构与 server.rs::serve 对齐：worker_connections 额度、
+/// 活跃连接指标、优雅停机、accept 退避、JoinSet 排空）。
 pub async fn serve_stream(
+    state: Arc<crate::server::AppState>,
     pool: Arc<UpstreamPool>,
     srv: Arc<StreamServer>,
     tcp: TcpListener,
@@ -171,13 +179,26 @@ pub async fn serve_stream(
         let accepted = tokio::select! {
             _ = shutdown.changed() => break,
             r = tcp.accept() => r,
+            // 回收已完成的隧道任务，避免长跑进程里 JoinSet 只增不减
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
         };
         match accepted {
             Ok((stream, peer)) => {
                 backoff = Duration::from_millis(1);
+                crate::metrics::get().on_accept();
                 let pool = Arc::clone(&pool);
+                let state = Arc::clone(&state);
                 let srv = Arc::clone(&srv);
                 tasks.spawn(async move {
+                    // 与 HTTP 共用 worker_connections 额度：拿不到就立刻断开，不排队、不耗 fd
+                    let Ok(_permit) = state.permits.clone().try_acquire_owned() else {
+                        log_debug!(
+                            "stream {} 连接数已达 worker_connections，拒绝 {peer}",
+                            srv.listen
+                        );
+                        return;
+                    };
+                    let _active = crate::metrics::ActiveConnGuard::new(crate::metrics::get());
                     handle_connection(pool, srv, stream, peer).await;
                 });
             }
@@ -191,17 +212,9 @@ pub async fn serve_stream(
             }
         }
     }
-    // 停机：给在途隧道一个短暂排空窗口后强制结束
-    let grace = Duration::from_millis(200);
-    let started = std::time::Instant::now();
-    while !tasks.is_empty() && started.elapsed() < grace {
-        tokio::select! {
-            _ = tasks.join_next() => {}
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-    }
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+    // 与 HTTP 同语义：先关监听（新连接立即被拒），再在 shutdown_grace 内等隧道自然结束
+    drop(tcp);
+    crate::server::drain_connections(&mut tasks, state.settings.shutdown_grace, addr).await;
 }
 
 /// 单条连接：窥探（可选）→ 选目标 → 连接后端 → 字节双向接力。
@@ -233,7 +246,7 @@ async fn handle_connection(
             return;
         }
     };
-    let spec = match resolve_target(&pool, &target, &client_ip) {
+    let (spec, upstream_guard) = match resolve_target(&pool, &target, &client_ip) {
         Some(s) => s,
         None => {
             log_warn!("stream 目标 {target} 无可用后端节点（no live upstreams）");
@@ -241,8 +254,17 @@ async fn handle_connection(
         }
     };
     let mut backend = match connect_with_timeout(&spec, srv.connect_timeout).await {
-        Ok(b) => b,
+        Ok(b) => {
+            // 连接成功即视为节点存活（被动健康检查）；隧道期间的 max_conns 由 guard 持有
+            if let Some(g) = &upstream_guard {
+                g.note_success();
+            }
+            b
+        }
         Err(e) => {
+            if let Some(g) = &upstream_guard {
+                g.note_failure();
+            }
             log_error!("stream 连接后端 {spec} 失败: {e}");
             return;
         }
@@ -253,6 +275,8 @@ async fn handle_connection(
         return;
     }
     relay(client, backend, srv.proxy_timeout).await;
+    // guard 在这里释放：upstream 的 conns 计数覆盖整条隧道，而不是只覆盖 connect
+    drop(upstream_guard);
 }
 
 /// 窥探开头字节：读到一条完整 TLS 记录或封顶/超时为止；非 TLS 也返回已读到的内容。
@@ -295,23 +319,26 @@ async fn connect_with_timeout(spec: &str, timeout: Duration) -> std::io::Result<
     }
 }
 
-/// 双向接力：两个方向各一个任务，任一方向读空闲超过 idle（0=不限）或 EOF/错误即结束。
+/// 双向接力：两个方向在同一任务内并发（join），任一方向读空闲超过 idle（0=不限）
+/// 或 EOF/错误即结束本方向。不用 `tokio::spawn`：外层连接任务被停机 abort 时，
+/// 两个方向会一起被取消，不会留下持有半条 socket 的孤儿任务。
 async fn relay(client: TcpStream, backend: TcpStream, idle: Duration) {
     let (mut cr, mut cw) = client.into_split();
     let (mut br, mut bw) = backend.into_split();
-    let to_client = tokio::spawn(async move {
+    let to_client = async {
         pump(&mut br, &mut cw, idle).await;
+        // 后端 EOF：向客户端发 FIN，让对端知道响应结束
         let _ = cw.shutdown().await;
-    });
-    let to_backend = tokio::spawn(async move {
+    };
+    let to_backend = async {
         pump(&mut cr, &mut bw, idle).await;
         let _ = bw.shutdown().await;
-    });
-    let _ = tokio::join!(to_client, to_backend);
+    };
+    tokio::join!(to_client, to_backend);
 }
 
-/// 单向泵：read→write 直到 EOF/错误/空闲超时。
-async fn pump<R, W>(r: &mut R, w: &mut W, idle: Duration)
+/// 单向泵：read→write 直到 EOF/错误/空闲超时（WebSocket 隧道也复用）。
+pub(crate) async fn pump<R, W>(r: &mut R, w: &mut W, idle: Duration)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,

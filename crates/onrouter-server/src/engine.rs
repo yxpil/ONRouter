@@ -11,13 +11,65 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures_util::future::BoxFuture;
+use tokio::sync::mpsc;
 
 use onrouter_config::Directive;
 
 use crate::AppError;
 
+/// 流式响应的帧：Head 只在最前面出现一次，之后都是 Data，End 表示脚本收尾、
+/// 响应体到此为止（不依赖发送端全部 drop，便于 log 阶段继续持有 ctx）。
+#[derive(Debug)]
+pub enum StreamEvent {
+    Head {
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
+    Data(Bytes),
+    End,
+}
+
+/// content_by_lua 的流式输出口（ngx.flush 或输出越过阈值后启用）。
+/// 发送端是有界通道：脚本同步调用 ngx.flush 时 try_send，通道满则把字节留在
+/// ctx.body 里等下次；脚本结束后由后台任务 await 补发剩余数据，保证不丢字节。
+#[derive(Debug, Clone)]
+pub struct StreamSink {
+    pub tx: mpsc::Sender<StreamEvent>,
+    /// Head 快照要合并的 add_header（location 覆盖 server）
+    pub extra_headers: Vec<(String, String)>,
+    head_sent: bool,
+}
+
+impl StreamSink {
+    pub fn new(tx: mpsc::Sender<StreamEvent>, extra_headers: Vec<(String, String)>) -> Self {
+        Self {
+            tx,
+            extra_headers,
+            head_sent: false,
+        }
+    }
+}
+
+/// 自动冲刷阈值：ngx.say/print 的缓冲超过它就先发一帧，避免脚本忘写 ngx.flush
+/// 时整段响应都等脚本跑完（对齐 nginx 输出缓冲上限的直觉）。
+pub const STREAM_AUTO_FLUSH_BYTES: usize = 64 * 1024;
+
 // ---------- 请求上下文（贯穿 rewrite -> access -> content） ----------
+
+/// ssl_certificate_by_lua 阶段的握手状态：SNI、脚本选出的证书/私钥、是否清空或中止。
+/// 只在握手期间挂在 ctx 上（普通请求为 None），ngx.ssl.* 通过它读写。
+#[derive(Debug, Clone, Default)]
+pub struct SslState {
+    pub server_name: Option<String>,
+    pub cert_chain: Option<Vec<Vec<u8>>>,
+    pub priv_key: Option<Vec<u8>>,
+    /// 脚本调用 clear_certs() 后置位：未再设置新证书则握手失败（与 OpenResty 一致）
+    pub cleared: bool,
+    /// 脚本 ngx.exit(负数错误码) 中止握手
+    pub aborted: bool,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct RequestCtx {
@@ -40,11 +92,15 @@ pub struct RequestCtx {
     pub status: u16,
     /// 生成式响应体（return / rust handler 产出）
     pub body: Option<Vec<u8>>,
+    /// 流式输出口：只有 content_by_lua 且无 header/body filter 时才装上
+    pub stream: Option<StreamSink>,
     pub done: bool,
     /// rewrite ... last 触发的内部重定向
     pub internal_redirect: bool,
     /// 请求体（当前缓冲式读取；供 Lua 读取与代理转发）
-    pub req_body: Vec<u8>,
+    /// 用 Bytes 而不是 Vec：入口克隆/LOG 阶段克隆 ctx 都是 O(1)，且 Bytes 不可变，
+    /// 代理前可用"指针相同"快速判定 Lua 没有改写，无需每次请求再 memcmp 一遍。
+    pub req_body: Bytes,
     /// ngx.exec 内部重定向深度
     pub exec_depth: u8,
     /// rewrite ... redirect/permanent 触发的外部重定向
@@ -74,11 +130,134 @@ pub struct RequestCtx {
     pub upstream_status: u16,
     /// 后端"连接+发送+等到响应头"的耗时秒数（供 $upstream_header_time / $upstream_response_time）
     pub upstream_header_time: f64,
+    /// SSL 握手阶段状态；仅 ssl_certificate_by_lua 执行期间为 Some
+    pub ssl: Option<SslState>,
+    /// 请求到达时间（epoch 秒），供 `ngx.req.start_time()` / `$request_time`
+    pub start_time: f64,
+    /// HTTP 版本（1.0 / 1.1 / 2.0 / 3.0），供 `ngx.req.http_version()`
+    pub http_version: f64,
+    /// `ngx.req.init_body` / `append_body` 的构造缓冲；`finish_body` 提交到 req_body
+    pub body_builder: Option<Vec<u8>>,
+    /// `ngx.eof()` 已结束响应：后续 `ngx.print/say` 输出丢弃
+    pub eof_sent: bool,
 }
 
 impl RequestCtx {
     pub fn effective_path(&self) -> &str {
         self.rewritten_path.as_deref().unwrap_or(&self.path)
+    }
+
+    /// Lua 的 ngx.say/ngx.print 输出入口：流式模式下越过阈值自动推一帧。
+    pub fn lua_output(&mut self, bytes: &[u8]) {
+        if self.eof_sent {
+            return;
+        }
+        self.body.get_or_insert_with(Vec::new).extend_from_slice(bytes);
+        if self.stream.is_some()
+            && self
+                .body
+                .as_ref()
+                .is_some_and(|b| b.len() >= STREAM_AUTO_FLUSH_BYTES)
+        {
+            self.flush_stream();
+        }
+    }
+
+    /// 把已缓冲的输出推给流式通道；首帧先推 Head 快照（状态 + 头 + add_header）。
+    /// 返回 true 表示缓冲已清空。通道满时数据留在 body 里，下次再推。
+    pub fn flush_stream(&mut self) -> bool {
+        if self.stream.is_none() {
+            return false;
+        }
+        if !self.stream.as_ref().is_some_and(|s| s.head_sent) {
+            let status = self.status;
+            let mut headers = self.resp_headers.clone();
+            if let Some(sink) = &self.stream {
+                for (k, v) in &sink.extra_headers {
+                    if !headers.iter().any(|(ek, _)| ek.eq_ignore_ascii_case(k)) {
+                        headers.push((k.clone(), v.clone()));
+                    }
+                }
+            }
+            if !(100..200).contains(&status)
+                && status != 204
+                && status != 304
+                && !headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            {
+                headers.push(("content-type".into(), "text/plain; charset=utf-8".into()));
+            }
+            let sent = self
+                .stream
+                .as_ref()
+                .is_some_and(|s| s.tx.try_send(StreamEvent::Head { status, headers }).is_ok());
+            if !sent {
+                return false;
+            }
+            if let Some(s) = self.stream.as_mut() {
+                s.head_sent = true;
+            }
+        }
+        let Some(body) = self.body.take() else {
+            return true;
+        };
+        if body.is_empty() {
+            return true;
+        }
+        let frame = StreamEvent::Data(Bytes::from(body));
+        match self.stream.as_ref().unwrap().tx.try_send(frame) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(StreamEvent::Data(b))) => {
+                self.body = Some(b.to_vec());
+                false
+            }
+            Err(_) => {
+                self.stream = None;
+                false
+            }
+        }
+    }
+
+    /// 响应头是否已经发给客户端（`ngx.headers_sent`）
+    pub fn headers_sent(&self) -> bool {
+        self.stream.as_ref().is_some_and(|s| s.head_sent)
+    }
+
+    /// ngx.eof()：结束输出流。已发送响应头时立即推完剩余字节并结束流；
+    /// 通道拥塞时保留 stream，交给脚本结束后的 drain_and_end_stream 补发。
+    pub fn eof_stream(&mut self) {
+        self.eof_sent = true;
+        if self.stream.is_none() {
+            return;
+        }
+        if self.flush_stream() {
+            if let Some(sink) = &self.stream {
+                let _ = sink.tx.try_send(StreamEvent::End);
+            }
+            self.stream = None;
+        }
+    }
+
+    /// 脚本结束后的收尾：把通道满时退回缓冲的剩余字节 await 补发完，再发 End。
+    /// 只有已经开始流式输出的请求会走到这里。
+    pub async fn drain_and_end_stream(&mut self) {
+        let Some(sink) = self.stream.take() else {
+            return;
+        };
+        if let Some(body) = self.body.take() {
+            for chunk in body.chunks(STREAM_AUTO_FLUSH_BYTES) {
+                if sink
+                    .tx
+                    .send(StreamEvent::Data(Bytes::copy_from_slice(chunk)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        let _ = sink.tx.send(StreamEvent::End).await;
     }
 
     /// 定时器/后台任务用的游离上下文：不属于任何请求，ngx.say 等写入落到这里被丢弃
@@ -98,9 +277,10 @@ impl RequestCtx {
             rewritten_path: None,
             status: 200,
             body: None,
+            stream: None,
             done: false,
             internal_redirect: false,
-            req_body: Vec::new(),
+            req_body: Bytes::new(),
             exec_depth: 0,
             redirect: None,
             scheme: "http".to_string(),
@@ -116,6 +296,11 @@ impl RequestCtx {
             upstream_addr: String::new(),
             upstream_status: 0,
             upstream_header_time: 0.0,
+            ssl: None,
+            start_time: unix_now(),
+            http_version: 1.1,
+            body_builder: None,
+            eof_sent: false,
         }
     }
 
@@ -167,25 +352,25 @@ pub struct MapDef {
     pub cases: Vec<MapCase>,
 }
 
-static MAPS: std::sync::OnceLock<std::sync::RwLock<Vec<MapDef>>> = std::sync::OnceLock::new();
+/// map/geo/split 的派生定义按 Arc 存放：热路径每次解析变量时只克隆一个引用，
+/// 不再把整张规则表（含编译好的正则）复制一遍。
+static MAPS: std::sync::OnceLock<std::sync::RwLock<Vec<Arc<MapDef>>>> = std::sync::OnceLock::new();
 
-fn map_store() -> &'static std::sync::RwLock<Vec<MapDef>> {
+fn map_store() -> &'static std::sync::RwLock<Vec<Arc<MapDef>>> {
     MAPS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
 }
 
 /// 由 Router::build 在每次（含热重载）构建路由表时调用，原子替换整张 map 表。
 pub fn install_maps(defs: Vec<MapDef>) {
-    *map_store().write().unwrap() = defs;
+    *map_store().write().unwrap() = defs.into_iter().map(Arc::new).collect();
 }
 
-/// 已安装的 map + geo + split_clients 目标变量名集合，供 proxy 变量插值按名替换（长名优先，防前缀吞并）。
-pub fn mapped_dests_sorted() -> Vec<String> {
-    let mut v: Vec<String> = map_store().read().unwrap().iter().map(|d| d.dest.clone()).collect();
-    v.extend(geo_store().read().unwrap().iter().map(|d| d.dest.clone()));
-    v.extend(split_store().read().unwrap().iter().map(|d| d.dest.clone()));
-    v.sort_by(|a, b| b.len().cmp(&a.len()));
-    v.dedup();
-    v
+/// 当前时间（epoch 秒，含小数）。
+pub fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// 内置 nginx 变量读取（`$uri` / `$http_*` / `$sent_http_*` / `$status` 等）。
@@ -207,6 +392,12 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
             .find(|(k, _)| k.eq_ignore_ascii_case(&want))
             .map(|(_, v)| v.clone());
     }
+    if let Some(arg) = name.strip_prefix("arg_") {
+        return query_arg(ctx, arg);
+    }
+    if let Some(cookie) = name.strip_prefix("cookie_") {
+        return cookie_value(ctx, cookie);
+    }
     match name {
         "remote_addr" => Some(ctx.remote_addr.clone()),
         "remote_port" => Some(ctx.remote_port.to_string()),
@@ -218,6 +409,8 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
         "args" | "query_string" => Some(ctx.query.clone()),
         "is_args" => Some(if ctx.query.is_empty() { String::new() } else { "?".to_string() }),
         "host" => ctx.host.clone(),
+        // 仅 SSL 握手阶段的 ctx 持有 SNI；普通请求未把连接的 SNI 带进 ctx（返回空）
+        "ssl_server_name" => ctx.ssl.as_ref().and_then(|s| s.server_name.clone()),
         "status" => Some(ctx.status.to_string()),
         "body_bytes_sent" => Some(ctx.body.as_ref().map(|b| b.len()).unwrap_or(0).to_string()),
         "content_type" => ctx
@@ -230,6 +423,25 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
                 + ctx.req_headers.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>())
                 .to_string(),
         ),
+        "content_length" => ctx
+            .req_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .map(|(_, v)| v.clone()),
+        "request_body" => Some(String::from_utf8_lossy(&ctx.req_body).into_owned()),
+        "request_time" => Some(format!("{:.3}", (unix_now() - ctx.start_time).max(0.0))),
+        "msec" => Some(format!("{:.3}", unix_now())),
+        "time_local" => Some(chrono::Local::now().format("%d/%b/%Y:%H:%M:%S %z").to_string()),
+        "time_iso8601" => Some(chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string()),
+        "https" => Some(if ctx.scheme.eq_ignore_ascii_case("https") { "on" } else { "" }.to_string()),
+        "server_addr" => ctx.listener.map(|a| a.ip().to_string()),
+        "proxy_add_x_forwarded_for" => Some(match ctx.header("x-forwarded-for") {
+            Some(prior) if !prior.trim().is_empty() => format!("{prior}, {}", ctx.remote_addr),
+            _ => ctx.remote_addr.clone(),
+        }),
+        "hostname" => std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .ok(),
         "upstream_addr" => Some(ctx.upstream_addr.clone()),
         "upstream_status" => Some(ctx.upstream_status.to_string()),
         "upstream_header_time" | "upstream_response_time" => {
@@ -237,6 +449,46 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// 从 query 串里取一个参数（百分号解码，`+` 视为空格）；重复参数取第一个。
+fn query_arg(ctx: &RequestCtx, name: &str) -> Option<String> {
+    ctx.query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        (percent_decode(k) == name).then(|| percent_decode(v))
+    })
+}
+
+/// 从 Cookie 请求头里取一个 cookie 值（键名大小写敏感，与 nginx `$cookie_<name>` 一致）。
+fn cookie_value(ctx: &RequestCtx, name: &str) -> Option<String> {
+    let raw = ctx.header("cookie")?;
+    raw.split(';').find_map(|part| {
+        let (k, v) = part.trim().split_once('=')?;
+        (k == name).then(|| v.trim().to_string())
+    })
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+                if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+            }
+            b'+' => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// 解析变量 `$name`：优先内置 map 目标，其次 geo 目标，最后内置变量表。
@@ -360,15 +612,15 @@ pub struct GeoDef {
     pub rules: Vec<GeoRule>,
 }
 
-static GEOS: std::sync::OnceLock<std::sync::RwLock<Vec<GeoDef>>> = std::sync::OnceLock::new();
+static GEOS: std::sync::OnceLock<std::sync::RwLock<Vec<Arc<GeoDef>>>> = std::sync::OnceLock::new();
 
-fn geo_store() -> &'static std::sync::RwLock<Vec<GeoDef>> {
+fn geo_store() -> &'static std::sync::RwLock<Vec<Arc<GeoDef>>> {
     GEOS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
 }
 
 /// 由 Router::build 在每次构建路由表时原子替换（与 map 一样热重载安全）。
 pub fn install_geos(defs: Vec<GeoDef>) {
-    *geo_store().write().unwrap() = defs;
+    *geo_store().write().unwrap() = defs.into_iter().map(Arc::new).collect();
 }
 
 /// `target` 是否落在 `rule` 的网络内。族不同直接判否（v4 目标只匹配 v4 规则，反之亦然）。
@@ -440,16 +692,16 @@ pub struct SplitDef {
     pub star: Option<String>,
 }
 
-static SPLITS: std::sync::OnceLock<std::sync::RwLock<Vec<SplitDef>>> =
+static SPLITS: std::sync::OnceLock<std::sync::RwLock<Vec<Arc<SplitDef>>>> =
     std::sync::OnceLock::new();
 
-fn split_store() -> &'static std::sync::RwLock<Vec<SplitDef>> {
+fn split_store() -> &'static std::sync::RwLock<Vec<Arc<SplitDef>>> {
     SPLITS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
 }
 
 /// 由 Router::build 在每次构建路由表时原子替换（与 map/geo 一样热重载安全）。
 pub fn install_splits(defs: Vec<SplitDef>) {
-    *split_store().write().unwrap() = defs;
+    *split_store().write().unwrap() = defs.into_iter().map(Arc::new).collect();
 }
 
 /// nginx `ngx_murmur_hash2` 的等价实现（32 位，MurmurHash2，小端读入）。

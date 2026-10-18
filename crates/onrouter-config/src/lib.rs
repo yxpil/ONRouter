@@ -105,9 +105,235 @@ impl Config {
 
 /// 解析一段配置文本为指令列表（不做 http{} 展平、不做 include 展开——由调用方处理）。
 fn parse_fragment(input: &str) -> Result<Vec<Directive>, ConfigError> {
-    let tokens = lex(input)?;
+    let rewritten = rewrite_lua_blocks(input)?;
+    let tokens = lex(&rewritten)?;
     let mut parser = Parser { tokens, pos: 0 };
     parser.parse_block(None)
+}
+
+// ---------- *_by_lua_block 预处理 ----------
+//
+// OpenResty 的 `content_by_lua_block { ...lua... }` 里是裸 Lua 源码：块内可能出现
+// `}`、`;`、`#`、引号和注释，直接交给 nginx 风格词法器会被切碎。这里在词法分析前
+// 把块替换成等价的 `content_by_lua "…转义后的 Lua…";`，后续解析器无需感知 Lua。
+// 替换时保留块内换行数，使后续指令的 line 仍与原文件一致。
+
+/// 把 `*_by_lua_block { <lua> }` 改写为 `*_by_lua "<lua>";`。
+fn rewrite_lua_blocks(input: &str) -> Result<String, ConfigError> {
+    let bytes = input.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut i = 0usize;
+    let mut line = 1usize;
+    let mut at_stmt_start = true;
+    // (基础指令名, 指令起始行)，如 ("content_by_lua", 12)
+    let mut pending: Option<(String, usize)> = None;
+
+    while i < n {
+        let b = bytes[i];
+        match b {
+            b'\n' => {
+                out.push('\n');
+                line += 1;
+                i += 1;
+            }
+            _ if b.is_ascii_whitespace() => {
+                out.push(b as char);
+                i += 1;
+            }
+            b'#' => {
+                let start = i;
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                out.push_str(&input[start..i]);
+            }
+            b'"' | b'\'' => {
+                let start = i;
+                i = skip_config_quoted(bytes, i);
+                out.push_str(&input[start..i]);
+                at_stmt_start = false;
+            }
+            b'{' => {
+                if let Some((base, dir_line)) = pending.take() {
+                    let content_start = i + 1;
+                    let (content_end, after_close) =
+                        capture_lua_block(bytes, content_start).ok_or_else(|| ConfigError::Parse {
+                            line: dir_line,
+                            message: format!("Lua 块缺少 '}}'（directive '{base}_block'）"),
+                        })?;
+                    let lua = &input[content_start..content_end];
+                    let newlines = lua.bytes().filter(|&c| c == b'\n').count();
+                    out.push('"');
+                    escape_lua_into(lua, &mut out);
+                    out.push_str("\";");
+                    // 补回块内换行，保证后续指令行号不变
+                    for _ in 0..newlines {
+                        out.push('\n');
+                    }
+                    line += newlines;
+                    i = after_close;
+                } else {
+                    out.push('{');
+                    i += 1;
+                }
+                at_stmt_start = true;
+            }
+            b'}' | b';' => {
+                out.push(b as char);
+                i += 1;
+                at_stmt_start = true;
+                pending = None;
+            }
+            _ => {
+                let start = i;
+                while i < n {
+                    let c = bytes[i];
+                    if c.is_ascii_whitespace()
+                        || matches!(c, b'{' | b'}' | b';' | b'#' | b'"' | b'\'')
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                let word = &input[start..i];
+                if at_stmt_start && word.ends_with("_by_lua_block") {
+                    let base = &word[..word.len() - "_block".len()];
+                    out.push_str(base);
+                    pending = Some((base.to_string(), line));
+                } else {
+                    out.push_str(word);
+                }
+                at_stmt_start = false;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 跳过配置层的引号字符串（与 lexer 相同的转义规则），返回闭合引号之后的位置。
+fn skip_config_quoted(bytes: &[u8], mut i: usize) -> usize {
+    let quote = bytes[i];
+    i += 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// 从 `{` 之后开始扫描 Lua 源码，返回 (闭合 `}` 的位置, 闭合之后的位置)。
+/// 理解短字符串、长括号字符串 `[=[...]=]`、行注释与嵌套表花括号。
+fn capture_lua_block(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => i = skip_lua_short_string(bytes, i),
+            b'[' => match skip_lua_long_bracket(bytes, i) {
+                Some(after) => i = after,
+                None => i += 1,
+            },
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i += 2;
+                match skip_lua_long_bracket(bytes, i) {
+                    Some(after) => i = after,
+                    None => {
+                        while i < bytes.len() && bytes[i] != b'\n' {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((i, i + 1));
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn skip_lua_short_string(bytes: &[u8], mut i: usize) -> usize {
+    let quote = bytes[i];
+    i += 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i = (i + 2).min(bytes.len()),
+            c if c == quote => return i + 1,
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+/// 若 `bytes[i]` 起是 Lua 长括号（`[[`、`[=[` …），返回配对闭合之后的位置。
+fn skip_lua_long_bracket(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'[') {
+        return None;
+    }
+    let mut i = start + 1;
+    let mut eq = 0usize;
+    while i < bytes.len() && bytes[i] == b'=' {
+        eq += 1;
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'[' {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() {
+        if bytes[i] == b']' {
+            let mut j = i + 1;
+            let mut k = 0usize;
+            while j < bytes.len() && k < eq && bytes[j] == b'=' {
+                k += 1;
+                j += 1;
+            }
+            if k == eq && j < bytes.len() && bytes[j] == b']' {
+                return Some(j + 1);
+            }
+        }
+        i += 1;
+    }
+    // 未闭合的长括号：吞掉剩余内容，交给 Lua 运行时报语法错
+    Some(bytes.len())
+}
+
+/// 把 Lua 源码转义成配置 lexer 能还原的引号串内容。
+fn escape_lua_into(code: &str, out: &mut String) {
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                    out.push_str("\\n");
+                } else {
+                    out.push_str("\\r");
+                }
+            }
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
 }
 
 /// `include` 最大递归深度（防止自包含 / 环）——对齐 nginx "cyclic include" 保护的意图。
@@ -478,6 +704,116 @@ mod tests {
         // 空模式的结果参数
         let empty = m.block.iter().find(|d| d.name == "").unwrap();
         assert_eq!(empty.arg(0), Some("close"));
+    }
+
+    fn lua_of(cfg: &Config, name: &str) -> String {
+        let server = cfg.servers().next().unwrap();
+        let loc = server.block.iter().find(|d| d.name == "location").unwrap();
+        loc.find(name).unwrap().arg(0).unwrap().to_string()
+    }
+
+    #[test]
+    fn lua_block_becomes_inline_lua_directive() {
+        let cfg = Config::parse(
+            r#"
+            init_by_lua_block { local x = 1 }
+
+            server {
+                location / {
+                    content_by_lua_block {
+                        ngx.say("hi")
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let init = cfg.root.block.iter().find(|d| d.name == "init_by_lua").unwrap();
+        assert_eq!(init.arg(0).unwrap().trim(), "local x = 1");
+        let lua = lua_of(&cfg, "content_by_lua");
+        assert!(lua.contains(r#"ngx.say("hi")"#), "{lua:?}");
+        // 原指令块不应残留
+        let server = cfg.servers().next().unwrap();
+        let loc = server.block.iter().find(|d| d.name == "location").unwrap();
+        assert!(loc.find("content_by_lua_block").is_none());
+    }
+
+    #[test]
+    fn lua_block_understands_nested_tables_strings_and_comments() {
+        let cfg = Config::parse(
+            r#"
+            server {
+                location / {
+                    content_by_lua_block {
+                        local t = { a = 1, b = { c = "}" } }
+                        -- comment with } and ;
+                        local s = [[ long } string ]]
+                        local n = #t
+                        ngx.say("ok; { }")
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let lua = lua_of(&cfg, "content_by_lua");
+        assert!(lua.contains(r#"b = { c = "}" }"#), "{lua:?}");
+        assert!(lua.contains("-- comment with } and ;"), "{lua:?}");
+        assert!(lua.contains("[[ long } string ]]"), "{lua:?}");
+        assert!(lua.contains("local n = #t"), "{lua:?}");
+        assert!(lua.contains(r#"ngx.say("ok; { }")"#), "{lua:?}");
+    }
+
+    #[test]
+    fn lua_block_understands_long_brackets_and_single_quotes() {
+        let cfg = Config::parse(
+            "server { location / { content_by_lua_block {\n\
+             --[==[ long } comment ; # ]==]\n\
+             local x = [=[a ]= b]=]\n\
+             local y = 'it\\'s a } brace'\n\
+             ngx.say(x, y)\n\
+             } } }",
+        )
+        .unwrap();
+        let lua = lua_of(&cfg, "content_by_lua");
+        assert!(lua.contains("--[==[ long } comment ; # ]==]"), "{lua:?}");
+        assert!(lua.contains("[=[a ]= b]=]"), "{lua:?}");
+        assert!(lua.contains(r"local y = 'it\'s a } brace'"), "{lua:?}");
+    }
+
+    #[test]
+    fn lua_block_preserves_escape_sequences() {
+        let cfg = Config::parse(
+            r#"server { location / { content_by_lua_block { ngx.say("a\nb\t\"c\"") } } }"#,
+        )
+        .unwrap();
+        let lua = lua_of(&cfg, "content_by_lua");
+        assert!(lua.contains(r#"ngx.say("a\nb\t\"c\"")"#), "{lua:?}");
+    }
+
+    #[test]
+    fn lua_block_preserves_following_line_numbers() {
+        let src = "server {\n\
+                   \x20 location / {\n\
+                   \x20   content_by_lua_block {\n\
+                   \x20     ngx.say(1)\n\
+                   \x20     ngx.say(2)\n\
+                   \x20   }\n\
+                   \x20   return 204;\n\
+                   \x20 }\n\
+                   }\n";
+        let cfg = Config::parse(src).unwrap();
+        let server = cfg.servers().next().unwrap();
+        let loc = server.block.iter().find(|d| d.name == "location").unwrap();
+        assert_eq!(loc.find("content_by_lua").unwrap().line, 3);
+        assert_eq!(loc.find("return").unwrap().line, 7);
+    }
+
+    #[test]
+    fn lua_block_requires_closing_brace() {
+        let err =
+            Config::parse("server { location / { content_by_lua_block { ngx.say(1) ").unwrap_err();
+        assert!(err.to_string().contains("Lua 块缺少 '}'"), "{err}");
     }
 
     #[test]

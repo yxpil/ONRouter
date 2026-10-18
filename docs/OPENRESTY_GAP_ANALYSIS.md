@@ -1,321 +1,255 @@
-# ONRouter vs OpenResty - Gap Analysis
-
-This document analyzes what ONRouter is missing compared to OpenResty and identifies areas for improvement.
-
-## Executive Summary
-
-**OpenResty** is a mature, production-grade Web platform based on Nginx + LuaJIT with extensive ecosystem. **ONRouter** is a Rust-based gateway inspired by Nginx/OpenResty architecture but still in early development.
-
-### Current Status
-- ✅ **Core Architecture**: Event-driven model, request lifecycle phases (implemented)
-- ✅ **Basic Features**: Reverse proxy, load balancing, static files, TLS/SNI (implemented)
-- ✅ **Lua Support**: Basic ngx.* API, shared_dict, file caching (implemented)
-- ⚠️ **Missing**: Advanced modules, ecosystem, battle-tested stability
-
----
-
-## 1. Critical Missing Features (High Priority)
-
-### 1.1 Request/Response Body Filters
-**OpenResty has:**
-- `body_filter_by_lua` - Stream response body modification
-- `header_filter_by_lua` - Response header manipulation
-
-**ONRouter status:** ❌ Not implemented
-
-**Impact:** Cannot do real-time response transformation, compression, or content injection.
-
-### 1.2 Subrequests (Internal HTTP Calls)
-**OpenResty has:**
-- `ngx.location.capture()` - Make internal subrequests
-- `ngx.location.capture_multi()` - Parallel subrequests
-
-**ONRouter status:** ❌ Not implemented
-
-**Impact:** Cannot compose responses from multiple backends, implement aggregation patterns.
-
-### 1.3 Cosockets (Non-blocking I/O in Lua)
-**OpenResty has:**
-- `resty.socket` - Non-blocking TCP/UDP sockets
-- `resty.redis`, `resty.mysql`, `resty.http` - Async database/HTTP clients
-
-**ONRouter status:** ❌ Not implemented
-
-**Impact:** Lua scripts cannot make async calls to Redis/MySQL/external APIs without blocking workers.
-
-### 1.4 Timer Support
-**OpenResty has:**
-- `ngx.timer.at(delay, callback)` - One-shot timers
-- `ngx.timer.every(interval, callback)` - Periodic timers
-- Background tasks independent of requests
-
-**ONRouter status:** ❌ Not implemented
-
-**Impact:** Cannot run periodic cleanup, health checks, cache warming in background.
-
-### 1.5 Shared Memory Locks
-**OpenResty has:**
-- `resty.lock` - Distributed locks using shared memory
-- Mutex primitives for cross-worker coordination
-
-**ONRouter status:** ❌ Not implemented (only shared_dict exists)
-
-**Impact:** Cannot implement distributed rate limiting, leader election, or coordinated operations.
-
----
-
-## 2. Important Missing Features (Medium Priority)
-
-### 2.1 Advanced Lua APIs
-
-| OpenResty API | ONRouter Status | Description |
-|--------------|----------------|-------------|
-| `ngx.req.set_body_data()` | ❌ | Modify request body |
-| `ngx.req.discard_body()` | ❌ | Discard request body |
-| `ngx.req.init_body()` | ❌ | Initialize buffered body |
-| `ngx.req.append_body()` | ❌ | Append to request body |
-| `ngx.req.finish_body()` | ❌ | Finalize request body |
-| `ngx.req.socket()` | ❌ | Get raw request socket |
-| `ngx.resp.get_headers()` | ⚠️ Partial | Response headers (basic) |
-| `ngx.var.VARIABLE` | ❌ | Access nginx variables |
-| `ngx.ctx` isolation | ⚠️ Basic | Per-request context (needs metatable) |
-| `phase.is_internal()` | ❌ | Check if internal redirect |
-
-### 2.2 Stream/TCP Proxying
-**OpenResty has:**
-- `stream-lua-nginx-module` - TCP/UDP proxying with Lua
-- `stream_by_lua*` directives
-
-**ONRouter status:** ❌ Only HTTP supported
-
-**Impact:** Cannot proxy databases, custom protocols, WebSocket upgrades properly.
-
-### 2.3 Dynamic Module Loading
-**OpenResty has:**
-- Hot-reload Lua modules without restart
-- `package.path` customization
-- Dynamic code compilation
-
-**ONRouter status:** ⚠️ File mtime cache only (no hot reload)
-
-### 2.4 SSL/TLS Session Management
-**OpenResty has:**
-- `ssl_certificate_by_lua` - Dynamic certificate selection
-- `ssl_session_store_by_lua` - Custom session storage
-- OCSP stapling support
-
-**ONRouter status:** ⚠️ Static cert loading only
-
-### 2.5 DNS Resolver
-**OpenResty has:**
-- `resty.dns.resolver` - Async DNS resolution
-- Dynamic upstream discovery
-- SRV record support
-
-**ONRouter status:** ❌ Static config only
-
----
-
-## 3. Ecosystem Gaps (Library Support)
-
-### 3.1 Missing lua-resty-* Libraries
-
-OpenResty provides these official libraries that ONRouter lacks:
-
-| Library | Purpose | ONRouter Alternative |
-|---------|---------|---------------------|
-| `lua-resty-redis` | Async Redis client | ❌ None |
-| `lua-resty-mysql` | Async MySQL client | ❌ None |
-| `lua-resty-http` | Async HTTP client | ❌ None |
-| `lua-resty-websocket` | WebSocket handling | ❌ None |
-| `lua-resty-jwt` | JWT validation | ❌ None |
-| `lua-resty-string` | Crypto utilities | ❌ None |
-| `lua-resty-lock` | Shared memory locks | ❌ None |
-| `lua-resty-dns` | DNS resolver | ❌ None |
-| `lua-resty-upload` | Multipart upload parser | ❌ None |
-| `lua-resty-cookie` | Cookie management | ❌ None |
-| `lua-resty-core` | Core optimizations | ❌ None |
-| `lua-resty-limit-traffic` | Rate limiting | ⚠️ Basic only |
-
-### 3.2 Third-party Module Compatibility
-
-OpenResty supports these Nginx modules that ONRouter doesn't:
-
-- `echo-nginx-module` - Debug/testing commands
-- `headers-more-nginx-module` - Advanced header manipulation
-- `set-misc-nginx-module` - Utility functions (md5, sha1, etc.)
-- `srcache-nginx-module` - Transparent caching layer
-- `memc-nginx-module` - Memcached integration
-- `redis2-nginx-module` - Redis upstream module
-- `drizzle-nginx-module` - MySQL upstream module
-
----
-
-## 4. Performance & Scalability Gaps
-
-### 4.1 Worker Model Differences
-
-| Feature | OpenResty | ONRouter |
-|---------|-----------|---------|
-| Workers | Multi-process (one per CPU) | Single process with thread pool |
-| VM per worker | Yes (isolated) | Pool of VMs (shared) |
-| IPC | Shared memory + Unix socket | Shared memory only |
-| Graceful reload | `kill -HUP` (zero downtime) | ❌ Requires restart |
-
-**Impact:** ONRouter cannot achieve zero-downtime reloads like OpenResty.
-
-### 4.2 LuaJIT vs mlua
-
-| Aspect | OpenResty (LuaJIT) | ONRouter (mlua/Lua 5.4) |
-|--------|-------------------|------------------------|
-| Performance | JIT compiled (~10x faster) | Interpreted |
-| FFI | Yes (call C directly) | Limited |
-| Coroutine | Native support | Via mlua |
-| GC tuning | Advanced options | Standard Lua GC |
-
-**Impact:** Lua scripts in ONRouter will be significantly slower than OpenResty.
-
----
-
-## 5. Operational Gaps
-
-### 5.1 Monitoring & Observability
-
-**OpenResty has:**
-- Prometheus metrics via `lua-resty-prometheus`
-- Distributed tracing (Jaeger, Zipkin)
-- Detailed error logging with stack traces
-- Admin API for runtime inspection
-
-**ONRouter status:** ❌ Basic access/error logs only
-
-### 5.2 Configuration Management
-
-**OpenResty has:**
-- Dynamic configuration via REST API
-- Configuration versioning
-- Blue-green deployment support
-
-**ONRouter status:** ❌ File-based config only (requires restart)
-
-### 5.3 Testing Framework
-
-**OpenResty has:**
-- `Test::Nginx` - Perl-based test framework
-- Built-in mock servers
-- Traffic replay tools
-
-**ONRouter status:** ⚠️ Basic Rust unit tests only
-
----
-
-## 6. Security Gaps
-
-### 6.1 WAF (Web Application Firewall)
-
-**OpenResty has:**
-- ModSecurity integration
-- `lua-resty-waf` - Rule-based filtering
-- SQL injection/XSS detection libraries
-
-**ONRouter status:** ❌ No WAF capabilities
-
-### 6.2 Rate Limiting
-
-**OpenResty has:**
-- Token bucket algorithm (`lua-resty-limit-traffic`)
-- Sliding window counters
-- Distributed rate limiting with Redis
-
-**ONRouter status:** ⚠️ Basic leaky bucket only
-
-### 6.3 Authentication
-
-**OpenResty has:**
-- OAuth2/OIDC libraries
-- LDAP integration
-- SAML support
-- API key management
-
-**ONRouter status:** ❌ No built-in auth
-
----
-
-## 7. Roadmap Recommendations
-
-### Phase 1: Core Stability (Current - v0.3)
-- [ ] Fix shared_dict deadlock ✅ (Done)
-- [ ] Complete WebSocket tunnel implementation
-- [ ] Add timer support (`ngx.timer.at`)
-- [ ] Implement `ngx.ctx` proper isolation
-- [ ] Add request/response body filters
-
-### Phase 2: Async I/O (v0.4 - v0.5)
-- [ ] Implement cosocket API
-- [ ] Build `resty.redis` equivalent
-- [ ] Build `resty.http` client
-- [ ] Add DNS resolver
-- [ ] Subrequest support (`ngx.location.capture`)
-
-### Phase 3: Ecosystem (v0.6 - v0.8)
-- [ ] Port `lua-resty-jwt`
-- [ ] Port `lua-resty-lock`
-- [ ] Port `lua-resty-string` (crypto)
-- [ ] Build rate limiting library
-- [ ] Add authentication middleware
-
-### Phase 4: Operations (v0.9 - v1.0)
-- [ ] Prometheus metrics export
-- [ ] Dynamic configuration API
-- [ ] Graceful reload (zero downtime)
-- [ ] Admin dashboard
-- [ ] Comprehensive test suite
-
-### Phase 5: Production Ready (v1.0+)
-- [ ] WAF module
-- [ ] Stream/TCP proxying
-- [ ] Distributed tracing
-- [ ] Enterprise features (LDAP, SAML)
-- [ ] Performance optimization (consider LuaJIT binding)
-
----
-
-## 8. Competitive Advantages of ONRouter
-
-Despite gaps, ONRouter has unique strengths:
-
-1. **Memory Safety**: Rust prevents entire classes of bugs (buffer overflows, use-after-free)
-2. **Modern Tooling**: Cargo ecosystem, easy dependency management
-3. **Cross-platform**: Windows/macOS/Linux/ARM/RISC-V builds
-4. **Single Binary**: No external dependencies (unlike OpenResty needing LuaJIT)
-5. **Cloud-native**: Docker/K8s ready out of the box
-6. **Type Safety**: Compile-time guarantees reduce runtime errors
-
----
-
-## 9. Conclusion
-
-**ONRouter is approximately 30-40% feature-complete compared to OpenResty.**
-
-The core gateway functionality is solid, but the rich ecosystem of async libraries, advanced Lua APIs, and operational tooling are missing. Focus should be on:
-
-1. **Short-term**: Implement critical missing APIs (timers, body filters, subrequests)
-2. **Mid-term**: Build async I/O foundation (cosockets) and port key resty libraries
-3. **Long-term**: Develop operational excellence (metrics, dynamic config, zero-downtime reload)
-
-**Estimated timeline to parity**: 12-18 months with dedicated team of 3-5 developers.
-
----
+# ONRouter vs OpenResty — Gap Analysis
+
+Updated: 2026-10-18 (v0.3.0, Windows host). Previous revisions of this document
+were written before the `ngx_lua` async surface landed and understated the
+implementation; this revision is status-first and cites the E2E/unit evidence
+that enforces each row.
+
+## Executive summary
+
+ONRouter now covers the core nginx request pipeline plus a broad OpenResty Lua
+surface: all request phases (including response filters and log phase), timers,
+TCP/UDP cosockets, light threads, `ngx.semaphore`, subrequests (including
+concurrent `capture_multi`), shared dicts, `resty.lock` / `resty.http` /
+`resty.redis` / `resty.string` / `resty.cookie` / `resty.limit.req|count|conn`,
+dynamic TLS certificate selection at handshake time, session resumption shared
+across listeners, and in-process config/Lua hot reload.
+
+The remaining gaps are concentrated in four areas:
+
+1. **Process model / zero-downtime binary upgrade** — no master/worker split, no
+   USR2 upgrade (design and Linux test plan in `docs/USR2_HOT_UPGRADE.md`).
+2. **Raw Lua performance** — mlua/Lua 5.4 interpreted vs LuaJIT; expect roughly
+   0.7–0.9x on Lua-only endpoints and much faster static paths on Windows
+   (Linux numbers still pending, see `docs/LINUX_AB.md`).
+3. **OpenResty-specific ecosystem breadth** — `ssl_session_store_by_lua`,
+   OCSP stapling, `stream_*_by_lua`, `resty.websocket/jwt/mysql/dns/upload/...`.
+4. **Long-tail `ngx.*` semantics** — `ngx.on_abort` invocation, full
+   `share_all_vars` capture options, HTTP/2 upstreams, and a few phase/API
+   corner cases listed below.
+
+## 1. Implemented (with evidence)
+
+### 1.1 Configuration and lifecycle
+
+| Feature | Status | Evidence |
+|---|---|---|
+| nginx config syntax, `include`, `-p/-g/-e`, `http{}` flattening, pid file | ✅ | parser unit tests, `compat_test.py` |
+| `*_by_lua_block { … }` for every phase | ✅ | lexer unit tests (nested tables/strings/comments/long brackets, line numbers) |
+| Unknown top-level directive warnings; `worker_processes`/`log_format` explicitly “ignored” | ✅ | `router::warn_unknown_top_level`, startup log |
+| `init_by_lua*` once per VM | ✅ | `lua_engine` unit tests |
+| `init_worker_by_lua*` once per VM after scheduler start; timers/cosockets/`ngx.sleep` work | ✅ | `tools/init_worker_package_e2e.py` 21/21 |
+| `lua_package_path` (`$prefix`, `${prefix}`, `;;`, repeatable) | ✅ | same suite 21/21 + unit tests |
+| `SIGHUP` / `reload <interval>;` in-process routing hot swap; Lua file mtime self-check | ✅ | `tools/hotreload_e2e.py`, `tools/lua_watch_e2e.py` |
+| `*_by_lua_file` changes picked up without restart; compiles once per VM | ✅ | `tools/lua_watch_e2e.py` |
+| USR2 zero-downtime binary upgrade | ❌ | design only (`docs/USR2_HOT_UPGRADE.md`); blocked on Linux verification |
+
+### 1.2 Lua API (implemented and exercised)
+
+- **Phases**: `rewrite`, `access`, `content`, `header_filter`, `body_filter`, `log`,
+  `balancer`, `ssl_certificate`, `init`, `init_worker` — inline, `_file`, and
+  `_block` forms where applicable.
+- **Response**: `ngx.say/print/status/exit/redirect/exec`, `ngx.header` read/write
+  (table values emit/read repeated lines, e.g. multiple `Set-Cookie`),
+  `header.set`, `resp.get_headers`, **`ngx.flush([wait])`** (streaming head/body;
+  64 KiB auto-flush; h1 chunked and h2 DATA paths), **`ngx.send_headers()`**,
+  **`ngx.eof()`**, `ngx.headers_sent`; response filters keep the location buffered.
+  Evidence: `tools/lua_flush_socket_e2e.py` 23/23, `tools/api_compat_e2e.py` 57/57.
+- **Request**: method/path/query/header mutation APIs, `read_body`, `get_body_data`,
+  `set_body_data`, `discard_body`, `init_body`/`append_body`/`finish_body` (commit a
+  rebuilt body + accurate `Content-Length`, also used by `proxy_pass`),
+  `get_post_args`, `raw_header`, `start_time()`, `http_version()`,
+  `is_internal()`, **`ngx.req.socket([raw])`** with `receive` / `receiveuntil` /
+  `close`.
+- **Control**: `ngx.sleep`, `ngx.exit`, `ngx.exec`, `ngx.redirect`,
+  `ngx.semaphore.new/count/post/wait` (scheduler-yielding per-VM semaphore),
+  `ngx.on_abort` (registration only; disconnect hook not wired).
+- **Cosockets**: `ngx.socket.tcp` (`connect/send/receive*/receiveany/receiveuntil/
+  settimeout/setsize/setkeepalive/tlshandshake/sslhandshake/reconnect/close/
+  getstats/getreusedtimes`, shared keepalive pool), `ngx.socket.udp`.
+  Evidence: `cosocket`, `sock_ext`, `sock_tls`, `sock_udp` suites.
+- **Concurrency**: `ngx.thread.spawn/wait/yield/kill`; `ngx.location.capture`
+  (full subrequest pipeline, nesting + depth guard, `method`/`body`/`args` opts);
+  `ngx.location.capture_multi` (concurrent captures via light threads);
+  `ngx.timer.at/every/running_count/pending_count`.
+- **Shared state**: `ngx.shared.DICT` full method surface (sharded, capacity/LRU,
+  `get_keys`, `expire`), `resty.lock`, `ngx.socket.tcp` keepalive pool.
+- **Encoding/crypto/regex**: base64, URI escape/unescape, args encode/decode,
+  `ngx.re.*` (`match/find/gmatch/sub/gsub/opt`), `md5/sha1/sha256` and `_bin`
+  variants; `resty.string`.
+- **Bundled resty modules**: `resty.lock`, `resty.http`, `resty.redis`,
+  `resty.string`, `resty.cookie`, `resty.limit.req` / `resty.limit.count` /
+  `resty.limit.conn` (pure-Lua originals over the native cosocket + shared-dict
+  surface, not upstream source copies). Evidence: `tools/resty_e2e.py`,
+  `tools/resty_http_e2e.py`, `tools/resty_redis_e2e.py`,
+  `tools/api_compat_e2e.py`.
+- **Response filters**: `header_filter_by_lua*` and `body_filter_by_lua*` on both
+  Lua/static and proxied responses (proxied responses are buffered so filters see
+  the whole body). Evidence: `tools/proxy_filter_e2e.py`, `tools/sub_filter_e2e.py`.
+- **Variables**: `ngx.var` (request/response/upstream variables; `$uri` and
+  `$status` writable), plus derived variables from `map` / `geo` / `split_clients`,
+  resolved identically in Lua and config interpolation.
+
+### 1.3 HTTP / TLS / upstream
+
+- HTTP/1.1 (keepalive, upgrades/WebSocket tunnel), HTTP/2 (ALPN + h2c
+  prior-knowledge), HTTP/3 (QUIC + Alt-Svc).
+- Multi-certificate SNI vhosts on shared listen ports; exact > wildcard > default;
+  Host routing independent of SNI.
+- TLS 1.2/1.3 via rustls; legacy TLS 1.0/1.1 via the optional `native-tls`
+  platform backend.
+- **TLS sessions**: process-wide `ssl_session_cache` (`off` / `builtin[:n]` /
+  `shared:name:size`, approximate LRU) plus a stateless ticketer, shared by every
+  listener and SNI config; `ssl_session_tickets on|off`. Cross-port resumption
+  verified with `openssl -sess_out/-sess_in`; evidence `tools/tls_session_e2e.py`.
+- **`ssl_certificate_by_lua*` + `ngx.ssl`**: per-SNI handshake scripts with
+  `server_name`, PEM cert/key parse, `set_cert/set_priv_key/clear_certs` and legacy
+  aliases; dynamic configs cached by cert/key hash; script error or
+  `ngx.exit(ngx.ERROR)` aborts the handshake. Evidence:
+  `tools/ssl_cert_lua_e2e.py` 21/21 (TLS1.2, ALPN h2, `_file`, two vhosts).
+- Reverse proxy: HTTP/HTTPS/WSS upstreams, mTLS client certs, connection pool,
+  `proxy_next_upstream`, passive + active health checks, request buffering on/off,
+  streaming response, `proxy_cache`, `proxy_redirect`/cookie rewrites, gzip,
+  `sub_filter`, real-IP, rate/conn limits, basic auth, `stream{}` L4 proxy with
+  `ssl_preread`, `resolver` async DNS.
+- **Proxy cache**: in-memory named zones with capacity from
+  `proxy_cache_path … keys_zone=<name>:<size>` (LRU eviction, expiry cleanup
+  every 128 stores), `proxy_cache_lock`/`_lock_timeout` request coalescing,
+  `proxy_cache_use_stale` (`error`, `timeout`, `updating`, `http_4xx/5xx`),
+  `proxy_cache_bypass`/`proxy_no_cache`, upstream freshness precedence, HEAD lookup without
+  HEAD-response cache population, and `X-Cache-Status: HIT|MISS|EXPIRED|BYPASS|STALE`. Evidence:
+  `tools/proxy_cache_e2e.py` 13/13, `tools/cache_advanced_e2e.py` 32/32.
+- **Scheduler fast path**: first Lua segment runs inline when the VM lock is free;
+  only yielding phases hand off to the scheduler. Counters exposed as
+  `onrouter_lua_phase_{inline,adopted,scheduled}_total`; E2E traffic shows
+  100/100 inline for a no-yield script and 50/50 adopt for `ngx.sleep`.
+
+### 1.4 Operations
+
+- Prometheus metrics via `content_by_rust metrics`: uptime, accepted/active/capacity,
+  requests, status classes, Lua scheduling counters, per-upstream node
+  connections/health/success/failure, cache status (`hit/miss/expired/bypass/stale`),
+  TLS handshake failures, limit_req/limit_conn rejections, dropped access-log lines
+  (`metrics.rs`, `tools/metrics_e2e.py` 38/38, `tools/observability_e2e.py` 26/26).
+- Access log (combined) with `$request_time` and the
+  `$upstream_addr`/`$upstream_status`/`$upstream_header_time` triple (including the
+  Upgrade path; `- - -` when no upstream), plus error log, `SIGUSR1`/`SIGHUP` log
+  reopen, and a counted non-blocking drop path under queue pressure.
+- Graceful shutdown with `shutdown_grace`, `worker_connections`, `keepalive_requests`.
+- Windows and Linux builds; Windows is the verified host for this snapshot.
+
+## 2. Remaining gaps (ranked)
+
+### 2.1 High
+
+| Gap | Impact | Notes |
+|---|---|---|
+| USR2 zero-downtime binary upgrade | deploy needs a restart (or external LB draining) | Requires SO_REUSEPORT handover or master/worker + FD inheritance; see `docs/USR2_HOT_UPGRADE.md` |
+| LuaJIT-class performance | Lua endpoints ~0.7–0.9x OpenResty on Windows | interpreted Lua 5.4; static/proxy paths are competitive. Linux baseline pending (`docs/LINUX_AB.md`) |
+| `ssl_session_store_by_lua*` | no custom session store | memory store + ticketer are fixed |
+| OCSP stapling | no stapling | `proxy_tls.rs` has an unused OCSP slot only |
+| `stream_*_by_lua*` | L4 proxy has no Lua hooks | `stream{}` supports SNI preread + upstream only |
+| HTTP/2 upstream (`proxy_http_version 2`) | upstream h1 only | client-side h2/h3 fully supported |
+
+### 2.2 Medium
+
+- `ngx.on_abort` callback is accepted but not invoked on client disconnect.
+- `ngx.location.capture` lacks `share_all_vars` / `ctx` option passing; capture
+  response shares no request context.
+- `ngx.req.socket` reads the buffered body only; it is not a duplex raw socket
+  (no `send`/`shutdown` on the client socket).
+- `header_filter_by_lua`/`body_filter_by_lua` force buffering (no streaming through
+  filters; same tradeoff as nginx filters but no `proxy_buffering off` bypass).
+- Native-tls legacy backend ignores `ssl_certificate_by_lua` and session options.
+- QUIC listeners use the static SNI cert store; handshake scripts do not run on
+  QUIC.
+- `init_by_lua*` / `init_worker_by_lua*` / `lua_package_path` changes require a
+  restart: `SIGHUP` swaps routing only, not the Lua engine.
+- `init_worker_by_lua*` runs once per VM (16 times), not once per OS process;
+  matching nginx semantics would require the multi-process model.
+- Relative `lua_package_path` entries resolve against the process CWD, not the
+  config directory (use `$prefix` or absolute paths).
+- `ssl_session_cache shared:` is an in-process LRU, not a cross-process shared
+  memory zone; capacity is per process.
+- `proxy_cache` is memory-only: `proxy_cache_path`'s directory/`levels`/`max_size`
+  are ignored (only `keys_zone` capacity is used), so entries do not survive a
+  restart. Missing: revalidation (`proxy_cache_revalidate`, If-None-Match → 304),
+  `proxy_cache_purge`, `proxy_cache_lock_age`, `proxy_cache_background_update`,
+  `proxy_cache_convert_head` (HEAD may read but never populate), `Vary`-aware
+  keying, and the `$upstream_cache_status` variable (`X-Cache-Status` is emitted
+  instead).
+
+### 2.3 Ecosystem / long tail
+
+- Modules: `resty.websocket`, `resty.jwt`, `resty.mysql`, `resty.dns.resolver`,
+  `resty.upload`, `resty.core` — absent. `resty.cookie` and `resty.limit.{req,
+  count,conn}` are now bundled (see above).
+- Third-party nginx modules (echo, headers-more, set-misc, srcache, memc, redis2,
+  drizzle) are not loadable; use `content_by_rust` or Lua instead.
+- Cron-like `ngx.timer` workers exist, but there is no `init_worker`-based
+  “privileged agent”/shared-memory zone pruning parity.
+- No built-in WAF/OAuth/LDAP/SAML; basic auth + IP ACL only.
+- Test harness: ported assertion scripts, not the full Perl `Test::Nginx` suite
+  (the official suite is vendored as semantics reference only).
+
+## 3. Performance snapshot (Windows, 2026-10-18)
+
+`python bench_ab.py --sweep 1,4 --requests 12000` on a 16-logical-core Windows
+host (`bench_win_ab.json`); ratios are ONRouter/OpenResty:
+
+| Endpoint | c=1 | c=4 |
+|---|---:|---:|
+| static `index.html` | 3595/s vs 2863/s (**1.26x**) | 8025/s vs 3614/s (**2.22x**) |
+| Lua `content_by_lua` | 6309/s vs 7111/s (0.89x) | 15197/s vs 19850/s (0.77x) |
+| Lua `shared.DICT` serialized incr | 6445/s vs 7778/s (0.83x) | 15091/s vs 20784/s (0.73x) |
+| Lua `*_file` | 6295/s vs 7907/s (0.80x) | 15733/s vs 22109/s (0.71x) |
+| reverse proxy upstream | 3411/s vs 96/s (artifact) | 8041/s vs 2721/s (2.96x) |
+
+Caveats: Windows nginx uses `select()` and a limited worker count; OpenResty's
+c=1 proxy row (96 req/s, 14 ms) is an environment artifact; the Python client
+ceiling moved between runs (9844 → 8865–9193 req/s); all rows are keep-alive GET
+without TLS. Do not treat these as Linux/production conclusions — rerun
+`tools/linux_ab.sh` on Linux and record the median of 3 runs.
+
+Fast-path A/B (same Windows host, before → after, two after runs): Lua
+`content_by_lua` c=1 6678 → 6518/6428, c=4 15043 → 15366/14882; DICT c=1 5807 →
+5909/5762, c=4 14262 → 14893/14861; static and proxy rows tracked the client
+ceiling. Conclusion: neutral within noise on this host; the win is architectural
+(no scheduler hop), observable in the `inline/adopted/scheduled` counters.
+
+## 4. Verification inventory
+
+- Unit tests: 251 passing (`cargo test --workspace`; 238 in onrouter-server +
+  13 in onrouter-config).
+- E2E suites (real traffic), this snapshot:
+  - `lua_concurrency` 5/5, `thread` 24/24, `cosocket` 7/7, `subrequest` 18/18
+  - `lua_flush_socket` 23/23, `init_worker_package` 21/21, `ssl_cert_lua` 21/21,
+    `metrics` 38/38, `observability` 26/26, `api_compat` 57/57
+  - Full regression: 63 scripts (8 root scenario/compat/security/static/upstream
+    suites + every `tools/*_e2e.py` incl. TLS matrix, HTTP/2, HTTP/3, hot reload,
+    cache, filters, auth, stream, resty, and API-compat) all exited 0.
+  - `native-tls` legacy handshake suite 12/12 with `--features native-tls`
+    (runtime-generated RSA cert); the default rustls build still passes it.
+- Not verifiable on this host: USR2/Linux signal behavior and the Linux A/B
+  baseline (no Linux/WSL/Docker or Linux toolchain on this machine).
+
+## 5. Roadmap
+
+1. **Linux CI baseline** (`tools/linux_ab.sh`) with 3-run medians; use it to decide
+   whether Lua performance work is warranted.
+2. **USR2 upgrade, option A** (SO_REUSEPORT handover) behind `cfg(unix)`, with the
+   pipeline in `docs/USR2_HOT_UPGRADE.md`; keep Windows on rolling restart.
+3. **TLS/ops parity**: `ssl_session_store_by_lua`, OCSP stapling, QUIC handshake
+   scripts, per-process vs shared session-store documentation.
+4. **Lua API long tail**: `ngx.on_abort` invocation, capture `ctx`/`share_all_vars`,
+   duplex `ngx.req.socket`, streaming filters where safe.
+5. **Ecosystem**: `resty.websocket`/`jwt`/`mysql`/`dns` on top of the existing
+   cosocket core; optional LuaJIT investigation (mlua supports LuaJIT builds, but
+   the Rust module surface would need auditing).
 
 ## References
 
-- [OpenResty Official Documentation](https://openresty.org/)
-- [lua-nginx-module Wiki](https://github.com/openresty/lua-nginx-module/wiki)
-- [OpenResty Best Practices](https://github.com/moonbingbing/openresty-best-practices)
-- [GeekBang OpenResty Course](https://time.geekbang.org/column/intro/100028301)
-
-Sources:
-- [OpenResty核心定位与优势](https://m.blog.csdn.net/qq_58967403/article/details/155502632)
-- [Nginx Lua动态扩展](https://m.blog.csdn.net/onlymscn/article/details/154872138)
-- [探索OpenResty：高性能Web开发利器](https://m.blog.csdn.net/weixin_43663196/article/details/151294235)
-- [OpenResty官方文档](https://openresty.org/cn/)
+- OpenResty documentation: https://openresty.org/
+- lua-nginx-module wiki: https://github.com/openresty/lua-nginx-module/wiki
+- OpenResty best practices: https://github.com/moonbingbing/openresty-best-practices
+- `docs/USR2_HOT_UPGRADE.md`, `docs/LINUX_AB.md`, `README.md` (feature map + Lua API)

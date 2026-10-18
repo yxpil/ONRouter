@@ -27,6 +27,10 @@ const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 
+/// 一轮解析最多遍历 nameserver 列表两遍：第一遍全是瞬时错误（超时/收发/报文异常）
+/// 且没拿到地址时再给一次机会；NXDOMAIN 等权威否定不做无谓重查。
+const DNS_QUERY_ROUNDS: usize = 2;
+
 /// 解析器配置（来自 `resolver` 指令）。
 #[derive(Debug, Clone)]
 pub struct ResolverConfig {
@@ -60,6 +64,9 @@ struct CacheEntry {
 pub struct DnsResolver {
     config: ResolverConfig,
     cache: Mutex<HashMap<String, CacheEntry>>,
+    /// 多 A/AAAA 记录的轮询游标（按域名）。proxy 侧只取解析结果的首地址，
+    /// 不轮换的话第二条及之后的记录永远用不上。
+    rotation: Mutex<HashMap<String, usize>>,
     /// 自增查询 ID（简单取 16 位回绕）。
     next_id: Mutex<u16>,
 }
@@ -110,6 +117,7 @@ impl DnsResolver {
         Some(Arc::new(DnsResolver {
             config: cfg,
             cache: Mutex::new(HashMap::new()),
+            rotation: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
         }))
     }
@@ -135,27 +143,41 @@ impl DnsResolver {
             return if addrs.is_empty() {
                 Err(format!("DNS 无记录: {host}（缓存）"))
             } else {
-                Ok(addrs)
+                Ok(self.rotate(host, addrs))
             };
         }
 
         let mut addrs: Vec<IpAddr> = Vec::new();
         let mut last_err = String::new();
-        for ns in self.config.nameservers.clone() {
-            // 先查 A（IPv4 优先，与 nginx ipv6=off / 常见 vhost 场景一致）
-            match self.query_one(ns, host, TYPE_A).await {
-                Ok(a) => addrs.extend(a),
-                Err(e) => last_err = e,
-            }
-            if addrs.is_empty() && self.config.ipv6 {
-                match self.query_one(ns, host, TYPE_AAAA).await {
+        for _round in 0..DNS_QUERY_ROUNDS {
+            // 本轮是否出现过瞬时错误；全是"无记录"时说明是权威否定，不必再查一遍
+            let mut had_error = false;
+            for ns in self.config.nameservers.iter().copied() {
+                // 先查 A（IPv4 优先，与 nginx ipv6=off / 常见 vhost 场景一致）
+                match self.query_one(ns, host, TYPE_A).await {
                     Ok(a) => addrs.extend(a),
-                    Err(e) => last_err = e,
+                    Err(e) => {
+                        had_error = true;
+                        last_err = e;
+                    }
+                }
+                if addrs.is_empty() && self.config.ipv6 {
+                    match self.query_one(ns, host, TYPE_AAAA).await {
+                        Ok(a) => addrs.extend(a),
+                        Err(e) => {
+                            had_error = true;
+                            last_err = e;
+                        }
+                    }
+                }
+                if !addrs.is_empty() {
+                    break;
                 }
             }
-            if !addrs.is_empty() {
+            if !addrs.is_empty() || !had_error {
                 break;
             }
+            // 所有 nameserver 都瞬时失败且无地址：进入下一轮重查
         }
 
         self.store(host, addrs.clone());
@@ -166,8 +188,20 @@ impl DnsResolver {
                 last_err
             })
         } else {
-            Ok(addrs)
+            Ok(self.rotate(host, addrs))
         }
+    }
+
+    /// 按域名轮换多地址顺序：消费方都取首地址，轮换后连续请求会分摊到各条 A/AAAA 记录。
+    fn rotate(&self, host: &str, mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
+        let len = addrs.len();
+        if len > 1 {
+            let mut g = self.rotation.lock().unwrap_or_else(|e| e.into_inner());
+            let idx = g.entry(host.to_string()).or_insert(0);
+            addrs.rotate_left(*idx % len);
+            *idx = idx.wrapping_add(1);
+        }
+        addrs
     }
 
     fn cached(&self, host: &str) -> Option<Vec<IpAddr>> {
@@ -482,10 +516,125 @@ mod tests {
         let r = DnsResolver {
             config: ResolverConfig::default(),
             cache: Mutex::new(HashMap::new()),
+            rotation: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
         };
         let addrs = tokio_test(&r, "127.0.0.1");
         assert_eq!(addrs, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
+    }
+
+    #[test]
+    fn rotates_across_cached_addresses() {
+        let host = "multi.invalid";
+        let mut cache = HashMap::new();
+        cache.insert(
+            host.to_string(),
+            CacheEntry {
+                addrs: vec![
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+                ],
+                expires: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        let r = DnsResolver {
+            config: ResolverConfig::default(),
+            cache: Mutex::new(cache),
+            rotation: Mutex::new(HashMap::new()),
+            next_id: Mutex::new(0),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let firsts: Vec<IpAddr> = (0..4)
+            .map(|_| *rt.block_on(r.resolve(host)).unwrap().first().unwrap())
+            .collect();
+        assert_eq!(
+            firsts,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn retries_after_transient_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sock = rt.block_on(async { tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap() });
+        let ns = sock.local_addr().unwrap();
+        let answered = Arc::new(AtomicUsize::new(0));
+        let answered_srv = answered.clone();
+        rt.spawn(async move {
+            let mut buf = [0u8; 4096];
+            let mut a_seen = 0usize;
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                if n < 17 {
+                    continue;
+                }
+                let qid = u16::from_be_bytes([buf[0], buf[1]]);
+                let Ok((_, qend)) = read_name(&buf[..n], 12) else {
+                    continue;
+                };
+                let qtype = u16::from_be_bytes([buf[qend], buf[qend + 1]]);
+                let question = buf[12..qend + 4].to_vec();
+                let mut msg = Vec::new();
+                msg.extend_from_slice(&qid.to_be_bytes());
+                if qtype == TYPE_A {
+                    a_seen += 1;
+                    if a_seen == 1 {
+                        // 丢弃首条 A 查询，制造一次超时
+                        continue;
+                    }
+                    answered_srv.fetch_add(1, Ordering::Relaxed);
+                    msg.extend_from_slice(&0x8180u16.to_be_bytes());
+                    msg.extend_from_slice(&1u16.to_be_bytes()); // QD
+                    msg.extend_from_slice(&1u16.to_be_bytes()); // AN
+                    msg.extend_from_slice(&0u16.to_be_bytes());
+                    msg.extend_from_slice(&0u16.to_be_bytes());
+                    msg.extend_from_slice(&question);
+                    // 指针指向 question 名，A 127.0.0.9
+                    msg.extend_from_slice(&[
+                        0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 30, 0, 4, 127, 0, 0, 9,
+                    ]);
+                } else {
+                    // AAAA 回 NXDOMAIN：让首轮以"超时 + 无记录"结束
+                    msg.extend_from_slice(&0x8183u16.to_be_bytes());
+                    msg.extend_from_slice(&1u16.to_be_bytes());
+                    msg.extend_from_slice(&0u16.to_be_bytes());
+                    msg.extend_from_slice(&0u16.to_be_bytes());
+                    msg.extend_from_slice(&0u16.to_be_bytes());
+                    msg.extend_from_slice(&question);
+                }
+                let _ = sock.send_to(&msg, peer).await;
+            }
+        });
+
+        let r = DnsResolver {
+            config: ResolverConfig {
+                nameservers: vec![ns],
+                valid: Duration::from_secs(10),
+                timeout: Duration::from_millis(150),
+                ipv6: true,
+            },
+            cache: Mutex::new(HashMap::new()),
+            rotation: Mutex::new(HashMap::new()),
+            next_id: Mutex::new(0),
+        };
+        let addrs = rt.block_on(r.resolve("retry.invalid")).unwrap();
+        assert_eq!(addrs, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9))]);
+        assert_eq!(answered.load(Ordering::Relaxed), 1);
     }
 
     fn tokio_test(r: &DnsResolver, host: &str) -> Vec<IpAddr> {

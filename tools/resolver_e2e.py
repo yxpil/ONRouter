@@ -3,11 +3,14 @@
 #   * test.invalid 是 RFC6761 保留域，系统 getaddrinfo 解析不出来，只有脚本起的存根 DNS
 #     服务器能给答案 → 代理成功即证明命中的是 resolver 路径
 #   * 解析出的 IP 用于连接，Host 头仍是原始域名（proxy_set_header Host test.invalid）
+#   * test.invalid 有两台后端（127.0.0.1 / 127.0.0.2:18121）：连续请求应轮换命中两条 A 记录
 #   * 存根对 missing.invalid 回 NXDOMAIN → 解析失败 → 502（对齐 nginx）
+#   * 存根对 retry.invalid 丢弃首条 A 查询 → 等满 timeout 后重试一轮并成功
 #   * valid=30s TTL 缓存：第二次代理请求不再向 DNS 服务器发查询（脚本侧对 A 查询计数）
 #
 #   cargo build --release -p onrouter-server --bin onrouter && python tools/resolver_e2e.py
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -27,10 +30,11 @@ BACKEND_PORT = 18121
 GW_HOST, GW_PORT = "127.0.0.1", 18119
 BASE = f"http://{GW_HOST}:{GW_PORT}"
 
-# 存根 DNS 的记录表：只给 test.invalid 一条 A；其余 *.invalid 回 NXDOMAIN
-A_RECORDS = {"test.invalid": "127.0.0.1"}
-# 计数：分别记录对 test.invalid 的 A 查询数与总查询数
-stats = {"a_test": 0, "queries": 0, "aa": 0}
+# 存根 DNS 的记录表：test.invalid 两条 A，其余 *.invalid 回 NXDOMAIN
+A_RECORDS = {"test.invalid": ["127.0.0.1", "127.0.0.2"]}
+RETRY_HOST = "retry.invalid"
+# 计数：分别记录 test.invalid / retry.invalid 的 A 查询数与总查询数
+stats = {"a_test": 0, "a_retry": 0, "queries": 0, "aa": 0, "retry_dropped": 0}
 _lock = threading.Lock()
 
 results = []
@@ -100,13 +104,29 @@ def dns_server():
             stats["queries"] += 1
             if qtype == 1 and name_l == "test.invalid":
                 stats["a_test"] += 1
+            if qtype == 1 and name_l == RETRY_HOST:
+                stats["a_retry"] += 1
             if qtype == 28:
                 stats["aa"] += 1
-        ip = A_RECORDS.get(name_l)
-        if qtype == 1 and ip:
-            rdata = socket.inet_aton(ip)
-            hdr = qid + struct.pack(">HHHHH", 0x8180, 1, 1, 0, 0)
-            ans = struct.pack(">HHIH", 0xC00C, 1, 1, 30) + struct.pack(">H", 4) + rdata
+
+        if qtype == 1 and name_l == RETRY_HOST:
+            with _lock:
+                drop = stats["a_retry"] == 1
+                if drop:
+                    stats["retry_dropped"] += 1
+            if drop:
+                # 丢弃首条 A 查询：让网关等满 resolver_timeout 后进入重试轮
+                continue
+            ips = ["127.0.0.1"]
+        else:
+            ips = A_RECORDS.get(name_l, [])
+
+        if qtype == 1 and ips:
+            hdr = qid + struct.pack(">HHHHH", 0x8180, 1, len(ips), 0, 0)
+            ans = b"".join(
+                struct.pack(">HHIH", 0xC00C, 1, 1, 30) + struct.pack(">H", 4) + socket.inet_aton(ip)
+                for ip in ips
+            )
             sock.sendto(hdr + question + ans, addr)
         else:
             # NXDOMAIN：QR=1 RCODE=3，回显 question，AN=0
@@ -116,7 +136,8 @@ def dns_server():
 
 class Backend(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = f"BACKEND host={self.headers.get('Host')} path={self.path}".encode()
+        addr = self.server.server_address[0]
+        body = f"BACKEND addr={addr} host={self.headers.get('Host')} path={self.path}".encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
@@ -127,6 +148,12 @@ class Backend(BaseHTTPRequestHandler):
         pass
 
 
+def start_backend(ip):
+    srv = HTTPServer((ip, BACKEND_PORT), Backend)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
 def main():
     exe = find_binary()
     os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
@@ -134,8 +161,7 @@ def main():
     dns_t = threading.Thread(target=dns_server, daemon=True)
     dns_t.start()
 
-    backend = HTTPServer(("127.0.0.1", BACKEND_PORT), Backend)
-    threading.Thread(target=backend.serve_forever, daemon=True).start()
+    backends = [start_backend("127.0.0.1"), start_backend("127.0.0.2")]
 
     logf = open(os.path.join(ROOT, "logs", "resolver_out.log"), "wb")
     proc = subprocess.Popen([exe, CONF], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
@@ -163,13 +189,22 @@ def main():
         check("后端收到 Host=原始域名 test.invalid", "host=test.invalid" in body, f"body={body!r}")
         check("后端收到原始路径", "path=/upstream-by-name" in body, f"body={body!r}")
 
-        # 2) valid=30s 缓存：再次请求不应新增对 test.invalid 的 A 查询
+        # 2) 多 A 记录轮换 + valid=30s 缓存：连续请求覆盖两个后端且不新增 DNS 查询
         with _lock:
             before = stats["a_test"]
-        get("/upstream-by-name")
-        get("/upstream-by-name")
+        seen_ips = []
+        for _ in range(4):
+            st, body = get("/upstream-by-name")
+            m = re.search(r"addr=([0-9.]+)", body)
+            if st == 200 and m:
+                seen_ips.append(m.group(1))
         with _lock:
             after = stats["a_test"]
+        check(
+            "多 A 记录轮换：连续请求覆盖两个后端 IP",
+            set(seen_ips) == {"127.0.0.1", "127.0.0.2"},
+            f"seen={seen_ips}",
+        )
         check("TTL 缓存命中：重复请求未新增 DNS A 查询", after == before, f"before={before} after={after}")
         # A 记录命中即不发 AAAA（IPv4 优先）
         with _lock:
@@ -180,6 +215,19 @@ def main():
         st, _ = get("/upstream-missing")
         check("/upstream-missing（NXDOMAIN）→ 502", st == 502, f"st={st}")
 
+        # 4) 瞬时错误重试：首条 A 查询被丢弃 → 等满 1s timeout，第二轮成功
+        t0 = time.time()
+        st, body = get("/upstream-retry", timeout=15)
+        elapsed = time.time() - t0
+        with _lock:
+            dropped = stats["retry_dropped"]
+            tries = stats["a_retry"]
+        check("/upstream-retry → 200（首查丢包后重试成功）", st == 200, f"st={st} body={body!r}")
+        check("重试用例确实丢弃过一次查询", dropped == 1, f"dropped={dropped}")
+        check("重试用例发出了至少两次 A 查询", tries >= 2, f"a_retry={tries}")
+        check("重试在 DNS 超时之后才成功（证明等待过 timeout）", elapsed >= 0.8, f"elapsed={elapsed:.2f}s")
+        check("重试命中后端 127.0.0.1", "addr=127.0.0.1" in body, f"body={body!r}")
+
     finally:
         proc.terminate()
         try:
@@ -187,7 +235,8 @@ def main():
         except subprocess.TimeoutExpired:
             proc.kill()
         logf.close()
-        backend.shutdown()
+        for b in backends:
+            b.shutdown()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)
