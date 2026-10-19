@@ -1,10 +1,19 @@
 # ONRouter Cross-Platform Build Script for Windows PowerShell
 # Supports: Windows (x86_64, ARM64), cross-compilation info
 
+[CmdletBinding()]
+param(
+    [Parameter(Position=0)]
+    [ValidateSet("build", "clean", "matrix", "help")]
+    [string]$Command = "build"
+)
+
 $ErrorActionPreference = "Stop"
 
-$VERSION = git describe --tags --always --dirty 2>$null
+$VERSION = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+if (-not $VERSION) { $VERSION = git describe --tags --always --dirty 2>$null }
 if (-not $VERSION) { $VERSION = "dev" }
+if ($VERSION -notlike "v*") { $VERSION = "v$VERSION" }
 $BUILD_DIR = "target\dist"
 
 function Write-Info {
@@ -153,12 +162,6 @@ function Build-All {
 }
 
 # Main
-param(
-    [Parameter(Position=0)]
-    [ValidateSet("build", "clean", "matrix", "help")]
-    [string]$Command = "build"
-)
-
 switch ($Command) {
     "build" { Build-All }
     "clean" {

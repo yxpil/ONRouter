@@ -10,7 +10,9 @@ COLOR_RED='\033[0;31m'
 COLOR_YELLOW='\033[1;33m'
 NC='\033[0m'
 
-VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+VERSION=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+[ -z "$VERSION" ] && VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+case "$VERSION" in v*) ;; *) VERSION="v$VERSION" ;; esac
 BUILD_DIR="target/dist"
 
 log_info() {
