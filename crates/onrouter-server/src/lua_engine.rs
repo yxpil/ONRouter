@@ -1316,6 +1316,39 @@ struct VmSlot {
     chunks: Arc<std::sync::Mutex<ChunkCache>>,
     /// ngx.thread.spawn 的跨锁信箱：快速路径结束时要清掉本请求未启动的子线程
     sched_ctl: SharedCtl,
+    /// 时间片：一条协程在让回调度器前最多执行的虚拟机指令数（0 = 关闭抢占）
+    quantum: u32,
+    /// 上一次 resume 是否因时间片耗尽而让出（VM 内 resume 串行，一个标志够用）
+    preempted: Arc<AtomicBool>,
+}
+
+/// `lua_slice_instructions` 的默认值。1M 条约当于 10 ms 纯 Lua 计算：
+/// 正常请求脚本一段跑不到这个量级（继续走无调度的快速路径），
+/// 失控循环则每 10 ms 被迫让出一次。
+const LUA_SLICE_DEFAULT: u32 = 1_000_000;
+/// 单次持锁期间允许的时间片抢占次数上限：超过就把控制权交回调度器主循环
+/// （释放 VM 锁、await 通道），避免一个热循环把 tokio worker 线程一直占住。
+/// 与默认时间片相乘 ≈ 一次持锁最多 80 ms 的纯 Lua 计算。
+const PREEMPT_PER_HOLD: u32 = 8;
+/// `Job::Adopt` 里表示"不是等 op 事件、随时可跑"的哨兵 op id（真实 op id 从 1 起）
+const ADOPT_READY: u64 = 0;
+
+/// 给即将 resume 的协程装上"时间片"钩子：每执行 `quantum` 条虚拟机指令就从钩子里
+/// 让出（等价于 `coroutine.yield()`，不带值），把 CPU 交回调度器。
+/// 没有它，一段 `while true do end` 会占死该 VM 调度器所在的 tokio worker——
+/// 单进程网关里连非 Lua 端点都会一起失联（爆炸半径远大于 nginx 的多 worker）。
+fn arm_quantum(thread: &Thread, quantum: u32, preempted: &Arc<AtomicBool>) {
+    if quantum == 0 {
+        return;
+    }
+    let flag = Arc::clone(preempted);
+    thread.set_hook(
+        mlua::HookTriggers::new().every_nth_instruction(quantum),
+        move |_lua, _debug| {
+            flag.store(true, Ordering::Relaxed);
+            Ok(mlua::VmState::Yield)
+        },
+    );
 }
 
 /// 调度器在协程让出后、重新 resume 时回传给协程的值（纯 Rust，跨 await 安全）。
@@ -1845,6 +1878,17 @@ impl LuaEngine {
             .map(|n| n.get())
             .unwrap_or(4)
             .clamp(1, 16);
+        // `lua_slice_instructions <n>;`：协程时间片（虚拟机指令数），0 关闭抢占。
+        // ONRouter 是单进程 + 每核一个 VM，一段不 yield 的 Lua 会占住整个 tokio worker，
+        // 所以给每个 resume 装一个指令钩子；默认值对正常脚本不可见（一段跑不满）。
+        let quantum = config
+            .root
+            .block
+            .iter()
+            .find(|d| d.name == "lua_slice_instructions")
+            .and_then(|d| d.arg(0))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(LUA_SLICE_DEFAULT);
         // 进程级定时器计数（对标 lua_max_pending/running_timers 的每 worker 计数）
         let timer_pending = Arc::new(AtomicIsize::new(0));
         let timer_running = Arc::new(AtomicIsize::new(0));
@@ -1899,12 +1943,15 @@ impl LuaEngine {
             // 调度器任务持有 VM 的强引用：引擎存活期间 job_tx 不 drop，调度器不退出，VM 随之存活
             let chunks: Arc<std::sync::Mutex<ChunkCache>> =
                 Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let preempted = Arc::new(AtomicBool::new(false));
             tokio::spawn(Self::run_scheduler(
                 vm.clone(),
                 job_rx,
                 ev_rx,
                 Arc::clone(&sched_ctl),
                 Arc::clone(&chunks),
+                quantum,
+                Arc::clone(&preempted),
             ));
             vms.push(Arc::new(VmSlot {
                 job_tx,
@@ -1912,6 +1959,8 @@ impl LuaEngine {
                 vm,
                 chunks,
                 sched_ctl,
+                quantum,
+                preempted,
             }));
         }
         for (name, _) in &inits {
@@ -4165,6 +4214,8 @@ impl LuaEngine {
                 phase_name,
                 &code,
                 &ctx,
+                slot.quantum,
+                &slot.preempted,
             );
             drop(guard);
             match outcome? {
@@ -4225,6 +4276,8 @@ impl LuaEngine {
         phase_name: &str,
         code: &Arc<str>,
         ctx: &Arc<Mutex<RequestCtx>>,
+        quantum: u32,
+        preempted: &Arc<AtomicBool>,
     ) -> Result<InlineOutcome, AppError> {
         let (thread_key, ctx_table_key) = {
             let mut cache = chunks.lock().unwrap();
@@ -4239,6 +4292,8 @@ impl LuaEngine {
             lua.set_named_registry_value("__cur_owner", co_id as i64)?;
             ngx.raw_set("ctx", ctx_table)?;
             let thread: Thread = lua.registry_value(&thread_key)?;
+            preempted.store(false, Ordering::Relaxed);
+            arm_quantum(&thread, quantum, preempted);
             thread.resume::<LuaValue>(()).map_err(AppError::from)
         })();
         match run {
@@ -4259,21 +4314,31 @@ impl LuaEngine {
                         drop_unstarted_spawns(ctl, co_id);
                         Ok(InlineOutcome::Finished)
                     }
-                    ThreadStatus::Resumable => match op_id_of(&yielded) {
-                        Some(op_id) => Ok(InlineOutcome::Yielded {
-                            op_id,
-                            thread_key,
-                            ctx_table_key,
-                        }),
-                        None => {
-                            let _ = lua.remove_registry_value(thread_key);
-                            let _ = lua.remove_registry_value(ctx_table_key);
-                            drop_unstarted_spawns(ctl, co_id);
-                            Err(AppError::Other(
-                                "attempt to yield from outside a supported operation".into(),
-                            ))
+                    ThreadStatus::Resumable => {
+                        // 钩子切出来的：不是脚本 yield，协程原样交给调度器继续跑
+                        if preempted.load(Ordering::Relaxed) {
+                            return Ok(InlineOutcome::Yielded {
+                                op_id: ADOPT_READY,
+                                thread_key,
+                                ctx_table_key,
+                            });
                         }
-                    },
+                        match op_id_of(&yielded) {
+                            Some(op_id) => Ok(InlineOutcome::Yielded {
+                                op_id,
+                                thread_key,
+                                ctx_table_key,
+                            }),
+                            None => {
+                                let _ = lua.remove_registry_value(thread_key);
+                                let _ = lua.remove_registry_value(ctx_table_key);
+                                drop_unstarted_spawns(ctl, co_id);
+                                Err(AppError::Other(
+                                    "attempt to yield from outside a supported operation".into(),
+                                ))
+                            }
+                        }
+                    }
                     // 同步 resume 不可能停在 Running；Error 表示协程异常终止
                     ThreadStatus::Error | ThreadStatus::Running => {
                         let _ = lua.remove_registry_value(thread_key);
@@ -4331,6 +4396,8 @@ impl LuaEngine {
         mut ev_rx: mpsc::UnboundedReceiver<(u64, Vec<ResumeVal>)>,
         ctl: SharedCtl,
         chunks: Arc<std::sync::Mutex<ChunkCache>>,
+        quantum: u32,
+        preempted: Arc<AtomicBool>,
     ) {
         let mut states: HashMap<u64, CoState> = HashMap::new();
         let mut ready: VecDeque<u64> = VecDeque::new();
@@ -4514,6 +4581,11 @@ impl LuaEngine {
                 // 1d) 快速路径移交的挂起协程：登记让出等待。必须放在事件处理之前——op 的
                 //     完成事件可能先于 Adopt 作业到达，若此时 waiting 里没有映射，事件会被丢弃。
                 for (co_id, op_id) in adopted {
+                    if op_id == ADOPT_READY {
+                        // 快速路径首段被时间片切出来：不等任何 op，直接排队继续跑
+                        ready.push_back(co_id);
+                        continue;
+                    }
                     park_yielded(
                         co_id,
                         op_id,
@@ -4547,6 +4619,7 @@ impl LuaEngine {
                 //    请求协程与 ngx.thread.spawn 出的子协程共用此循环：子协程是一等 states
                 //    成员，可交错跑 cosocket/ngx.sleep；完成时把 __thread_sink[tid] 投递给 parked 等待方。
                 let mut pending = std::mem::take(&mut ready);
+                let mut preempts: u32 = 0;
                 while let Some(co_id) = pending.pop_front() {
                     // 借用 st 仅用于挂上下文 + 取句柄 + 取出唤醒参数/tid；随后立即结束借用
                     let (thread, wake_args, wake_tid, is_child, owner) =
@@ -4598,21 +4671,26 @@ impl LuaEngine {
                     };
 
                     // 喂回协程本轮恢复值：wait 命中用 sink[tid] 打包结果，否则用 op 唤醒参数
-                    let resume_result = (|| -> LuaResult<LuaValue> {
-                        if let Some(tid) = wake_tid {
-                            let vals = sink_values(lua, tid)?;
-                            return thread.resume::<LuaValue>(mlua::MultiValue::from_vec(vals));
-                        }
-                        if wake_args.is_empty() {
-                            thread.resume::<LuaValue>(())
-                        } else {
-                            let mut vals: Vec<LuaValue> = Vec::with_capacity(wake_args.len());
-                            for rv in wake_args {
-                                vals.push(resume_val_to_lua(lua, rv)?);
+                    let resume_result = {
+                        // 钩子按线程挂载，且每 VM 只有一个钩子槽：每次 resume 前重装
+                        preempted.store(false, Ordering::Relaxed);
+                        arm_quantum(&thread, quantum, &preempted);
+                        (|| -> LuaResult<LuaValue> {
+                            if let Some(tid) = wake_tid {
+                                let vals = sink_values(lua, tid)?;
+                                return thread.resume::<LuaValue>(mlua::MultiValue::from_vec(vals));
                             }
-                            thread.resume::<LuaValue>(mlua::MultiValue::from_vec(vals))
-                        }
-                    })();
+                            if wake_args.is_empty() {
+                                thread.resume::<LuaValue>(())
+                            } else {
+                                let mut vals: Vec<LuaValue> = Vec::with_capacity(wake_args.len());
+                                for rv in wake_args {
+                                    vals.push(resume_val_to_lua(lua, rv)?);
+                                }
+                                thread.resume::<LuaValue>(mlua::MultiValue::from_vec(vals))
+                            }
+                        })()
+                    };
 
                     match resume_result {
                         Err(e) => {
@@ -4656,6 +4734,20 @@ impl LuaEngine {
                                         &mut tid_waitop, &mut wait_group, &mut waiting,
                                     );
                                 }
+                            }
+                            ThreadStatus::Resumable
+                                if preempted.load(Ordering::Relaxed) =>
+                            {
+                                // 时间片到、由钩子切的，不是脚本 yield：放回队尾公平轮转。
+                                // 连续切满 PREEMPT_PER_HOLD 次就交回主循环（释放 VM 锁 + await），
+                                // 这样一个热循环再也占不住 tokio worker 线程。
+                                preempts += 1;
+                                if preempts >= PREEMPT_PER_HOLD {
+                                    ready.push_back(co_id);
+                                    break;
+                                }
+                                pending.push_back(co_id);
+                                continue;
                             }
                             ThreadStatus::Resumable => match op_id_of(&yielded) {
                                 Some(sid) => park_yielded(

@@ -31,8 +31,10 @@ all gateway logic is hand-written.
 - **Large/uncached files stream from disk**: files above the cache threshold (and `Range` windows that
   miss it) are no longer read into memory. `serve_static_flow` emits a chunked `DiskBody` that seeks
   once and reads 64 KiB per poll while the response is written, with an explicit `Content-Length` so
-  keep-alive framing and `HEAD` stay exact; `HEAD` doesn't even open the file. `sub_filter` still needs
-  the whole body, but only buffers when its MIME gate matches. Verified by `tools/static_stream_e2e.py`
+  keep-alive framing and `HEAD` stay exact; `HEAD` doesn't even open the file. `sub_filter` needs the
+  whole body to rewrite it, so it buffers only when its MIME gate matches and only up to a hard
+  8 MiB ceiling (`SUB_FILTER_MAX_BUFFER`); above that the file keeps streaming untouched and the
+  skip is logged. Verified by `tools/static_stream_e2e.py`
   (19 checks: a 128 MB file served whole / by mid-file `Range` / suffix `Range` / `HEAD` / `304` /
   `416` with sha256 equality, a 2 MB file rewritten by `sub_filter` while its `Range` slice stays
   byte-exact, and a paused mid-download showing **0.6 MB RSS delta for a 128 MB file** versus the old
@@ -47,9 +49,22 @@ all gateway logic is hand-written.
 - **Unknown method** → 501; URL > 8 KB → 414; oversized headers → 431; oversized body → 413
   (rejected before the body is read).
 - **Slow connections**: do not block normal requests (the tokio concurrency model is inherently
-  resistant to single-connection Slowloris attacks).
+  resistant to single-connection Slowloris attacks). Streamed uploads (`proxy_request_buffering off`)
+  are covered by `client_body_timeout` too — the limit is per inter-read interval, not total body time.
+- **Fail-closed access control**: `auth_basic` without `auth_basic_user_file` denies (401) instead of
+  serving, htpasswd entries with an empty hash are dropped (no empty-password login), an unparsable
+  peer address denies rather than skips the `allow`/`deny` rules, and the htpasswd cache is bounded by
+  a 1 s staleness limit on top of `(mtime, size)` invalidation so revoked credentials stop working even
+  when a file is rebuilt with identical timestamps.
+- **No front/back URI disagreement**: the Upgrade (WebSocket) tunnel forwards the client's raw,
+  undecoded request target — routing/ACL decisions and what the backend parses are about the same URI.
+- **Bounded blast radius**: `sub_filter` buffers at most 8 MiB per response (larger files stream
+  unfiltered, with a warning), and Lua coroutines are preempted every `lua_slice_instructions`
+  VM instructions (default 1 000 000) so a runaway loop can no longer stall the single process.
 - Security tests: `sec_test.py` (30 checks, covering traversal / smuggling / CRLF injection /
-  malformed requests / oversized requests / default response headers).
+  malformed requests / oversized requests / default response headers) and
+  `tools/security_matrix_e2e.py` (20 checks, one gateway process per probe, reproducing each finding
+  from `docs/SECURITY_AUDIT.md` with real traffic — every probe fails on the pre-fix binary).
 
 ## Multi-core architecture
 
@@ -61,6 +76,12 @@ all gateway logic is hand-written.
   many in-flight requests as Lua coroutines — a request yields only at `ngx.sleep` and the VM lock is
   released between synchronous resume segments, so `ngx.timer` callbacks and sleep timers progress
   while other requests on the same VM run (OpenResty's single-worker C10K, not one-request-per-VM).
+  Because there is only one process, a script that *never* yields is more damaging here than in
+  multi-worker nginx — it parks that VM's tokio worker outright. So every resume arms a Lua count hook
+  (`lua_slice_instructions`, default 1 000 000 VM instructions ≈ 10 ms) that yields the coroutine back
+  to the scheduler; after 8 consecutive slices the scheduler leaves its lock/await loop. A runaway
+  `while true do end` then degrades to "one core busy, its own request never finishes" instead of
+  taking the whole gateway down with it.
 - **Low-concurrency fast path (no scheduler hop for the common case)**: when the target VM lock is
   free, the request task compiles/resumes the first Lua segment inline; scripts that never yield
   finish without ever touching the scheduler task. On the first yield the coroutine is handed to the
@@ -111,12 +132,13 @@ all gateway logic is hand-written.
 | `init_by_lua*` / `init_worker_by_lua*` / `lua_package_path` | `init_by_lua*` once per VM at startup; `init_worker_by_lua*` (inline and `_file`) once per VM after its scheduler is live, so timers/cosockets/`ngx.sleep` work; startup aborts non-zero on script errors. `lua_package_path` supports `$prefix`/`${prefix}` and OpenResty's `;;` default-path semantics, repeatable directives joined with `;`, applied before init scripts | `lua_engine.rs`, `main.rs`, `tools/init_worker_package_e2e.py` |
 | HTTP/3 serving (`listen … quic`) | quinn QUIC endpoint (UDP) + h3 over it, TLS1.3/ALPN `h3` reusing the SNI cert store; same body-agnostic request core as h1/h2 (vhost/location/rewrite/access/proxy/lua); TCP-TLS on the same port serves h1/h2 and advertises `Alt-Svc: h3=":port"` | `server.rs`, `certs.rs`, `router.rs` |
 | `ngx_lua` scripting layer | mlua (Lua 5.4), see the Lua API list below | `lua_engine.rs` |
+| `lua_slice_instructions <n>;` | ONRouter-only cooperative preemption quantum: every coroutine resume arms a Lua count hook that yields back to the VM scheduler after `n` VM instructions (default 1 000 000 ≈ 10 ms of pure Lua; `0` disables). Bounds how long one script can hold a VM/tokio worker, so a runaway loop no longer blackouts the single process. Normal request scripts never reach a slice, so measured Lua throughput is unchanged (12.9k → 13.3k req/s within noise) | `lua_engine.rs`, `tools/security_matrix_e2e.py` |
 | `lua_shared_dict` / `ngx.shared.DICT` | full OpenResty method surface: `get`/`get_stale`/`get_plus`/`get2`, `set`/`safe_set`/`force_set`/`set_auto`, `add`/`force_add`/`replace`, `incr`/`decr`/`bump`, `delete`/`flush_all`/`flush_expired`, `ttl`/`key_present`/`size`/`len`/`num`/`capacity`/`free_space`/`get_keys`/`expire` (true multi-value returns) | `shared_dict.rs`, `lua_engine.rs` |
 | `access_log` combined format | local file + stdout; `$remote_addr` is captured after realip, so logs show the real client, not the trusted proxy; each line also carries `$request_time` and the `$upstream_addr` / `$upstream_status` / `$upstream_header_time` triple (`- - -` when no upstream was contacted; Upgrade tunnels log the `101` peer); a full async queue drops and counts lines instead of blocking request tasks | `access_log.rs` |
 | third-party C modules | `content_by_rust` / `access_by_rust` compile-time registered Rust handlers | `engine.rs` |
 | `stub_status` / Prometheus scraping | process-global runtime metrics (accepted/active/capacity + requests + 2xx/3xx/4xx/5xx) plus per-upstream node connections/health/success/failure, cache-status counters, TLS handshake failures, limit_req/limit_conn rejections and dropped access-log lines, rendered as Prometheus text via `content_by_rust metrics` | `metrics.rs` |
 | `allow` / `deny` | ACCESS-phase IP ACL: IPv4/IPv6/CIDR/`all`, ordered first-match-wins (default allow), location inherits server rules | `access.rs` |
-| `auth_basic` / `auth_basic_user_file` | HTTP Basic auth in ACCESS phase; htpasswd supports plaintext, `{SHA}` (SHA-1), `$1$`/`$apr1$` (MD5-crypt), realm tri-state incl. `off`, mtime-cached file reload | `access.rs` |
+| `auth_basic` / `auth_basic_user_file` | HTTP Basic auth in ACCESS phase; htpasswd supports plaintext, `{SHA}` (SHA-1), `$1$`/`$apr1$` (MD5-crypt), realm tri-state incl. `off`. Fail closed: a realm with no user file denies, empty-hash entries are dropped, and the file cache invalidates on `(mtime, size)` **or** after 1 s of age, so a rewritten credential file takes effect even with preserved timestamps | `access.rs` |
 | nginx syntax compatibility | `location =/\^~/~/~*`, server_name wildcards, error_page, try_files, index, autoindex, alias, client_max_body_size, return URL shorthand | |
 
 ## Directory layout
@@ -371,6 +393,11 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   regex + `&` back-reference, `application/json` left alone under the default `text/html` gate, the
   `content_by_lua` path, a static file fully rewritten, and the same file's `Range` slice kept
   un-rewritten) + unit tests `sub_filter_*` and `parse_sub_filter_directives`.
+  On the static seam only the served `[start, start+len)` window is read from disk, and a body larger
+  than `SUB_FILTER_MAX_BUFFER` (8 MiB) is streamed **un-rewritten** with a warning: nginx streams the
+  substitution with a small tail window, we buffer, so the buffer has to be capped (a single
+  `sub_filter` line must not turn a large file into a per-request memory amplification). Verified by
+  `tools/security_matrix_e2e.py` probe `s6`.
 - Real client IP — the nginx `ngx_http_realip_module` (`realip.rs`). Behind a CDN or load balancer the
   socket peer is the proxy, not the visitor; `set_real_ip_from <ip>|<cidr>` (repeatable) lists the
   **trusted proxy** ranges, `real_ip_header <name>` (default `X-Real-IP`; e.g. `X-Forwarded-For`, or
@@ -526,9 +553,11 @@ them as standalone runnable assertion scripts.
   `ngx.sleep` request and recovery afterwards, a raw TLS-garbage probe bumping the handshake-failure
   counter, a WebSocket 101 upgrade counted against its upstream, and access-log line assertions for
   `$request_time` + the upstream triple (proxied, no-upstream `- - -`, and Upgrade `101`).
-- The whole suite (unit tests + 63 Python E2E scripts: every `tools/*_e2e.py` plus the root
+- The whole suite (unit tests + 64 Python E2E scripts: every `tools/*_e2e.py` plus the root
   scenario/compat/security/static/upstream suites) is re-run after these changes:
-  `cargo test --workspace` 251/251 and every E2E script passes with real traffic.
+  `cargo test --workspace` 255/255 and every E2E script passes with real traffic.
+  `python run_regression.py summaryD.txt` runs all of them and writes the exit-code
+  roll-up plus per-script logs under `logs/regression/`.
 - The official suite is vendored under `vendor/lua-nginx-module/t/` (gitignored) as a semantics
   reference. Running a full `.t` directly via Test::Nginx requires a real OpenResty binary as
   `TEST_NGINX_BINARY` plus `*_by_lua_block` syntax and Unix signals, which do not run on this Windows
@@ -599,7 +628,13 @@ Already done (previously listed as gaps, now implemented):
   (`server.rs::handle_upgrade` + `ProxyEngine::upgrade`); WS-frame bytes that race ahead of the
   backend's 101 are not lost (prefix buffer). The tunnel reaches both `http://` and TLS backends
   (`https://`/`wss://`) through the same connector (`proxy.rs` → `proxy_tls.rs`), verified by
-  `tools/https_backend_e2e.py`.
+  `tools/https_backend_e2e.py`. The request line sent to the backend carries the client's **raw,
+  undecoded** request target (nginx behaviour): routing/`allow`/`deny`/`limit` decisions were made on
+  that same string, so `%23` cannot arrive as a bare `#` (fragment truncation) or `%3f` as a second
+  `?` and make the backend talk about a different resource than the gateway guarded. Only a
+  `rewrite`-produced path (already decoded) or a non-origin-form target is re-encoded per segment.
+  Verified by `tools/security_matrix_e2e.py` probe `s4`, which reads the request line the fake
+  backend actually received, plus unit test `upgrade_target_forwards_raw_undecoded_uri`.
 - **https / wss backends**: `proxy_pass https://…` (and `wss://…` upgrades) terminate TLS to the
   upstream with a pure-Rust rustls client over one pooled connector shared with plain-HTTP backends
   (`proxy_tls.rs::ProxyConnector` implements `tower_service::Service<Uri>`; `ProxyStream` is either a
@@ -643,6 +678,12 @@ Already done (previously listed as gaps, now implemented):
   switching. (`proxy.rs::ProxyBody`, `server.rs::handle_request`, verified by
   `tools/streaming_body_e2e.py`: a body dribbled to the backend over ~1.2s shows a ~1.1s read span
   through `off` but a single burst read through `on`, with matching sha256 both ways.)
+  The forwarded body is wrapped in `StreamBodyGuard`, which enforces **both** `client_max_body_size`
+  (counted while streaming, since chunked has no declared length to pre-check → 413) and
+  `client_body_timeout` (a `tokio::time::Sleep` re-armed on every data frame, so a client that sends
+  one chunk and stalls is cut after the idle interval → 408, the nginx status for this case).
+  `tools/security_matrix_e2e.py` probe `s5` shows a stalled upload being closed at the configured
+  2 s while `/ping` keeps answering.
 - **`proxy_send_timeout` idle-write watchdog**: covers every header/body/flush write on the upstream
   stream (plain or TLS). A write that stays `Pending` for the configured duration aborts the hop with
   `Timed out`; `0` disables it, matching nginx (the timeout is per write operation, not a total
@@ -709,13 +750,19 @@ Already done (previously listed as gaps, now implemented):
   evaluated first-match-wins with default-allow, and a location with no own rules inherits the
   server's. `auth_basic`/`auth_basic_user_file` enforce HTTP Basic with the realm as a tri-state
   (`unset` inherits, `off`/`""` disables, else enables); the htpasswd file is loaded through a
-  process-wide cache keyed by mtime. Password records may be plaintext, `{SHA}` (SHA-1 base64),
+  process-wide cache that reloads when `(mtime, size)` changes **or** once the entry is older than
+  1 s. Both gates fail closed: an unparsable peer address is a `403` rather than "no rules matched",
+  a realm without a user file is a `401` challenge rather than a pass, and an htpasswd line with an
+  empty hash is dropped so it can never match an empty password. Password records may be plaintext,
+  `{SHA}` (SHA-1 base64),
   `$1$` (glibc MD5-crypt) or `$apr1$` (Apache MD5-crypt) — MD5 and SHA-1 are implemented in pure Rust
   (no crypto crates, so cross-compiles stay clean), and the MD5-crypt output is validated against
   `openssl passwd` reference vectors. Comparisons are constant-time. (`access.rs`, `server.rs`,
   `router.rs`, verified by `tools/auth_e2e.py`: missing/wrong credentials → `401` with a
   `WWW-Authenticate: Basic realm=…` challenge, correct `{SHA}`/`$apr1$`/plaintext logins → `200`,
-  `deny all` → `403`, `allow 127.0.0.1/32` matches the loopback client.) crypt-DES and bcrypt
+  `deny all` → `403`, `allow 127.0.0.1/32` matches the loopback client; plus
+  `tools/security_matrix_e2e.py` probes `s1`/`s2`/`s3` for the three fail-open cases and unit tests
+  `empty_hash_entry_never_authenticates`, `htpasswd_cache_*`.) crypt-DES and bcrypt
   (`$2y$`) htpasswd records are not yet supported.
 - **Subrequests (`ngx.location.capture`)**: a captured location runs the entire request pipeline
   (rewrite → access → content: static, `return`, `proxy_pass`, and nested Lua content all work) as an

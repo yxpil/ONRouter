@@ -19,25 +19,49 @@ use std::time::SystemTime;
 
 // ==================== htpasswd 文件缓存 ====================
 
-/// 进程级 htpasswd 缓存：按路径缓存解析结果，文件 mtime 变化时重载（对标 nginx open_file_cache
-/// 的被动失效）。读不到文件或解析失败返回 `None`，调用方按“认证失败”处理。
+/// 进程级 htpasswd 缓存：按路径缓存解析结果。失效条件取三者之一——
+/// mtime 变化、文件大小变化、或缓存年龄超过 `HTPASSWD_MAX_AGE`。
+/// 前两者对标 nginx open_file_cache 的被动失效；第三条是必须的：
+/// 运维常用 `htpasswd -b` 原子重建文件，新文件可与旧文件同 mtime（同一秒/时钟粒度）
+/// 且同长度（改口令长度不变），只看 mtime 会让"撤销用户"无限期不生效。
+/// 读不到文件或解析失败返回 `None`，调用方按“认证失败”处理。
 /// 存 Arc：缓存命中只克隆指针，不再整份复制用户表。
-static HTPASSWD_CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, Arc<Htpasswd>)>>> = OnceLock::new();
+static HTPASSWD_CACHE: OnceLock<Mutex<HashMap<PathBuf, HtpasswdCacheEntry>>> = OnceLock::new();
+
+/// 口令文件最长缓存年龄。1s 相对每请求的 md5crypt（1000 轮 MD5）开销可忽略，
+/// 但把"改口令/删用户"的传播延迟压到人眼不可察的量级。
+const HTPASSWD_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1);
+
+struct HtpasswdCacheEntry {
+    mtime: SystemTime,
+    len: u64,
+    fetched_at: std::time::Instant,
+    users: Arc<Htpasswd>,
+}
 
 pub fn load_htpasswd(path: &Path) -> Option<Arc<Htpasswd>> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
+    let len = meta.len();
     let cache = HTPASSWD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     // 中毒的锁：拿内部数据继续（缓存非关键状态）
     let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((t, users)) = map.get(path) {
-        if *t == mtime {
-            return Some(Arc::clone(users));
+    if let Some(e) = map.get(path) {
+        if e.mtime == mtime && e.len == len && e.fetched_at.elapsed() < HTPASSWD_MAX_AGE {
+            return Some(Arc::clone(&e.users));
         }
     }
     let text = std::fs::read_to_string(path).ok()?;
     let users = Arc::new(Htpasswd::parse(&text));
-    map.insert(path.to_path_buf(), (mtime, Arc::clone(&users)));
+    map.insert(
+        path.to_path_buf(),
+        HtpasswdCacheEntry {
+            mtime,
+            len,
+            fetched_at: std::time::Instant::now(),
+            users: Arc::clone(&users),
+        },
+    );
     Some(users)
 }
 
@@ -228,6 +252,11 @@ impl Htpasswd {
                 continue;
             }
             if let Some((user, hash)) = line.split_once(':') {
+                // 空哈希条目永不放行：否则空口令即可匹配（明文分支会退化成 "" == ""）。
+                // Apache 与 nginx 同样把这种行视为不可认证。
+                if hash.is_empty() {
+                    continue;
+                }
                 // 覆盖同名旧条目
                 if let Some(pos) = entries.iter().position(|(u, _)| u == user) {
                     entries[pos].1 = hash.to_string();
@@ -695,6 +724,60 @@ mod tests {
         assert!(!h.verify("carol", "secret"));
         let users: Vec<_> = h.users().collect();
         assert_eq!(users, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn empty_hash_entry_never_authenticates() {
+        // `user:` 空哈希会被存成空串，明文分支退化成 "" == ""，
+        // 空口令即可登录——解析阶段就必须丢掉这种条目。
+        let h = Htpasswd::parse("dave:\nerin:{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ=");
+        assert!(!h.verify("dave", ""));
+        assert!(!h.verify("dave", "anything"));
+        assert_eq!(h.users().collect::<Vec<_>>(), vec!["erin"]);
+    }
+
+    /// 把文件的 mtime 恢复到指定值（模拟 `htpasswd -b` 原子重建后 mtime 同秒不变的情形）。
+    /// 需要可写句柄，只读句柄上 set_modified 在 Windows 会失败。
+    fn restore_mtime(path: &Path, stamp: SystemTime) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(stamp).unwrap();
+    }
+
+    #[test]
+    fn htpasswd_cache_reloads_when_size_changes_under_same_mtime() {
+        let dir = std::env::temp_dir().join(format!("orr_htpw_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("users");
+        std::fs::write(&path, "alice:secret\n").unwrap();
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(load_htpasswd(&path).unwrap().verify("alice", "secret"));
+        // 撤销 alice：原子重建文件后把 mtime 恢复原值，只留长度差异
+        std::fs::write(&path, "bob:secret2\n").unwrap();
+        restore_mtime(&path, stamp);
+        let h = load_htpasswd(&path).unwrap();
+        assert!(!h.verify("alice", "secret"), "长度变化必须触发重载");
+        assert!(h.verify("bob", "secret2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn htpasswd_cache_expiry_bounds_staleness() {
+        // mtime 与长度都不变（同一秒内改口令、等长替换）：只能靠缓存年龄兜底
+        let dir = std::env::temp_dir().join(format!("orr_htpw_age_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("users");
+        std::fs::write(&path, "alice:aaa\n").unwrap();
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(load_htpasswd(&path).unwrap().verify("alice", "aaa"));
+        std::fs::write(&path, "alice:bbb\n").unwrap();
+        restore_mtime(&path, stamp);
+        // 未到缓存年龄：命中旧副本（允许短暂陈旧）
+        assert!(load_htpasswd(&path).unwrap().verify("alice", "aaa"));
+        std::thread::sleep(HTPASSWD_MAX_AGE + std::time::Duration::from_millis(300));
+        let h = load_htpasswd(&path).unwrap();
+        assert!(h.verify("alice", "bbb"), "超过缓存年龄必须重载");
+        assert!(!h.verify("alice", "aaa"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

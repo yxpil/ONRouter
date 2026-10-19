@@ -160,7 +160,17 @@ The remaining gaps are concentrated in four areas:
   (no `send`/`shutdown` on the client socket).
 - `header_filter_by_lua`/`body_filter_by_lua` force buffering (no streaming through
   filters; same tradeoff as nginx filters but no `proxy_buffering off` bypass).
+- `return` does not interpolate variables (`engine.rs:1041` copies the text verbatim,
+  including the 30x `Location`). Verified on a live listener:
+  `return 200 "ip=$remote_addr uri=$uri"` responds `ip=$remote_addr uri=$uri`, while
+  nginx returns the values. `content_by_rust echo`/`status` *do* interpolate, and so
+  do header/cache-key surfaces, which makes the inconsistency easy to miss.
 - Native-tls legacy backend ignores `ssl_certificate_by_lua` and session options.
+- With no ALPN overlap (client offers only `h2`, vhost serves HTTP/1.1), rustls
+  aborts with a `no_application_protocol` alert; nginx/OpenSSL continue the
+  handshake and serve HTTP/1.1. Surfaced as the two `GAP` lines in
+  `tools/https_matrix_e2e.py` (that suite still exits 0, so read its log, not its
+  exit code).
 - QUIC listeners use the static SNI cert store; handshake scripts do not run on
   QUIC.
 - `init_by_lua*` / `init_worker_by_lua*` / `lua_package_path` changes require a
@@ -192,6 +202,25 @@ The remaining gaps are concentrated in four areas:
 - Test harness: ported assertion scripts, not the full Perl `Test::Nginx` suite
   (the official suite is vendored as semantics reference only).
 
+### 2.4 nginx directives that parse, warn and are ignored
+
+Verified by running `onrouter -t` on a config that uses each of them (2026-10-19):
+every one emits `未知指令 '<name>'（已忽略…）` and the config test still **passes
+with exit code 0**. In the surfaces that *do* interpolate (`proxy_set_header`,
+`add_header`, `proxy_cache_key`, `proxy_cache_bypass`, log lines), an unknown
+`$variable` renders as empty (`interpolate_vars`, `proxy.rs:756`); elsewhere it is
+left literal — see the `return` note in §2.2. So this is a migration hazard, not a
+crash: a security control copied from a nginx config (`auth_request`, `if`,
+`valid_referers`, `secure_link`) can be absent while the gateway reports a healthy
+start — always read the warnings, not just the exit code.
+
+| Scope | Directives | Notes |
+|---|---|---|
+| top | `worker_shutdown_timeout`, `ssl_stapling` | `shutdown_grace` is ONRouter's own drain knob; stapling is a §2.1 gap |
+| server | `valid_referers`, `secure_link`, `secure_link_md5`, `gzip_static` | referer/link checks: do in Lua or `content_by_rust`; pre-compressed `.gz` serving falls back to on-the-fly gzip |
+| location | `if` (with its whole block), `limit_rate`, `auth_request`, `dav_methods`, `grpc_pass`, `fastcgi_pass`, `mirror`, `proxy_bind`, `proxy_cache_revalidate` | `if` swallows its block: a nested `return 405` is ignored too. Downstream-protocol upstreams (`grpc`/`fastcgi`) and upstream source binding are simply not implemented |
+| scope | `client_body_timeout` (and the other process timeouts) is **root-level only** | `client_body_timeout 2s;` inside `server {}`/`location {}` warns as unknown and is ignored — it is a `Settings` field, not a per-vhost override (nginx allows it per server/location) |
+
 ## 3. Performance snapshot (Windows, 2026-10-18)
 
 `python bench_ab.py --sweep 1,4 --requests 12000` on a 16-logical-core Windows
@@ -219,15 +248,22 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
 
 ## 4. Verification inventory
 
-- Unit tests: 251 passing (`cargo test --workspace`; 238 in onrouter-server +
+- Unit tests: 255 passing (`cargo test --workspace`; 242 in onrouter-server +
   13 in onrouter-config).
 - E2E suites (real traffic), this snapshot:
   - `lua_concurrency` 5/5, `thread` 24/24, `cosocket` 7/7, `subrequest` 18/18
   - `lua_flush_socket` 23/23, `init_worker_package` 21/21, `ssl_cert_lua` 21/21,
     `metrics` 38/38, `observability` 26/26, `api_compat` 57/57
-  - Full regression: 63 scripts (8 root scenario/compat/security/static/upstream
+  - `security_matrix` 20/20 (the seven findings from `docs/SECURITY_AUDIT.md`, each
+    probe asserting the pre-fix failure mode is gone: fail-closed `auth_basic` and
+    `allow/deny`, streamed-body `client_body_timeout` → 408, raw undecoded Upgrade
+    request-target, htpasswd change visibility, `sub_filter` memory ceiling, Lua
+    runaway-loop preemption), `static_stream` 19/19, `streaming_body` 7/7
+  - Full regression: 64 scripts (8 root scenario/compat/security/static/upstream
     suites + every `tools/*_e2e.py` incl. TLS matrix, HTTP/2, HTTP/3, hot reload,
-    cache, filters, auth, stream, resty, and API-compat) all exited 0.
+    cache, filters, auth, stream, resty, security-matrix and API-compat) all
+    exited 0. Run them with `python run_regression.py summaryD.txt`
+    (per-script logs and the exit-code roll-up land in `logs/regression/`).
   - `native-tls` legacy handshake suite 12/12 with `--features native-tls`
     (runtime-generated RSA cert); the default rustls build still passes it.
 - Not verifiable on this host: USR2/Linux signal behavior and the Linux A/B

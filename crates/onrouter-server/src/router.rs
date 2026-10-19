@@ -1379,6 +1379,7 @@ impl Router {
             "limit_req_zone", "limit_conn_zone", "limit_req_status", "limit_conn_status",
             "lua_shared_dict", "init_by_lua", "init_by_lua_file",
             "init_worker_by_lua", "init_worker_by_lua_file", "lua_package_path",
+            "lua_slice_instructions",
             "error_log", "error_log_max_size", "error_log_keep",
             "access_log", "access_log_max_size", "access_log_keep",
             "resolver", "resolver_timeout", "pid",

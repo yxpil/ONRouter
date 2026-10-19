@@ -945,6 +945,8 @@ async fn handle_request(
             .map(|l| l.proxy_pass.is_some() && !l.proxy_request_buffering)
             .unwrap_or(false);
     let inbound = if stream_body {
+        // 流式路径同样受 client_body_timeout 约束（在 StreamBodyGuard 里逐帧计时）
+        let idle_body = state.settings.client_body_timeout;
         // 分块无法预先限长；声明了 Content-Length 时先做 upfront 拒绝，
         // 其余（chunked / 谎报长度）在转发途中由 BodyLimitBody 边数边限。
         if let Some(max) = limit {
@@ -959,10 +961,8 @@ async fn handle_request(
             }
         }
         let body = match limit {
-            Some(max) if max != u64::MAX => {
-                BodyLimitBody { inner: body, max, seen: 0 }.boxed()
-            }
-            _ => body,
+            Some(max) if max != u64::MAX => StreamBodyGuard::new(body, max, idle_body).boxed(),
+            _ => StreamBodyGuard::new(body, u64::MAX, idle_body).boxed(),
         };
         ProxyBody::Streaming(Some(body))
     } else {
@@ -1226,17 +1226,66 @@ async fn read_body(
     Ok(Bytes::from(out))
 }
 
+/// `sub_filter` 处理磁盘文件时的缓冲上限：超过则跳过改写、原样流式发送。
+/// nginx 的 sub_filter 是流式过滤器（只保留匹配长度的尾巴窗口），代价小；
+/// 我们按整段替换实现，必须给它一个硬上限，否则一个指令 + 一个大文件 = 内存放大。
+const SUB_FILTER_MAX_BUFFER: u64 = 8 << 20;
+
+/// 只读取文件的 `[start, start+len)` 窗口，而不是整份文件。
+/// 旧实现对任意 len 都 `fs::read` 全文件——range 截断与大响应体都会多读多占。
+async fn read_file_window(path: &std::path::Path, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut f = tokio::fs::File::open(path).await?;
+    if start > 0 {
+        f.seek(std::io::SeekFrom::Start(start)).await?;
+    }
+    let mut buf = Vec::with_capacity(len as usize);
+    f.take(len).read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
 /// 流式请求体的字节上限：chunked 没有 Content-Length 可预检，只能边转发边计数。
 /// 超限时以 body 错误中断，上游连接随之中断（不会把超出的字节继续塞给后端）。
 const STREAM_BODY_LIMIT_ERR: &str = "client_max_body_size exceeded (streamed request body)";
+/// 流式请求体的空闲超时：nginx 的 `client_body_timeout` 是"两次读之间"的间隔上限，
+/// 缓冲式路径由 read_body 的 per-frame timeout 实现；`proxy_request_buffering off`
+/// 绕过 read_body，必须在 body 适配器里补上同一条超时，否则一个慢客户端可以
+/// 发一个 chunk 后永久挂住——连接额度、上游连接一起被钉住（慢速拒绝服务）。
+const STREAM_BODY_TIMEOUT_ERR: &str = "client_body_timeout exceeded (streamed request body)";
 
-struct BodyLimitBody {
+struct StreamBodyGuard {
     inner: crate::proxy::ProxyReqBody,
     max: u64,
     seen: u64,
+    /// None = 关闭（`client_body_timeout 0`）
+    idle: Option<Duration>,
+    /// 用 `Pin<Box<Sleep>>` 持有定时器：本结构体因此保持 `Unpin`，
+    /// 可以用 `get_mut()` 而不是 `unsafe get_unchecked_mut()`。
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
-impl Body for BodyLimitBody {
+impl StreamBodyGuard {
+    fn new(inner: crate::proxy::ProxyReqBody, max: u64, idle: Duration) -> Self {
+        let idle = if idle.is_zero() { None } else { Some(idle) };
+        let timer = idle.map(|d| Box::pin(tokio::time::sleep(d)));
+        StreamBodyGuard {
+            inner,
+            max,
+            seen: 0,
+            idle,
+            timer,
+        }
+    }
+
+    /// 收到数据后重新计时（nginx 语义：超时只约束相邻两次读，不是总时长）
+    fn rearm(&mut self) {
+        if let Some(d) = self.idle {
+            self.timer = Some(Box::pin(tokio::time::sleep(d)));
+        }
+    }
+}
+
+impl Body for StreamBodyGuard {
     type Data = Bytes;
     type Error = crate::proxy::BoxError;
 
@@ -1245,13 +1294,22 @@ impl Body for BodyLimitBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        if let Some(t) = this.timer.as_mut() {
+            if t.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Some(Err(STREAM_BODY_TIMEOUT_ERR.into())));
+            }
+        }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
+                let got_data = frame.data_ref().is_some();
                 if let Some(data) = frame.data_ref() {
                     this.seen = this.seen.saturating_add(data.len() as u64);
                     if this.seen > this.max {
                         return Poll::Ready(Some(Err(STREAM_BODY_LIMIT_ERR.into())));
                     }
+                }
+                if got_data {
+                    this.rearm();
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -1437,19 +1495,21 @@ async fn run_ingress<'a>(
             }
         }
         // 2) rewrite_by_rust / rewrite_by_lua
-        if !run_phases(state, ctx, loc, Phase::Rewrite, server).await {
-            if let Some((code, target)) = ctx.redirect.take() {
-                return Err(redirect_response(code, &target));
-            }
-            if ctx.done {
-                return Err(finish_response(ctx, server, last_loc));
-            }
-            if ctx.internal_redirect {
-                ctx.internal_redirect = false;
-                ctx.internal_request = true;
-                ctx.exec_depth = ctx.exec_depth.saturating_add(1);
-                continue;
-            }
+        if run_phases(state, ctx, loc, Phase::Rewrite, server).await {
+            // 阶段脚本报错必须就此收口：继续往下跑会让"检查没跑成"变成"检查通过"
+            return Err(error_response(ctx, server, last_loc, 500).await);
+        }
+        if let Some((code, target)) = ctx.redirect.take() {
+            return Err(redirect_response(code, &target));
+        }
+        if ctx.done {
+            return Err(finish_response(ctx, server, last_loc));
+        }
+        if ctx.internal_redirect {
+            ctx.internal_redirect = false;
+            ctx.internal_request = true;
+            ctx.exec_depth = ctx.exec_depth.saturating_add(1);
+            continue;
         }
         // 3) PREACCESS：limit_req
         if let Some(resp) = check_limit_req(state, ctx, loc) {
@@ -1460,19 +1520,21 @@ async fn run_ingress<'a>(
             return Err(resp);
         }
         // 4) ACCESS：access_by_rust / access_by_lua
-        if !run_phases(state, ctx, loc, Phase::Access, server).await {
-            if let Some((code, target)) = ctx.redirect.take() {
-                return Err(redirect_response(code, &target));
-            }
-            if ctx.done {
-                return Err(finish_response(ctx, server, last_loc));
-            }
-            if ctx.internal_redirect {
-                ctx.internal_redirect = false;
-                ctx.internal_request = true;
-                ctx.exec_depth = ctx.exec_depth.saturating_add(1);
-                continue;
-            }
+        if run_phases(state, ctx, loc, Phase::Access, server).await {
+            // 同上：access 检查脚本加载失败或运行报错 = 拒绝，绝不放行到 content/proxy
+            return Err(error_response(ctx, server, last_loc, 500).await);
+        }
+        if let Some((code, target)) = ctx.redirect.take() {
+            return Err(redirect_response(code, &target));
+        }
+        if ctx.done {
+            return Err(finish_response(ctx, server, last_loc));
+        }
+        if ctx.internal_redirect {
+            ctx.internal_redirect = false;
+            ctx.internal_request = true;
+            ctx.exec_depth = ctx.exec_depth.saturating_add(1);
+            continue;
         }
 
         // return 指令在 access 之前生效（nginx 的 return 属于 rewrite 阶段，这里保持原实现语义）
@@ -1511,7 +1573,9 @@ async fn process(
     // ---- CONTENT ----
     if let Some(target) = &loc.proxy_pass {
         // BALANCER：balancer_by_lua 在转发前运行，Lua 可经 ngx.balancer 选定上游节点/超时
-        let _ = run_phases(state, ctx, loc, Phase::Balancer, server).await;
+        if run_phases(state, ctx, loc, Phase::Balancer, server).await {
+            return error_response(ctx, server, Some(loc), 500).await;
+        }
         let headers = router::effective_proxy_headers(loc, server);
         let opts = ProxyOpts {
             set_headers: &headers,
@@ -1794,6 +1858,10 @@ async fn process(
                 if e.contains(STREAM_BODY_LIMIT_ERR) {
                     return error_response(ctx, server, Some(loc), 413).await;
                 }
+                // 流式上传卡住同样是客户端问题：nginx 对 client_body_timeout 回 408
+                if e.contains(STREAM_BODY_TIMEOUT_ERR) {
+                    return error_response(ctx, server, Some(loc), 408).await;
+                }
                 error_response(ctx, server, Some(loc), 502).await
             }
         }
@@ -1811,14 +1879,20 @@ async fn process(
         let failed = if streamable {
             match start_streaming_content(state, ctx, server, loc, name, src, scope).await {
                 StreamStart::Streamed(resp) => return resp,
-                StreamStart::Completed(res) => res.is_some(),
+                StreamStart::Completed(err) => match err {
+                    Some(e) => {
+                        log_error!("{name} 执行失败: {e}");
+                        true
+                    }
+                    None => false,
+                },
             }
         } else {
             run_lua(state, ctx, name, src).await
         };
-        // 出错已由收尾逻辑记账并置 500，这里只需处理脚本产生的跳转
+        // 脚本没跑成就是 5xx：这里不能按 ctx 里残留的 200 收尾，否则"缺文件"会变成"空 200"
         if failed {
-            return finish_response(ctx, server, Some(loc));
+            return error_response(ctx, server, Some(loc), 500).await;
         }
         if let Some((code, target)) = ctx.redirect.take() {
             return redirect_response(code, &target);
@@ -1877,7 +1951,8 @@ async fn process(
     serve_static_flow(state, ctx, server, loc, body, scope).await
 }
 
-/// 执行某个阶段的 rust + lua 处理器；返回 true 表示应当中止（出错）
+/// 执行某个阶段的 rust + lua 处理器；返回 true 表示出错（已置 ctx.status=500/done）。
+/// 调用方必须在 true 时立即收口：继续往下走等于把"检查没跑成"当成"检查通过"。
 async fn run_phases(
     state: &Arc<AppState>,
     ctx: &mut RequestCtx,
@@ -2003,9 +2078,18 @@ async fn check_access_and_auth(
         &server.access_rules
     };
     if !rules.is_empty() {
-        if let Ok(ip) = ctx.remote_addr.parse::<std::net::IpAddr>() {
-            if !crate::access::check_access(rules, ip) {
-                log_debug!("allow/deny 拒绝 {}", ctx.remote_addr);
+        // 地址解析不了必须拒绝（fail closed）：allow/deny 是访问控制，
+        // 把"读不到对端 IP"当成"没有规则"等于给绕过者开门。
+        match ctx.remote_addr.parse::<std::net::IpAddr>() {
+            Ok(ip) => {
+                if !crate::access::check_access(rules, ip) {
+                    log_debug!("allow/deny 拒绝 {}", ctx.remote_addr);
+                    ctx.status = 403;
+                    return Some(status_page(403));
+                }
+            }
+            Err(_) => {
+                log_error!("allow/deny 无法解析对端地址 {}，按拒绝处理", ctx.remote_addr);
                 ctx.status = 403;
                 return Some(status_page(403));
             }
@@ -2021,10 +2105,21 @@ async fn check_access_and_auth(
         Some(r) if r != "off" => r,
         _ => return None,
     };
-    let file = loc
+    // 启用 auth_basic 却没有口令文件同样 fail closed：没有可校验的凭据源，
+    // 任何请求（包括无 Authorization 的）都拿不到 200。nginx 在此情形返回 500，
+    // 我们用 401 质询 + error_log，既不泄露内容、又能让客户端提示输入口令。
+    let file = match loc
         .auth_basic_user_file
         .as_ref()
-        .or(server.auth_basic_user_file.as_ref())?;
+        .or(server.auth_basic_user_file.as_ref())
+    {
+        Some(f) => f,
+        None => {
+            log_error!("auth_basic 已启用但未配置 auth_basic_user_file，按未授权处理");
+            ctx.status = 401;
+            return Some(basic_challenge(realm));
+        }
+    };
 
     // 校验 Authorization（缺失/格式错/不匹配一律 401，附带 WWW-Authenticate）。
     // 文件读取与口令校验（md5crypt 是 1000 轮 MD5）一起丢进阻塞池：
@@ -2119,21 +2214,33 @@ async fn serve_static_flow(
                     None => content,
                 }),
                 FileSource::Disk { path, start, len } => match filter {
-                    Some(conf) => match tokio::fs::read(&path).await {
-                        Ok(all) => {
-                            let lo = start as usize;
-                            let hi = (start + len).min(all.len() as u64) as usize;
-                            FileSource::Memory(Bytes::from(crate::engine::apply_sub_filter(
-                                Some(conf),
-                                Some(mime.as_str()),
-                                all.get(lo..hi).unwrap_or(&[]).to_vec(),
-                            )))
+                    // 超过缓冲上限的响应体不改写，原样零拷贝流式发送。
+                    // sub_filter 需要看到整段内容才能替换，全量缓冲等于把
+                    // "文件大小 × 并发数"的内存压在请求任务上；宁可漏改写一个
+                    // 大文件，也不能让一条 `sub_filter` 指令变成内存放大开关。
+                    Some(_) if len > SUB_FILTER_MAX_BUFFER => {
+                        log_warn!(
+                            "sub_filter 跳过 {}: 响应体 {len} 字节超过缓冲上限 {} MiB，按原样发送",
+                            path.display(),
+                            SUB_FILTER_MAX_BUFFER >> 20
+                        );
+                        FileSource::Disk { path, start, len }
+                    }
+                    Some(_) => {
+                        match read_file_window(&path, start, len).await {
+                            Ok(win) => FileSource::Memory(Bytes::from(
+                                crate::engine::apply_sub_filter(
+                                    filter,
+                                    Some(mime.as_str()),
+                                    win,
+                                ),
+                            )),
+                            Err(e) => {
+                                log_warn!("静态文件读取失败 {}: {e}", path.display());
+                                return error_response(ctx, server, Some(loc), 404).await;
+                            }
                         }
-                        Err(e) => {
-                            log_warn!("静态文件读取失败 {}: {e}", path.display());
-                            return error_response(ctx, server, Some(loc), 404).await;
-                        }
-                    },
+                    }
                     None => FileSource::Disk { path, start, len },
                 },
             };
@@ -3202,7 +3309,9 @@ async fn handle_upgrade(
     };
 
     // Upgrade 与普通转发同语义：balancer_by_lua 先选点，set_timeouts 覆盖本跳超时
-    let _ = run_phases(&state, &mut ctx, &location, Phase::Balancer, &server).await;
+    if run_phases(&state, &mut ctx, &location, Phase::Balancer, &server).await {
+        return error_response(&mut ctx, &server, Some(&location), 500).await;
+    }
 
     let timeouts = ProxyTimeouts {
         connect: location.proxy_connect_timeout,

@@ -668,6 +668,23 @@ fn encode_path(path: &str) -> String {
         .join("/")
 }
 
+/// Upgrade（WebSocket 隧道）的请求行必须转发客户端**原始的、未解码**的 request target。
+/// 用解码后的路径拼接会让 `%23` 变成裸 `#`（后端把它当片段截断 URI）、`%2f` 变成 `/`、
+/// `%2541` 之类二次编码也被顺手解掉一层——前后端对"这是哪个资源"的认知就此分叉，
+/// 而 location 匹配、allow/deny、auth_basic、limit_req 全部是按前端认知做的，
+/// 于是这些防护可以被一条构造的编码 URI 绕开。nginx 在这条路径上原样透传，我们也照做。
+/// 返回 `None` 表示不能原样透传（rewrite 改写出的解码态路径、`*` 或绝对形式），调用方回退到编码路径。
+fn raw_upgrade_target(ctx: &RequestCtx) -> Option<String> {
+    if ctx.rewritten_path.is_some() {
+        return None;
+    }
+    let uri = ctx.uri.as_str();
+    if !uri.starts_with('/') || uri.contains(['\r', '\n', '\0']) {
+        return None;
+    }
+    Some(uri.to_string())
+}
+
 /// nginx：非幂等请求（有副作用的）默认不参与 next_upstream 重试
 fn is_idempotent(method: &str) -> bool {
     matches!(
@@ -953,13 +970,17 @@ impl ProxyEngine {
             req_headers.insert(name, HeaderValue::try_from(val).map_err(|e| e.to_string())?);
         }
 
-        let request_line = format!(
-            "{} {}{}{} HTTP/1.1\r\n",
-            ctx.method,
-            ctx.effective_path(),
-            if ctx.query.is_empty() { "" } else { "?" },
-            ctx.query
-        );
+        let request_line = match raw_upgrade_target(ctx) {
+            // 原始 URI 已含 query，不再拼接
+            Some(target) => format!("{} {} HTTP/1.1\r\n", ctx.method, target),
+            None => format!(
+                "{} {}{}{} HTTP/1.1\r\n",
+                ctx.method,
+                encode_path(ctx.effective_path()),
+                if ctx.query.is_empty() { "" } else { "?" },
+                ctx.query
+            ),
+        };
         let mut request_buf = request_line.into_bytes();
         for (name, value) in &req_headers {
             request_buf.extend_from_slice(format!("{}: {}\r\n", name, value.to_str().unwrap_or("")).as_bytes());
@@ -1147,6 +1168,25 @@ mod tests {
         // 原本就是转义形式的 '%' 不能二次误解
         assert_eq!(encode_path("/100%25/"), "/100%2525/");
         assert_eq!(encode_path("/"), "/");
+    }
+
+    #[test]
+    fn upgrade_target_forwards_raw_undecoded_uri() {
+        let mut c = ctx();
+        // 解码后的 path 会把 %23 变成裸 '#'（后端按片段截断）、%3f 变成第二个 '?'：
+        // 网关与后端认到的资源不同，前置的 location/allow-deny/限流就能被绕过。
+        c.uri = "/ws%23frag?x=1%3fy=2".to_string();
+        c.path = "/ws#frag".to_string();
+        c.query = "x=1%3fy=2".to_string();
+        assert_eq!(raw_upgrade_target(&c).as_deref(), Some("/ws%23frag?x=1%3fy=2"));
+        // rewrite 改写出来的是解码态路径，只能重新编码；绝对形式/`*` 同理
+        c.rewritten_path = Some("/rewritten".to_string());
+        assert_eq!(raw_upgrade_target(&c), None);
+        c.rewritten_path = None;
+        c.uri = "*".to_string();
+        assert_eq!(raw_upgrade_target(&c), None);
+        c.uri = "/a\r\nX: 1".to_string();
+        assert_eq!(raw_upgrade_target(&c), None);
     }
 
     #[test]
