@@ -155,7 +155,11 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          find . -type f -exec sha256sum {} \; > SHA256SUMS.txt
+          # The redirect creates SHA256SUMS.txt before find walks the tree, so exclude it or the
+          # file ends up listing its own empty-content hash. Drop the artifact-directory prefix so
+          # the paths match the flat asset names on the release and `sha256sum -c` works as-is.
+          find . -type f ! -name SHA256SUMS.txt -exec sha256sum {} \; \
+            | sed 's|\./[^/]*/||' | sort -k2 > SHA256SUMS.txt
           cat SHA256SUMS.txt
       
       - name: Create Release
