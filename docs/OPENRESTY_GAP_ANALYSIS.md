@@ -1,6 +1,6 @@
 # ONRouter vs OpenResty — Gap Analysis
 
-Updated: 2026-10-18 (v0.3.0, Windows host). Previous revisions of this document
+Updated: 2026-10-19 (v0.4.0, Windows host). Previous revisions of this document
 were written before the `ngx_lua` async surface landed and understated the
 implementation; this revision is status-first and cites the E2E/unit evidence
 that enforces each row.

@@ -49,7 +49,7 @@ For "ONRouter" text accompanying the logo:
 
 | Context | Form | Example |
 |---------|------|---------|
-| Prose / brand / `Server:` header | `ONRouter` | `Server: ONRouter/0.3.0`, `ngx.config.server` |
+| Prose / brand / `Server:` header | `ONRouter` | `Server: ONRouter/0.4.0`, `ngx.config.server` |
 | Crate, binary, config file, log prefix, metric names | `onrouter` | `onrouter-server`, `conf/onrouter.conf`, `onrouter_http_requests_total` |
 | Env var prefix | `ONROUTER_` | `ONROUTER_CONFIG`, `ONROUTER_SKIP_BUILD` |
 | Auxiliary tool binaries | `orr-*` | `orr-gencert`, `orr-h3check` |
