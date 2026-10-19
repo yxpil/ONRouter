@@ -62,9 +62,12 @@ all gateway logic is hand-written.
   unfiltered, with a warning), and Lua coroutines are preempted every `lua_slice_instructions`
   VM instructions (default 1 000 000) so a runaway loop can no longer stall the single process.
 - Security tests: `sec_test.py` (30 checks, covering traversal / smuggling / CRLF injection /
-  malformed requests / oversized requests / default response headers) and
+  malformed requests / oversized requests / default response headers),
   `tools/security_matrix_e2e.py` (20 checks, one gateway process per probe, reproducing each finding
-  from `docs/SECURITY_AUDIT.md` with real traffic — every probe fails on the pre-fix binary).
+  from `docs/SECURITY_AUDIT.md` with real traffic — every probe fails on the pre-fix binary) and
+  `tools/rce_matrix_e2e.py` (27 checks on the remote-execution surface: Lua-source/path injection,
+  `internal` location escape, `proxy_pass` SSRF with a canary listener, encoded-CRLF request
+  splitting; the backend used by these probes echoes the exact request line it received).
 
 ## Multi-core architecture
 
@@ -553,10 +556,11 @@ them as standalone runnable assertion scripts.
   `ngx.sleep` request and recovery afterwards, a raw TLS-garbage probe bumping the handshake-failure
   counter, a WebSocket 101 upgrade counted against its upstream, and access-log line assertions for
   `$request_time` + the upstream triple (proxied, no-upstream `- - -`, and Upgrade `101`).
-- The whole suite (unit tests + 64 Python E2E scripts: every `tools/*_e2e.py` plus the root
+- The whole suite (unit tests + 65 Python E2E scripts: every `tools/*_e2e.py` plus the root
   scenario/compat/security/static/upstream suites) is re-run after these changes:
-  `cargo test --workspace` 255/255 and every E2E script passes with real traffic.
-  `python run_regression.py summaryD.txt` runs all of them and writes the exit-code
+  every E2E script passes with real traffic (`python run_regression.py summaryE.txt` →
+  `TOTAL 65 scripts, nonzero=0`, 2026-10-19) and `cargo test --workspace` passes.
+  `python run_regression.py <name>.txt` runs all of them and writes the exit-code
   roll-up plus per-script logs under `logs/regression/`.
 - The official suite is vendored under `vendor/lua-nginx-module/t/` (gitignored) as a semantics
   reference. Running a full `.t` directly via Test::Nginx requires a real OpenResty binary as

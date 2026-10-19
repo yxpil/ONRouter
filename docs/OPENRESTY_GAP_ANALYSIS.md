@@ -258,11 +258,13 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
     probe asserting the pre-fix failure mode is gone: fail-closed `auth_basic` and
     `allow/deny`, streamed-body `client_body_timeout` → 408, raw undecoded Upgrade
     request-target, htpasswd change visibility, `sub_filter` memory ceiling, Lua
-    runaway-loop preemption), `static_stream` 19/19, `streaming_body` 7/7
-  - Full regression: 64 scripts (8 root scenario/compat/security/static/upstream
+    runaway-loop preemption), `rce_matrix` 27/27 (Lua source/path injection,
+    `internal` location escape, `proxy_pass` SSRF against a canary listener,
+    encoded-CRLF splitting), `static_stream` 19/19, `streaming_body` 7/7
+  - Full regression: 65 scripts (8 root scenario/compat/security/static/upstream
     suites + every `tools/*_e2e.py` incl. TLS matrix, HTTP/2, HTTP/3, hot reload,
-    cache, filters, auth, stream, resty, security-matrix and API-compat) all
-    exited 0. Run them with `python run_regression.py summaryD.txt`
+    cache, filters, auth, stream, resty, security-matrix, rce-matrix and API-compat)
+    all exited 0. Run them with `python run_regression.py summaryE.txt`
     (per-script logs and the exit-code roll-up land in `logs/regression/`).
   - `native-tls` legacy handshake suite 12/12 with `--features native-tls`
     (runtime-generated RSA cert); the default rustls build still passes it.
