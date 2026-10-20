@@ -24,12 +24,16 @@
 //! 变成"多份声明 + 运行时按证据择优"。`set_real_ip_from` / `real_ip_header` / `real_ip_recursive` 的语义
 //! 完全不变，也仍然是唯一的默认授权根（见 [`decide`]）。
 
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{log_debug, log_warn};
-use crate::realip::{net_matches, parse_ip_chain, TrustedNet};
+// The single-token branch of `parse_ip_chain` is mirrored below in `token_ip`: a comma-free token
+// can only ever yield 0 or 1 addresses, so calling the real function would pay one heap allocation
+// per token; keep the two in sync.
+use crate::realip::{net_matches, TrustedNet};
 
 /// `front_proxy_mode`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,9 +144,22 @@ fn header_value<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h s
 
 /// 百分号解码。前置代理会把地址/位置类头的取值按 RFC 3986 §1.2 百分号编码（CloudFront 的文档就这么写），
 /// 于是 `2001%3Adb8%3A%3A1` 这种形状要能解；不含 `%` 时直接原样返回。只做能解就解、解不动就返回原值，绝不 panic。
-pub fn percent_decode(s: &str) -> String {
+///
+/// Author: yxpil
+///
+/// Why `Cow<'_, str>` instead of `String`: this runs once per header value per request in egress mode,
+/// and the overwhelming majority of header values contain no `%` at all — the old signature paid a
+/// heap allocation even for those. Scanning first and returning `Cow::Borrowed(s)` in that case makes
+/// the common path allocation-free; the owned branch is taken only when a `%` is actually present.
+/// Decoding semantics are byte-identical to the old version: `%XX` is consumed only when two hex
+/// digits follow (the `i + 2 < len` guard), a `%` that does not start a valid escape is copied
+/// verbatim, there is deliberately NO `+`-to-space translation (this is RFC 3986 percent-encoding,
+/// not form-urlencoded), and a result that is not valid UTF-8 (client sent garbage) falls back to
+/// the original input.
+pub fn percent_decode(s: &str) -> Cow<'_, str> {
+    // Fast path: no '%' means nothing can possibly decode — hand back the input borrowed, zero alloc.
     if !s.contains('%') {
-        return s.to_string();
+        return Cow::Borrowed(s);
     }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -163,54 +180,112 @@ pub fn percent_decode(s: &str) -> String {
         i += 1;
     }
     // 解码后可能不再是合法 UTF-8（客户端乱填），此时退回原值
-    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+    match String::from_utf8(out) {
+        Ok(decoded) => Cow::Owned(decoded),
+        Err(_) => Cow::Borrowed(s),
+    }
 }
 
-/// 把一个头的值切成地址链。先走 realip 的解析（裸 IP、`[v6]:port`、`v4:port`、逗号链都覆盖），
-/// 解不出再补一种形状：IPv6 被 URL 编码后解码成 `2001:db8::1:46532`，端口与地址都成了冒号分隔，
-/// 只有"尾段是纯数字且前段是合法地址"时才敢剥掉端口。
-fn chain_of(value: &str) -> Vec<IpAddr> {
-    value
-        .split(',')
-        .flat_map(|tok| {
-            let t = tok.trim();
-            let mut got = parse_ip_chain(t);
-            if got.is_empty() {
-                if let Some((head, port)) = t.rsplit_once(':') {
-                    if !port.is_empty()
-                        && port.chars().all(|c| c.is_ascii_digit())
-                        && port.len() <= 5
-                    {
-                        if let Ok(ip) = head.parse::<IpAddr>() {
-                            got.push(ip);
-                        }
-                    }
-                }
+/// 把逗号链里的**一个** token 解析成至多一个地址。先走 realip 的解析（裸 IP、`[v6]:port`、`v4:port`
+/// 都覆盖），解不出再补一种形状：IPv6 被 URL 编码后解码成 `2001:db8::1:46532`，端口与地址都成了
+/// 冒号分隔，只有"尾段是纯数字且前段是合法地址"时才敢剥掉端口。整条链的遍历在 `ip_from_value`。
+///
+/// Author: yxpil
+///
+/// Why a per-token helper instead of the old `chain_of` that collected a `Vec<IpAddr>`: the chain
+/// consumer only ever needs ONE position out of it — the rightmost address (`!recursive`), or the
+/// rightmost non-trusted one with the leftmost as fallback (`recursive`). Materialising the whole
+/// chain allocated a `Vec` per header value per request just to throw all but one element away.
+/// Walking the tokens in the needed direction (forward for `!recursive`, `rsplit` for `recursive`)
+/// and keeping a single running answer is allocation-free and value-identical. The per-token
+/// resolution lives in [`token_ip`].
+fn token_ip(tok: &str) -> Option<IpAddr> {
+    let t = tok.trim();
+    // Mirror of realip::parse_ip_chain's per-token branch (a token from split(',') cannot contain
+    // further commas, so parse_ip_chain would always answer 0-or-1 elements — one heap allocation
+    // to hold at most one IpAddr). Keep this branch in sync with realip::parse_ip_chain.
+    let pt = t.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '.' || c == '[' || c == ']'));
+    if let Ok(ip) = pt.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if pt.starts_with('[') {
+        if let Some(end) = pt.find(']') {
+            if let Ok(ip) = pt[1..end].parse::<IpAddr>() {
+                return Some(ip);
             }
-            got
-        })
-        .collect()
+        }
+        return None;
+    }
+    // IPv4:port —— 仅在去掉端口后仍是合法 v4 时接受（否则裸 IPv6 会被误伤，已被上面的 parse 拦截）
+    if let Some(pos) = pt.rfind(':') {
+        if let Ok(ip) = pt[..pos].parse::<std::net::Ipv4Addr>() {
+            return Some(IpAddr::V4(ip));
+        }
+    }
+    // Fallback shape, only consulted when the parse above yielded nothing (exactly like the old
+    // chain_of): decoded URL-encoded IPv6 where address and port are both colon-separated, e.g.
+    // "2001:db8::1:46532" — strip the port only when the tail is all digits (<= 5) and the head
+    // is a legal address. Runs on the whitespace-trimmed token, NOT the punctuation-trimmed one,
+    // matching the old code precisely.
+    if let Some((head, port)) = t.rsplit_once(':') {
+        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) && port.len() <= 5 {
+            if let Ok(ip) = head.parse::<IpAddr>() {
+                return Some(ip);
+            }
+        }
+    }
+    None
 }
 
 /// 从一个"带真实客户端 IP"的头值里取地址。支持三种已知形状，全部走同一套解析：
 /// 裸 IP、`a, b, c` 逗号链（XFF）、`ip:port` / `[v6]:port`（CloudFront-Viewer-Address 形状）。
 /// 语义与 realip 一致：`recursive` 关取最右，开则从右往左跳过仍可信的地址。
+///
+/// Author: yxpil
+///
+/// Why no intermediate chain `Vec`: `!recursive` needs only the LAST address, so one forward pass
+/// keeping a running `last` suffices; `recursive` needs the rightmost non-trusted address (falling
+/// back to the LEFTMOST), so one reverse pass via `rsplit(',')` keeps a running `first` — every
+/// yielded address overwrites it, so after a full pass it holds the leftmost, exactly the old
+/// `chain.first()` fallback — and returns at the first non-trusted hit, exactly the old
+/// `chain.iter().rev().find(...)` scan. Zero allocation on every path.
 pub fn ip_from_value(value: &str, skip_nets: &[TrustedNet], recursive: bool) -> Option<IpAddr> {
     let value = percent_decode(value.trim());
-    let chain = chain_of(&value);
-    if chain.is_empty() {
-        return None;
-    }
     if !recursive {
-        return chain.last().copied();
+        let mut last = None;
+        for tok in value.split(',') {
+            if let Some(ip) = token_ip(tok) {
+                last = Some(ip);
+            }
+        }
+        return last;
     }
     let is_trusted = |ip: &IpAddr| skip_nets.iter().any(|n| net_matches(ip, n));
-    chain.iter().rev().find(|ip| !is_trusted(ip)).or(chain.first()).copied()
+    let mut first = None;
+    for tok in value.rsplit(',') {
+        if let Some(ip) = token_ip(tok) {
+            // Overwrite unconditionally: after the full right-to-left walk this is the leftmost
+            // address, i.e. the old `chain.first()` fallback for an all-trusted chain.
+            first = Some(ip);
+            if !is_trusted(&ip) {
+                return Some(ip);
+            }
+        }
+    }
+    first
 }
 
 /// 从协议头里取原始 scheme。形状至少三种：`https`、`https, http`（多级追加）、
 /// `{"scheme":"https","ssl_protocol":"TLSv1.3"}`（JSON）。取不到 http/https 就当没有。
-pub fn scheme_from_value(value: &str) -> Option<String> {
+///
+/// Author: yxpil
+///
+/// Why `Option<&'static str>` instead of `Option<String>`: the canonical answer is always one of two
+/// compile-time literals, so the old per-value `to_string()` was a pure copy. The single owned
+/// `String` that `Decision.scheme` needs is materialised exactly once at the assignment in
+/// `decide()` — same number of allocations as before, but callers comparing/inspecting the scheme
+/// no longer need an owned value.
+pub fn scheme_from_value(value: &str) -> Option<&'static str> {
     let v = value.trim();
     if v.starts_with('{') {
         // 只认 "scheme" 这一个键，不做完整 JSON 解析（值里可能带任意空白与相邻键）
@@ -231,12 +306,27 @@ pub fn scheme_from_value(value: &str) -> Option<String> {
     None
 }
 
-fn normalize_scheme(raw: &str) -> Option<String> {
-    let t = raw.trim().to_ascii_lowercase();
-    match t.as_str() {
-        "https" | "on" | "ssl" | "1" => Some("https".to_string()),
-        "http" | "off" | "0" => Some("http".to_string()),
-        _ => None,
+/// Author: yxpil
+///
+/// Why `eq_ignore_ascii_case` against the literals instead of `to_ascii_lowercase()` + match: the
+/// lowercase copy allocated a `String` per scheme header value per request just to compare it with
+/// four short literals. Case-insensitive comparison returns the canonical `&'static str` with zero
+/// allocation; the accepted token set and the returned values are unchanged.
+fn normalize_scheme(raw: &str) -> Option<&'static str> {
+    let t = raw.trim();
+    if t.eq_ignore_ascii_case("https")
+        || t.eq_ignore_ascii_case("on")
+        || t.eq_ignore_ascii_case("ssl")
+        || t.eq_ignore_ascii_case("1")
+    {
+        Some("https")
+    } else if t.eq_ignore_ascii_case("http")
+        || t.eq_ignore_ascii_case("off")
+        || t.eq_ignore_ascii_case("0")
+    {
+        Some("http")
+    } else {
+        None
     }
 }
 
@@ -393,7 +483,9 @@ pub fn decide(
     if cand.verified {
         if let Some(h) = &p.proto_header {
             if let Some(s) = header_value(headers, h).and_then(scheme_from_value) {
-                d.scheme = Some(s);
+                // Single allocation at the boundary: scheme_from_value hands back a 'static literal,
+                // this is the one owned copy Decision.scheme needs (same count as before).
+                d.scheme = Some(s.to_string());
                 p.counters.origin_applied.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -466,14 +558,36 @@ fn pick_ip(
 
 /// 递归剔除时要跳过的地址集合 = 本 profile 的网段 ∪ 管理员声明的 set_real_ip_from。
 /// 顺带解决"链里最后一跳是我自己另一台代理"导致的取错值。
-fn nets_for(p: &FrontProfile, realip: &RealIpState<'_>) -> Vec<TrustedNet> {
+///
+/// Author: yxpil
+///
+/// Why a `Cow` fast path instead of always building a merged `Vec`: this runs per request, but both
+/// inputs (`p.trust` and `realip.trusted`) are configuration-static for the whole request lifetime.
+/// In the common case exactly ONE of the two lists is empty — a profile that declares no `trust`
+/// nets, or a server with no `set_real_ip_from` — and then the union is just the other list, which
+/// can be borrowed with zero allocation. Only when BOTH are non-empty (rare, and both are tiny
+/// admin-written lists) do we pay for the merged buffer; the O(n*m) `any()` dedup is kept there
+/// because it also preserves the exact element order of the old copy, which sort+dedup would not.
+/// All three outcomes are value-identical to the old always-copy behaviour.
+fn nets_for<'a>(p: &'a FrontProfile, realip: &RealIpState<'a>) -> Cow<'a, [TrustedNet]> {
+    // Common case: profile declares no trust nets of its own — the union is just the server's
+    // set_real_ip_from list; borrow it instead of copying.
+    if realip.trusted.is_empty() {
+        return Cow::Borrowed(&p.trust[..]);
+    }
+    // Common case: no set_real_ip_from on this server — the union is just the profile's own list.
+    if p.trust.is_empty() {
+        return Cow::Borrowed(realip.trusted);
+    }
+    // Rare case: both non-empty. Merge into a small buffer; nested-loop dedup keeps the exact
+    // ordering of the old implementation (p.trust first, then unseen realip nets in order).
     let mut v: Vec<TrustedNet> = p.trust.to_vec();
     for n in realip.trusted {
         if !v.iter().any(|x| x.net == n.net && x.prefix == n.prefix) {
             v.push(*n);
         }
     }
-    v
+    Cow::Owned(v)
 }
 
 /// 首次命中却被挡下时打一条可执行的告警（同一个 profile 只打一次，避免刷屏）。
@@ -777,5 +891,106 @@ mod tests {
         q.probes = vec![Probe { header: "x-front-id".into(), substr: Some("zzz".into()) }];
         let cq = conf(vec![q], FrontProxyMode::Detect, true);
         assert_eq!(decide(&cq, &req(), Some(v4("192.0.2.5")), &realip_off()).profile, None);
+    }
+
+    // Author: yxpil
+    //
+    // Allocation-count proof for the hot-path de-allocation (#77). The rps bench
+    // cannot separate this change from noise at bench load (medians overlap the
+    // pass-to-pass spread), but allocation counts are deterministic and
+    // load-independent. The counter is THREAD-LOCAL so parallel unit tests in
+    // this binary allocate against their own counters and never contaminate a
+    // measurement; the measured call runs entirely on the test's own thread.
+    mod alloccount {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        struct Counting;
+
+        thread_local! {
+            static COUNT: Cell<usize> = const { Cell::new(0) };
+        }
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                // try_with: TLS may already be torn down when a dying thread allocates.
+                let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+                System.alloc(layout)
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout)
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+                System.realloc(ptr, layout, new_size)
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+                System.alloc_zeroed(layout)
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: Counting = Counting;
+
+        pub fn count<R>(f: impl FnOnce() -> R) -> (usize, R) {
+            COUNT.with(|c| c.set(0));
+            let r = f();
+            (COUNT.with(|c| c.get()), r)
+        }
+    }
+
+    #[test]
+    fn plain_xff_chain_parses_with_zero_allocations() {
+        use alloccount::count;
+        let (n, got) = count(|| ip_from_value("198.51.100.7, 203.0.113.9", &[], false));
+        assert_eq!(n, 0, "!recursive chain allocated {n} times");
+        assert_eq!(got, Some(v4("203.0.113.9")));
+
+        let (n, got) = count(|| ip_from_value("198.51.100.7, 203.0.113.9", &[], true));
+        assert_eq!(n, 0, "recursive chain allocated {n} times");
+        assert_eq!(got, Some(v4("203.0.113.9")));
+    }
+
+    #[test]
+    fn recursive_with_trusted_nets_is_allocation_free() {
+        // Skip-list matching (rightmost hops are trusted proxies) must not
+        // allocate either: no merged Vec, no temporary chain. Whole chain
+        // trusted falls back to the leftmost address.
+        use alloccount::count;
+        let nets = vec![net("203.0.113.0/24"), net("198.51.100.0/24")];
+        let (n, got) = count(|| ip_from_value("198.51.100.7, 203.0.113.9", &nets, true));
+        assert_eq!(n, 0, "recursive+trusted walk allocated {n} times");
+        assert_eq!(got, Some(v4("198.51.100.7")));
+    }
+
+    #[test]
+    fn scheme_shapes_parse_with_zero_allocations() {
+        use alloccount::count;
+        for value in [
+            "https",
+            "HTTP",
+            "https, http",
+            "{\"scheme\":\"https\",\"ssl_protocol\":\"TLSv1.3\"}",
+        ] {
+            let (n, got) = count(|| scheme_from_value(value));
+            assert!(got.is_some(), "no scheme in {value:?}");
+            assert_eq!(n, 0, "scheme_from_value({value:?}) allocated {n} times");
+        }
+    }
+
+    #[test]
+    fn percent_encoded_value_allocates_exactly_once() {
+        // Decoding is the one legitimate allocation: one owned String, consumed
+        // in place by from_utf8 (no capacity regrowth). The no-% fast path
+        // returns Cow::Borrowed and must stay at zero.
+        use alloccount::count;
+        let (n, got) = count(|| ip_from_value("2001%3Adb8%3A%3A1", &[], false));
+        assert_eq!(n, 1, "encoded chain allocated {n} times, expected exactly 1");
+        assert_eq!(got, Some("2001:db8::1".parse().unwrap()));
+
+        let (n, got) = count(|| percent_decode("203.0.113.9"));
+        assert_eq!(n, 0, "borrowed fast path allocated {n} times");
+        assert!(matches!(got, Cow::Borrowed("203.0.113.9")));
     }
 }
