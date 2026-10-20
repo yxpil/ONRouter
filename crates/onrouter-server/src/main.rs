@@ -268,18 +268,20 @@ fn main() {
         startup_warnings.push(note);
     }
 
-    // 定时窗口：表在启动时一次建好，之后 runner 到点重算、热重载只原地换定义。
-    // 读不通必须在这里退出：一条写歪的"每天 9 点开门"不能变成"带着半套窗口上线"。
+    // Scheduled windows: the table is built once at startup; afterwards the runner recomputes at each due
+    // point and a hot reload only swaps definitions in place. An unreadable window table must abort startup
+    // here: a mistyped "open daily at 09:00" must not turn into "going live with half a window table".
     let schedule = Arc::new(match schedule::Scheduler::parse_all(&config) {
         Ok(s) => s,
         Err(e) => {
-            log_error!("定时窗口配置无效: {e}");
-            eprintln!("[onrouter] 定时窗口配置无效: {e}");
+            log_error!("invalid scheduled window configuration: {e}");
+            eprintln!("[onrouter] invalid scheduled window configuration: {e}");
             std::process::exit(1);
         }
     });
-    // 摘要按窗口自己的时区打印"算出来的下次触发时刻"：运维据此核对网关用的钟和自己
-    // 系统时钟是不是同一个时间 —— 日历类配置最常见的事故就是主机时钟漂移。
+    // The summary prints the computed next trigger time in each window's own timezone: the operator uses it to
+    // check whether the gateway's clock and the host clock read the same time -- the most common accident with
+    // calendar-style configuration is host clock drift.
     for line in schedule.describe(schedule::now_ms()) {
         log_info!("{line}");
     }
@@ -408,8 +410,9 @@ fn check(
     if !fps.is_empty() {
         println!("  前置代理识别 {}", front_proxy::describe(&fps));
     }
-    // 定时窗口：把"按这个配置算出来的开合与下次触发"打在 -t 里。日历类配置最容易出的
-    // 事故是主机时钟/时区口径错了，而那件事只有把算出来的墙钟摆出来才看得见。
+    // Scheduled windows: -t prints the open/closed state and the next trigger computed from this
+    // configuration. The likeliest accident with calendar-style configuration is a wrong host clock or
+    // timezone convention, and that only becomes visible once you lay out the computed wall clock.
     for line in schedule.describe(schedule::now_ms()) {
         println!("  {line}");
     }
@@ -519,8 +522,9 @@ async fn run(
     crate::metrics::register_proxy_cache(&state.proxy_cache);
     // 限流队列：`Limits` 实例进程内唯一，热重载只原地换策略，计数不清零
     crate::metrics::register_limits(&limits);
-    // 定时窗口：同理注册一次；关闭时段里被 403 挡掉的次数要能在 /metrics 上看到，
-    // 否则"闸门在工作"和"这条路由根本没挂闸门"两种情况长得一模一样。
+    // Scheduled windows: registered once the same way; the number of requests denied with 403 during a closed
+    // window must show up on /metrics, otherwise "the gate is working" and "this route has no gate at all"
+    // look exactly alike.
     crate::metrics::register_schedule(&schedule);
 
     // 先全部绑定再开始服务：端口冲突要在启动阶段就失败，而不是半启动状态
@@ -611,7 +615,7 @@ async fn run(
 
     let signals = spawn_signal_handlers(tx.clone(), reload_notify.clone());
 
-    // 定时窗口 runner：没声明任何窗口时**这个任务不存在**（默认 off 的零 footprint 要求）。
+    // Scheduled window runner: when no window is declared **this task does not exist at all** (the zero-footprint requirement of defaulting to off).
     let schedule_runner = spawn_schedule_task(Arc::clone(&state));
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -809,19 +813,25 @@ fn spawn_signal_handlers(
     }
 }
 
-/// 定时窗口 runner：**一个**任务，睡到下一个自然分钟边界再醒，醒来把所有窗口重算一遍。
+/// Scheduled window runner: **one** task, sleeping until the next natural minute boundary and, on waking,
+/// recomputing every window.
 ///
-/// 为什么按分钟睡、而不是精确睡到最早的那次触发：cron 的分辨率本来就是分钟，而
-/// "睡到 next_fire"会让一次时钟跳变或晚醒变成"整段窗口都错过"。按分钟重算最多晚一秒
-/// 判定，且只有一条代码路径 —— 状态永远由日历推出，不依赖"上一次我记得是开还是关"。
+/// Author: yxpil
 ///
-/// 表为空（没写任何 schedule_window）时**这个任务根本不建**：默认 off 不留常驻开销。
+/// Why it sleeps by the minute rather than precisely until the earliest next fire: cron's resolution is the
+/// minute anyway, and "sleeping until next_fire" would turn a single clock jump or a single late wake-up into
+/// "the whole window was missed". Recomputing by the minute decides at most one second late and keeps a single
+/// code path -- the state is always derived from the calendar, never from "whether I remember it being open or
+/// closed last time".
+///
+/// When the table is empty (no schedule_window written at all) **this task is not created**: defaulting to off
+/// must leave no resident overhead.
 fn spawn_schedule_task(state: Arc<server::AppState>) -> Option<tokio::task::JoinHandle<()>> {
     if state.schedule.is_empty() {
         return None;
     }
     log_info!(
-        "定时窗口 runner 已启动：{} 个窗口，每分钟边界重算一次；翻转记录在 error_log，落点见 /metrics 的 onrouter_schedule_*",
+        "scheduled window runner started: {} windows, recomputed at every minute boundary; state flips are recorded in error_log, and the current values are on /metrics under onrouter_schedule_*",
         state.schedule.len()
     );
     Some(tokio::spawn(async move {
@@ -829,20 +839,21 @@ fn spawn_schedule_task(state: Arc<server::AppState>) -> Option<tokio::task::Join
             tokio::time::sleep(next_minute_wait()).await;
             let now = schedule::now_ms();
             for ch in state.schedule.advance(now) {
-                // 只在**真的**变了状态时出声：到点不等于翻转（见 schedule.rs 的 next_trigger_at）。
+                // Only say something when the state **really** changed: coming due does not imply a flip (see next_trigger_at in schedule.rs).
                 log_info!(
-                    "schedule: 窗口 '{}' 于 {} 转为{}；引用它的路由当场生效（闸门状态见 /metrics 的 onrouter_schedule_open，被挡次数见 onrouter_schedule_denied_total）",
+                    "schedule: window '{}' at {} switched to {}; routes referencing it take effect immediately (gate state on /metrics: onrouter_schedule_open, denied count: onrouter_schedule_denied_total)",
                     ch.name,
                     state.schedule.wall(&ch.name, ch.at_ms),
-                    if ch.open { "开放" } else { "关闭" }
+                    if ch.open { "open" } else { "closed" }
                 );
             }
         }
     }))
 }
 
-/// 到下一个自然分钟边界还要多久。多给 20ms 越过边界，免得在上一分钟的最后一毫秒里
-/// 把新状态算成旧的、然后下一次醒又判一边（同一分钟判两次结果必须一致）。
+/// How long until the next natural minute boundary. Adds 20ms to clear the boundary, so we never sit in the
+/// last millisecond of the previous minute, compute the new state as the old one, then decide the other way on
+/// the next wake-up (evaluating twice within the same minute must give the same result).
 fn next_minute_wait() -> Duration {
     let now = schedule::now_ms();
     let to_next = 60_000 - now.rem_euclid(60_000);
@@ -965,14 +976,16 @@ fn do_reload(
                 for note in state.limits.apply_vip(&live) {
                     log_warn!("热重载信誉: {note}");
                 }
-                // 定时窗口：窗口实例进程内不换（引用它们的路由要能对上名字），所以这里
-                // 只原地换定义并按新配置**重算当前状态** —— 状态是日历的纯函数，重算即正确，
-                // 不需要任何"记住上一次是开还是关"的持久化。
+                // Scheduled windows: window instances are never swapped within the process (the routes
+                // referencing them must keep resolving by name), so here we only swap the definitions in place
+                // and **recompute the current state** from the new configuration -- the state is a pure function
+                // of the calendar, so recomputing is correct, and it needs no "remember whether it was open or
+                // closed last time" persistence.
                 for note in state.schedule.apply(&cfg, schedule::now_ms()) {
-                    log_warn!("热重载定时窗口: {note}");
+                    log_warn!("scheduled window reload: {note}");
                 }
                 for line in state.schedule.describe(schedule::now_ms()) {
-                    log_info!("热重载后 {line}");
+                    log_info!("after hot reload, {line}");
                 }
                 // upstream 池（连同 least_time 的 EWMA）挂在启动时构建的 Arc 上，热重载不替换它。
                 // 这里照样按新配置打一行档位并说明"要重启"，否则运维会以为 SIGHUP 就切了档。

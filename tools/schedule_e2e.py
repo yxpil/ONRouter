@@ -1,25 +1,33 @@
 # -*- coding: utf-8 -*-
-# 定时访问窗口（schedule_window + schedule_access）E2E。
+# Author: yxpil
+# Scheduled access windows (schedule_window + schedule_access) E2E.
 #
-# 证明了什么（真实流量、真实分钟边界，不是代码审查）：
-#   1) 闸门按日历生效：脚本把 office 改写成"两分钟后开、三分钟后关"，网关在**真实**的
-#      分钟边界上把 /office/ 从 403 翻成 200，热重载推后关闭时刻后再翻回 403。
-#   2) 被挡住时一次都不回源：403 期间后端**总**请求增量为 0（同一段里 /free/ 的 200 会
-#      让增量 +1，所以这不是"表坏了自己不知道"），闸门确实在 proxy 之前。
-#   3) 没挂闸门的路由（/free/）与恒开放窗口（/any/）全程 200：默认 off 不是"一律 403"。
-#   4) 落点两种都对：18338 的闸门写在 server 级，/inherited/ 跟着翻、/override/ 恒 403，
-#      证明 location 显式声明优先于 server 继承。
-#   5) 自证时间：next_fire_ms 与脚本自己算出的 epoch 毫秒**逐位相等**（关着时=开的那一刻、
-#      开着时=关的那一刻、翻转后=明天的开），连没被引用的 tzcheck 也按 +08 核对 ——
-#      时区口径写错的话这里必炸。
-#   6) 热重载只改定义不丢状态：开着的时候把 close 推后，窗口越过原来的 close 仍 200，
-#      next_fire_ms 改成新值，changes 不因为"到点却没翻转"而虚增。
-#   7) -t 是执行点：引用未声明的窗口、缺 tz、open/close 同一分钟、窗口重名、
-#      schedule_access 漏名字，五种都退出码非 0 并给出可定位的原因；
-#      "声明了但没人引用"只告警并退 0（老配置的 -t 结果不能变差）。
+# What this proves (real traffic, real minute boundaries -- not a code review):
+#   1) The gate follows the calendar: the script rewrites office into "opens two minutes from now, closes three
+#      minutes from now", the gateway flips /office/ from 403 to 200 on a **real** minute boundary, and only after
+#      a hot reload pushes the close time out does it flip back to 403.
+#   2) Nothing is proxied while blocked: during the 403 period the **total** backend request delta is 0 (the 200s
+#      on /free/ inside the same stretch would have pushed that delta to +1, so this is not "a counter that is
+#      broken and says nothing"), which puts the gate in front of the proxy.
+#   3) A route with no gate (/free/) and an always-open window (/any/) answer 200 for the whole run: defaulting to
+#      off is not "a blanket 403".
+#   4) Both placements are right: the gate on 18338 is written at the server level, /inherited/ flips along with it
+#      and /override/ stays 403, proving an explicit location declaration beats server inheritance.
+#   5) It verifies its own clock: next_fire_ms is **digit for digit equal** to the epoch milliseconds the script
+#      computes (while closed = the moment it opens, while open = the moment it closes, after a flip = tomorrow's
+#      open), and the unreferenced tzcheck is checked against +08 too -- a wrong timezone convention must blow up
+#      right here.
+#   6) A hot reload swaps definitions without losing state: while the window is open the close time is pushed
+#      back, the window still answers 200 past its original close, next_fire_ms takes the new value, and changes
+#      does not grow just because "the moment came and nothing flipped".
+#   7) -t is the enforcement point: referencing an undeclared window, a missing tz, open/close on the same minute,
+#      a duplicate window name and a schedule_access with no name all exit non-zero and each give a locatable
+#      reason; "declared but referenced by nobody" only warns and still exits 0 (the -t result of an old config
+#      must not get worse).
 #
 #   cargo build --release -p onrouter-server --bin onrouter && python tools/schedule_e2e.py
-#   整套约 8 分钟：三分之二花在等真实分钟边界 —— 这类特性只有等到点才算证过。
+#   The whole run takes about 8 minutes: two thirds of it is spent waiting on real minute boundaries -- for a
+#   feature like this nothing counts as proof until the time actually comes.
 import datetime as dt
 import os
 import re
@@ -42,9 +50,9 @@ CONF = os.path.join(ROOT, "conf", "schedule.conf")
 ERR_LOG = os.path.join(ROOT, "conf", "logs", "schedule_err.log")
 OUT_LOG = os.path.join(ROOT, "logs", "schedule_out.log")
 
-GW_PORT = 18330          # 闸门写在 location
-GATED_PORT = 18338       # 闸门写在 server 级
-BACKEND_PORT = 18337     # 18331-18336 由 router.rs 单测占用
+GW_PORT = 18330          # gate written on the location
+GATED_PORT = 18338       # gate written at the server level
+BACKEND_PORT = 18337     # 18331-18336 are taken by the router.rs unit tests
 BASE = f"http://127.0.0.1:{GW_PORT}"
 GATED = f"http://127.0.0.1:{GATED_PORT}"
 
@@ -86,7 +94,8 @@ def status(url, timeout=10):
 
 
 def wait_status(url, want, timeout, every=0.4):
-    """轮询到某个状态码为止。每轮只发一个请求 —— 多发的那几次会污染回源计数。"""
+    """Poll until a given status code shows up. One request per round -- the extra ones would pollute the
+    upstream hit counting."""
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
@@ -102,7 +111,7 @@ def metrics_body():
 
 
 def metric(body, mname, **labels):
-    """取一个 Prometheus 指标的数值。标签写成 {k="v"}（这里标签键本身就叫 name）。"""
+    """Read one Prometheus metric value. Labels are written as {k="v"} (here the label key itself is called name)."""
     full = mname + ("{" + ",".join('%s="%s"' % (k, v) for k, v in labels.items()) + "}" if labels else "")
     for line in body.splitlines():
         if line.startswith("#"):
@@ -121,13 +130,14 @@ def ms(when):
 
 
 def cron_fields(when):
-    """把某个绝对时刻写成**该窗口时区（+08:00）**里的 cron 分/时字段（每天一次）。"""
+    """Write an absolute moment as the cron minute/hour fields **in that window's own timezone (+08:00)**,
+    once per day."""
     w = when.astimezone(TZ_OFFICE)
     return f"{w.minute} {w.hour} * * *"
 
 
 def wall_text(when):
-    """网关 fmt_wall 的口径：%Y-%m-%d %H:%M，按窗口自己的时区。"""
+    """The gateway's fmt_wall convention: %Y-%m-%d %H:%M, read in the window's own timezone."""
     return when.astimezone(TZ_OFFICE).strftime("%Y-%m-%d %H:%M")
 
 
@@ -139,11 +149,13 @@ def office_block(open_at, close_at):
 
 
 def with_office(text, open_at, close_at):
-    """只替换 office 那一段，另外三个窗口保持原样（恒开/恒关对照不参与改写）。"""
+    """Replace only the office block; the other three windows stay as they are (the always-open and always-closed
+    controls never take part in the rewrite)."""
     block = office_block(open_at, close_at)
     new, n = re.subn(r"schedule_window office \{[^}]*\}", lambda _m: block, text, count=1)
     if n != 1:
-        raise SystemExit("!! conf/schedule.conf 里找不到 office 窗口，脚本与配置的锚点分叉了")
+        raise SystemExit("!! no office window found in conf/schedule.conf: the script and the config have "
+                         "diverged at their anchor")
     return new
 
 
@@ -170,7 +182,7 @@ def office_line(out):
 
 
 def daily_utc(hh, mm, after):
-    """第一个严格晚于 after 的"每天 hh:mm UTC"时刻。"""
+    """The first "daily hh:mm UTC" moment strictly later than after."""
     cand = after.replace(hour=hh, minute=mm, second=0, microsecond=0, tzinfo=dt.timezone.utc)
     if cand <= after:
         cand += dt.timedelta(days=1)
@@ -212,9 +224,10 @@ def backend_total():
 
 
 def hits_delta(fn):
-    """跑一次 fn，返回 (fn 的结果, 这段时间里后端收到的请求数)。
-    用"总数增量"而不是"某个路径的计数"：proxy_pass 带 URI 会把 location 前缀剥掉，
-    后端看到的是 /x2 而不是 /office/x2 —— 按路径数会数错，而"回没回源"才是这里要证的。"""
+    """Run fn once and return (its result, how many requests the backend received during it).
+    A "delta of the total" rather than "the count of one path": a proxy_pass with a URI strips the location
+    prefix, so the backend sees /x2 instead of /office/x2 -- counting by path would miscount, while "did it proxy
+    or not" is exactly what has to be proven here."""
     before = backend_total()
     r = fn()
     return r, backend_total() - before
@@ -226,60 +239,64 @@ def main():
     os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
     original = open(CONF, encoding="utf-8").read()
 
-    # ---- 排期：以"下一个真实分钟边界"为准，全程绝对时刻 ----
+    # ---- schedule: anchored on "the next real minute boundary", absolute moments throughout ----
     now = dt.datetime.now(dt.timezone.utc)
     floor = now.replace(second=0, microsecond=0)
     open_at = floor + dt.timedelta(minutes=2)
     close_at = open_at + dt.timedelta(minutes=3)
     close2 = close_at + dt.timedelta(minutes=2)
-    print(f"# office 将于 {wall_text(open_at)}(+08) 开放、{wall_text(close_at)} 关闭，"
-          f"热重载后推迟到 {wall_text(close2)}")
+    print(f"# office opens at {wall_text(open_at)} (+08) and closes at {wall_text(close_at)}, "
+          f"pushed to {wall_text(close2)} after the hot reload")
 
     generated = with_office(original, open_at, close_at)
     write_conf(generated)
 
-    # ---- 1) -t：合法配置要把"算出来的墙钟"摆出来 ----
+    # ---- 1) -t: a valid config has to lay out "the wall clock it computed" ----
     rc, out = run_t(CONF)
     ol = office_line(out)
-    check("-t 通过（四个窗口 + 两处闸门落点）", rc == 0, out[-600:])
-    check("-t 打印改写后的 office 定义", f'open="{cron_fields(open_at)}"' in ol, ol)
-    check("-t 的下次触发就是脚本算的那一刻", f"下次触发={wall_text(open_at)}" in ol, ol)
-    check("-t 里 office 此刻=关闭", "此刻=关闭" in ol, ol)
-    check("-t 告警：声明了却没人引用（tzcheck）",
-          "tzcheck" in out and "没有任何 server/location" in out, out[-600:])
+    check("-t passes (four windows + two gate placements)", rc == 0, out[-600:])
+    check("-t prints the rewritten office definition", f'open="{cron_fields(open_at)}"' in ol, ol)
+    check("-t next trigger is the exact moment the script computed",
+          f"next_trigger={wall_text(open_at)}" in ol, ol)
+    check("-t shows office closed right now", "state=closed" in ol, ol)
+    check("-t warning: declared but referenced by nobody (tzcheck)",
+          "tzcheck" in out and "are referenced by no server or location" in out, out[-600:])
 
-    # ---- 2) -t 的硬失败：写歪的定时不能带着半套上线 ----
+    # ---- 2) hard failures at -t: a mistyped schedule must not go live with half a window table ----
     bad = os.path.join(ROOT, "conf", "_schedule_bad.conf")
 
     def expect_reject(tag, text, *needles):
         with open(bad, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         rc, out = run_t(bad)
-        check(f"-t 拒绝：{tag}", rc != 0 and all(n in out for n in needles),
-              f"rc={rc} 缺 {needles} / {out[-400:]}")
+        check(f"-t rejects: {tag}", rc != 0 and all(n in out for n in needles),
+              f"rc={rc} missing {needles} / {out[-400:]}")
 
-    expect_reject("引用未声明的窗口",
+    expect_reject("reference to an undeclared window",
                   generated.replace("schedule_access office;", "schedule_access ghost;", 1),
-                  "引用了未声明的窗口 'ghost'")
-    expect_reject("窗口缺少 tz",
+                  "references the undeclared window 'ghost'")
+    expect_reject("window without tz",
                   generated.replace("schedule_window office { tz +08:00;", "schedule_window office {", 1),
-                  "缺少 tz", "office")
-    expect_reject("open 与 close 落在同一分钟", with_office(original, open_at, open_at),
-                  "同一分钟同时要求改变状态")
-    expect_reject("窗口重名", generated + "\n" + office_block(open_at, close_at) + "\n", "重复声明")
-    expect_reject("schedule_access 漏了名字",
-                  generated.replace("schedule_access office;", "schedule_access;", 1), "缺少窗口名")
-    # 全都只声明不引用：必须还是 0（-t 结果不能比老配置更悲观），但要说清有几个没挂上
+                  "has no tz", "office")
+    expect_reject("open and close land in the same minute", with_office(original, open_at, open_at),
+                  "state change in the same minute")
+    expect_reject("duplicate window name", generated + "\n" + office_block(open_at, close_at) + "\n",
+                  "is declared twice")
+    expect_reject("schedule_access with a missing name",
+                  generated.replace("schedule_access office;", "schedule_access;", 1),
+                  "is missing the window name")
+    # All of them declared but referenced by nobody: the exit code must still be 0 (a -t result must not be more
+    # pessimistic than the old config), but it has to say how many windows carry no gate.
     unreferenced = re.sub(r"\n[ ]*schedule_access [a-z_]+;", "", generated)
     with open(bad, "w", encoding="utf-8", newline="\n") as f:
         f.write(unreferenced)
     rc, out = run_t(bad)
-    check("-t 对'声明但没引用'只告警并退 0",
-          rc == 0 and "4 个没有任何 server/location" in out, f"rc={rc} / {out[-500:]}")
+    check("-t only warns about 'declared but unreferenced' and exits 0",
+          rc == 0 and "declarations, 4 are referenced by no server or location" in out, f"rc={rc} / {out[-500:]}")
     if os.path.exists(bad):
         os.remove(bad)
 
-    # ---- 3) 起网关，跑真实分钟边界 ----
+    # ---- 3) start the gateway, run through real minute boundaries ----
     backend = HTTPServer(("127.0.0.1", BACKEND_PORT), Backend)
     threading.Thread(target=backend.serve_forever, daemon=True).start()
     for stale in (ERR_LOG, OUT_LOG):
@@ -293,115 +310,128 @@ def main():
     notable = []
     try:
         if not wait_status(BASE + "/ping", 200, 30):
-            raise SystemExit(f"!! onrouter 未就绪（端口 {GW_PORT}/{GATED_PORT}/{BACKEND_PORT} 被占用？看 logs/schedule_out.log）")
+            raise SystemExit(f"!! onrouter never became ready (port {GW_PORT}/{GATED_PORT}/{BACKEND_PORT} "
+                             f"already in use? see logs/schedule_out.log)")
 
-        # ---- 关闭时段 ----
+        # ---- closed period ----
         st1, h1 = hits_delta(lambda: status(BASE + "/office/x1"))
-        check("窗口关闭：/office/ 403", st1 == 403, f"实际 {st1}")
-        check("窗口关闭：403 由网关本地答复（一次都没回源）", h1 == 0, f"后端多了 {h1} 次")
+        check("window closed: /office/ 403", st1 == 403, f"actual {st1}")
+        check("window closed: the 403 is answered locally by the gateway (not one request proxied)", h1 == 0,
+              f"backend saw {h1} extra requests")
         stf, hf = hits_delta(lambda: status(BASE + "/free/x1"))
-        check("没挂闸门的 /free/ 200（默认 off 零代价）", (stf, hf) == (200, 1), f"{stf}、回源 {hf}")
-        check("恒关窗口 /locked/ 全程 403 且不回源",
+        check("ungated /free/ answers 200 (default off costs nothing)", (stf, hf) == (200, 1),
+              f"{stf}, proxied {hf}")
+        check("always-closed window /locked/ is 403 throughout and never proxies",
               hits_delta(lambda: status(BASE + "/locked/x1")) == (403, 0))
-        check("恒开窗口 /any/ 200 且真的回源", hits_delta(lambda: status(BASE + "/any/x1")) == (200, 1))
-        check("server 级闸门也挡住 /inherited/ 且不回源",
+        check("always-open window /any/ answers 200 and really proxies",
+              hits_delta(lambda: status(BASE + "/any/x1")) == (200, 1))
+        check("the server-level gate also blocks /inherited/ without proxying",
               hits_delta(lambda: status(GATED + "/inherited/x1")) == (403, 0))
         read_at = dt.datetime.now(dt.timezone.utc)
         m = metrics_body()
-        check("指标：office 关闭", mrow(m, "onrouter_schedule_open", "office") == 0)
-        check("指标：next_fire_ms 逐位等于脚本算的开放时刻",
+        check("metrics: office closed", mrow(m, "onrouter_schedule_open", "office") == 0)
+        check("metrics: next_fire_ms is digit for digit the open moment the script computed",
               mrow(m, "onrouter_schedule_next_fire_ms", "office") == ms(open_at),
-              f"指标 {mrow(m, 'onrouter_schedule_next_fire_ms', 'office')} vs {ms(open_at)}")
-        # tzcheck 没有任何路由引用，但它的排期照样是同一套日历算术 —— 用它单独核对时区换算：
-        # 12:00-13:00 (+08) = 04:00-05:00 UTC，下次触发必然是两者中较早的那个。
-        # 允许落在"紧随其后的那一次"：读取指标这一刻正好压着分钟边界时，两边算出的 now 会差一格。
+              f"metric {mrow(m, 'onrouter_schedule_next_fire_ms', 'office')} vs {ms(open_at)}")
+        # tzcheck is referenced by no route, but its schedule is the same calendar arithmetic -- use it on its own
+        # to verify the timezone conversion: 12:00-13:00 (+08) = 04:00-05:00 UTC, so the next trigger must be the
+        # earlier of the two.
+        # Landing on "the occurrence just after" is allowed: when the metrics read happens to sit exactly on the
+        # minute boundary, the two sides compute a now that is one tick apart.
         tz_cands = sorted({daily_utc(4, 0, read_at), daily_utc(5, 0, read_at),
                            daily_utc(4, 0, read_at + dt.timedelta(days=1)),
                            daily_utc(5, 0, read_at + dt.timedelta(days=1))})
         want_tz = min(daily_utc(4, 0, read_at), daily_utc(5, 0, read_at))
         got_tz = mrow(m, "onrouter_schedule_next_fire_ms", "tzcheck")
-        check("指标：tzcheck 的下次触发证明 +08:00 真的换成了 UTC",
+        check("metrics: tzcheck's next trigger proves +08:00 really converts to UTC",
               got_tz in [ms(tz_cands[0]), ms(tz_cands[1])],
-              f"指标 {got_tz}，期望 {ms(want_tz)}（候选 {[ms(c) for c in tz_cands[:3]]}）")
-        check("指标：还没翻转，changes=0", mrow(m, "onrouter_schedule_changes_total", "office") == 0)
+              f"metric {got_tz}, expected {ms(want_tz)} (candidates {[ms(c) for c in tz_cands[:3]]})")
+        check("metrics: nothing flipped yet, changes=0",
+              mrow(m, "onrouter_schedule_changes_total", "office") == 0)
         d0 = mrow(m, "onrouter_schedule_denied_total", "office") or 0
-        check("指标：关闭期间的 403 计入 denied_total", d0 >= 1, f"实际 {d0}")
-        check("指标：恒开窗口一次都没挡过", mrow(m, "onrouter_schedule_denied_total", "always_open") == 0)
-        check("指标：窗口在 -t 之后仍然 enabled", mrow(m, "onrouter_schedule_enabled", "office") == 1)
-        check("指标：闸门没有落空（gate_miss=0）", metric(m, "onrouter_schedule_gate_miss_total") == 0)
-        check("启动日志给出 runner 概况", "定时窗口 runner 已启动" in open_log(),
-              "日志里看不到 runner 概况")
+        check("metrics: the 403s of the closed period count into denied_total", d0 >= 1, f"actual {d0}")
+        check("metrics: the always-open window never blocked anything",
+              mrow(m, "onrouter_schedule_denied_total", "always_open") == 0)
+        check("metrics: the window is still enabled after -t", mrow(m, "onrouter_schedule_enabled", "office") == 1)
+        check("metrics: no gate fell through (gate_miss=0)", metric(m, "onrouter_schedule_gate_miss_total") == 0)
+        check("startup log carries the runner banner", "scheduled window runner started" in open_log(),
+              "no runner banner in the log")
 
-        # ---- 等第一个真实分钟边界：开 ----
+        # ---- wait for the first real minute boundary: open ----
         wait_for_open = max(5.0, (open_at - dt.datetime.now(dt.timezone.utc)).total_seconds() + 40)
         before_flip = backend_total()
         got = wait_status(BASE + "/office/x2", 200, wait_for_open)
         d_flip = backend_total() - before_flip
-        check("到点真的翻了：/office/ 200", got == 200, f"实际 {got}")
-        check("整个等待里只回源一次（其余轮询都挡在网关，闸门确实在 proxy 之前）",
-              d_flip == 1, f"后端增量 {d_flip}")
-        check("server 级闸门的 /inherited/ 同步放开",
+        check("it really flipped when the time came: /office/ 200", got == 200, f"actual {got}")
+        check("the whole wait proxied exactly once (every other poll was stopped by the gateway, so the gate "
+              "really is in front of the proxy)", d_flip == 1, f"backend delta {d_flip}")
+        check("the server-level gate opens /inherited/ in step",
               hits_delta(lambda: status(GATED + "/inherited/x2")) == (200, 1))
-        check("location 显式声明优先：office 开着时 /override/ 仍 403 且不回源",
+        check("an explicit location wins: while office is open /override/ is still 403 and does not proxy",
               hits_delta(lambda: status(GATED + "/override/x1")) == (403, 0))
         m = metrics_body()
-        check("指标：office 开放", mrow(m, "onrouter_schedule_open", "office") == 1)
-        check("指标：翻转计数=1", mrow(m, "onrouter_schedule_changes_total", "office") == 1,
-              f"实际 {mrow(m, 'onrouter_schedule_changes_total', 'office')}")
-        check("指标：next_fire_ms 改成脚本算的关闭时刻",
+        check("metrics: office open", mrow(m, "onrouter_schedule_open", "office") == 1)
+        check("metrics: flip counter = 1", mrow(m, "onrouter_schedule_changes_total", "office") == 1,
+              f"actual {mrow(m, 'onrouter_schedule_changes_total', 'office')}")
+        check("metrics: next_fire_ms moved to the close moment the script computed",
               mrow(m, "onrouter_schedule_next_fire_ms", "office") == ms(close_at),
-              f"指标 {mrow(m, 'onrouter_schedule_next_fire_ms', 'office')} vs {ms(close_at)}")
+              f"metric {mrow(m, 'onrouter_schedule_next_fire_ms', 'office')} vs {ms(close_at)}")
         raw = open_log()
-        check("error_log 记下这一次翻转（开放）", "转为开放" in raw and "窗口 'office'" in raw,
-              "日志里看不到翻转")
+        check("error_log recorded this flip (open)",
+              "switched to open" in raw and "window 'office'" in raw, "no flip line in the log")
 
-        # ---- 热重载：开着的时候把 close 推后 ----
+        # ---- hot reload: push the close time back while the window is open ----
         write_conf(with_office(original, open_at, close2))
 
         def moved():
             return mrow(metrics_body(), "onrouter_schedule_next_fire_ms", "office") == ms(close2) or None
 
-        check("热重载：next_fire_ms 跟着新配置改成推迟后的关闭时刻", wait_for_pred(moved, 25) is not None,
-              f"停在 {mrow(metrics_body(), 'onrouter_schedule_next_fire_ms', 'office')} vs {ms(close2)}")
+        check("hot reload: next_fire_ms follows the new config to the pushed-back close moment",
+              wait_for_pred(moved, 25) is not None,
+              f"stuck at {mrow(metrics_body(), 'onrouter_schedule_next_fire_ms', 'office')} vs {ms(close2)}")
         m = metrics_body()
-        check("热重载：状态重算没错（仍开放）", mrow(m, "onrouter_schedule_open", "office") == 1)
-        check("热重载：没有虚增翻转次数", mrow(m, "onrouter_schedule_changes_total", "office") == 1,
-              f"实际 {mrow(m, 'onrouter_schedule_changes_total', 'office')}")
+        check("hot reload: state recomputed correctly (still open)",
+              mrow(m, "onrouter_schedule_open", "office") == 1)
+        check("hot reload: no phantom flip counted",
+              mrow(m, "onrouter_schedule_changes_total", "office") == 1,
+              f"actual {mrow(m, 'onrouter_schedule_changes_total', 'office')}")
 
-        # 走到原 close 之后：旧的关闭时刻必须真的不再适用
+        # Past the original close: that old close moment must really no longer apply.
         wait_until(close_at + dt.timedelta(seconds=25))
         st3, d3 = hits_delta(lambda: status(BASE + "/office/x3"))
-        check("越过原 close 仍放行（重载推后的就是它自己那条日历）", (st3, d3) == (200, 1),
-              f"{st3}、回源 {d3}")
-        check("放行期间恒关窗口仍 403", hits_delta(lambda: status(BASE + "/locked/x2")) == (403, 0))
+        check("still allowed past the original close (the reload pushed back that very calendar entry)",
+              (st3, d3) == (200, 1), f"{st3}, proxied {d3}")
+        check("the always-closed window is still 403 while traffic is allowed",
+              hits_delta(lambda: status(BASE + "/locked/x2")) == (403, 0))
 
-        # ---- 等第二个真实边界：关 ----
+        # ---- wait for the second real boundary: close ----
         wait_until(close2 + dt.timedelta(seconds=8))
         before_close = backend_total()
         got = wait_status(BASE + "/office/x4", 403, 40)
         d_close = backend_total() - before_close
-        check("新 close 到点：/office/ 回到 403", got == 403, f"实际 {got}")
+        check("the new close came due: /office/ back to 403", got == 403, f"actual {got}")
         st5, d5 = hits_delta(lambda: status(BASE + "/office/x5"))
-        check("关闭后不再回源", (st5, d5) == (403, 0), f"{st5}、回源 {d5}")
-        check("关闭时刻之后的轮询一次都没漏出去", d_close == 0, f"后端增量 {d_close}")
+        check("no proxying after the close", (st5, d5) == (403, 0), f"{st5}, proxied {d5}")
+        check("not one poll escaped after the close moment", d_close == 0, f"backend delta {d_close}")
         m = metrics_body()
-        check("指标：office 重新关闭", mrow(m, "onrouter_schedule_open", "office") == 0)
-        check("指标：累计两次真实翻转", mrow(m, "onrouter_schedule_changes_total", "office") == 2,
-              f"实际 {mrow(m, 'onrouter_schedule_changes_total', 'office')}")
-        check("指标：下次触发=明天的开放时刻",
+        check("metrics: office closed again", mrow(m, "onrouter_schedule_open", "office") == 0)
+        check("metrics: two real flips accumulated", mrow(m, "onrouter_schedule_changes_total", "office") == 2,
+              f"actual {mrow(m, 'onrouter_schedule_changes_total', 'office')}")
+        check("metrics: next trigger = tomorrow's open moment",
               mrow(m, "onrouter_schedule_next_fire_ms", "office") == ms(open_at + dt.timedelta(days=1)),
-              f"指标 {mrow(m, 'onrouter_schedule_next_fire_ms', 'office')} vs {ms(open_at + dt.timedelta(days=1))}")
+              f"metric {mrow(m, 'onrouter_schedule_next_fire_ms', 'office')} vs {ms(open_at + dt.timedelta(days=1))}")
         d1 = mrow(m, "onrouter_schedule_denied_total", "office") or 0
-        check("指标：关闭后的 403 继续累计", d1 >= d0 + 2, f"d0={d0} d1={d1}")
-        check("指标：恒关窗口一路在挡（locked denied >= 3）",
+        check("metrics: the 403s after the close keep accumulating", d1 >= d0 + 2, f"d0={d0} d1={d1}")
+        check("metrics: the always-closed window kept blocking all along (locked denied >= 3)",
               mrow(m, "onrouter_schedule_denied_total", "locked") >= 3)
-        check("指标：移除之前的窗口不会冻结排期（tzcheck 仍在走）",
+        check("metrics: removing the earlier windows does not freeze the schedule (tzcheck still moving)",
               mrow(m, "onrouter_schedule_next_fire_ms", "tzcheck") != -1)
         raw = open_log()
-        check("error_log 记下第二次翻转（关闭）", "转为关闭" in raw, "日志里看不到第二次翻转")
-        check("热重载后重打了窗口摘要", "热重载后 schedule window 'office'" in raw,
-              "重载后没重打窗口概况")
-        notable = [l for l in raw.splitlines() if "schedule: 窗口" in l or "热重载定时窗口" in l]
+        check("error_log recorded the second flip (closed)", "switched to closed" in raw,
+              "no second flip in the log")
+        check("the window summary was reprinted after the hot reload",
+              "after hot reload, schedule window 'office'" in raw, "window summary not reprinted after reload")
+        notable = [l for l in raw.splitlines() if "schedule: window" in l or "scheduled window reload" in l]
         logf.flush()
     finally:
         proc.terminate()
@@ -417,8 +447,9 @@ def main():
         print(f"#   {l.strip()[:160]}")
     passed = sum(1 for _, ok in results if ok)
     total = len(results)
-    print(f"\n==== 定时访问窗口 E2E: {passed}/{total} passed ====")
-    print(f"     后端共收到 {sum(served.values())} 次回源（{len(served)} 个路径：{sorted(served)}）")
+    print(f"\n==== scheduled access window E2E: {passed}/{total} passed ====")
+    print(f"     backend served {sum(served.values())} proxied requests "
+          f"({len(served)} paths: {sorted(served)})")
     sys.exit(0 if passed == total else 1)
 
 

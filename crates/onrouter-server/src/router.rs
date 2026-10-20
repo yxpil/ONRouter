@@ -232,8 +232,8 @@ pub struct Location {
     pub auth_basic_realm: Option<String>,
     /// `auth_basic_user_file <path>;` 解析后的绝对路径
     pub auth_basic_user_file: Option<PathBuf>,
-    /// `schedule_access <window>;`：引用的顶层窗口名。None = 本路由不设定时闸门。
-    /// location 没写时继承 server 级（与 access_rules/auth_basic 同一条路）。
+    /// `schedule_access <window>;`: the top-level window name this route references. None = this route sets no schedule gate.
+    /// When the location writes none it inherits the server level (the same path as access_rules/auth_basic).
     pub schedule_gate: Option<String>,
     /// `proxy_cache <zone>|off;`：Some(zone) 启用命名缓存区，None 关闭
     pub proxy_cache: Option<String>,
@@ -308,7 +308,7 @@ pub struct Server {
     pub access_rules: Vec<crate::access::AccessRule>,
     pub auth_basic_realm: Option<String>,
     pub auth_basic_user_file: Option<PathBuf>,
-    /// server 级 `schedule_access`：location 未自带时继承（同 access_rules）。
+    /// server-level `schedule_access`: inherited by a location that does not carry one (same rule as access_rules).
     pub schedule_gate: Option<String>,
     /// `real_ip_header` / `set_real_ip_from` / `real_ip_recursive`（server 级，对标 nginx http/server）
     pub real_ip: crate::realip::RealIpConf,
@@ -1811,8 +1811,9 @@ impl Router {
                 .map(|z| z.split(':').next().unwrap_or(z).to_string()))
             .collect();
 
-        // 定时窗口的名字表：`schedule_access <name>;` 引用未声明的窗口要硬失败（见 parse_schedule_gate）。
-        // 这里只做名字扫描 —— 日历本身在 `Scheduler::parse_all` 里解析，那一步更早、也更严。
+        // The name table of the scheduled windows: a `schedule_access <name>;` referencing an undeclared window
+        // must hard-fail (see parse_schedule_gate). This only scans names -- the calendar itself is parsed in
+        // `Scheduler::parse_all`, an earlier and stricter step.
         let schedule_declared = crate::schedule::Scheduler::declared_names(config);
 
         // 限流区的 key 决定"按什么计数"。本实现只会按客户端地址计数：写成别的变量
@@ -2126,8 +2127,9 @@ impl Router {
                 crate::front_proxy::describe(&front_profiles)
             ));
         }
-        // 定时窗口的"声明了却没引用"：窗口会照常在每个分钟边界翻转，但没有任何路由被它挡 ——
-        // 配置读起来像"已经限时段开放了"，其实一行没生效（与 front_proxy 未启用同一条硬要求）。
+        // The scheduled-window "declared but never referenced" case: the window keeps flipping at every minute
+        // boundary, but no route is blocked by it -- the config reads as if time-limited access were on, yet not a
+        // single line took effect (the same hard requirement as an unused front_proxy profile).
         if !schedule_declared.is_empty() {
             let mut referenced: HashSet<&str> = HashSet::new();
             for group in out_groups.values() {
@@ -2149,8 +2151,9 @@ impl Router {
                 .collect();
             if !unused.is_empty() {
                 warnings.push(format!(
-                    "顶层声明的 schedule_window 里 {} 个没有任何 server/location 用 schedule_access 引用（{}）：\
-                     它们会照常按日历翻转，只是没有路由被挡 —— 定时闸门要写在 server 或 location 里才生效",
+                    "of the top-level schedule_window declarations, {} are referenced by no server or location \
+                     through schedule_access ({}): they keep flipping on the calendar as usual, only no route is \
+                     blocked by them -- a schedule gate takes effect only when written in a server or location",
                     unused.len(),
                     unused.join(", ")
                 ));
@@ -2371,10 +2374,15 @@ impl Router {
     }
 
     /// 未知指令告警：拼错的指令静默失效是网关最难排查的一类故障
-    /// 解析 `schedule_access <窗口名>;`（server 级与 location 级同一条路，location 覆盖 server）。
+    /// Parse `schedule_access <window>;` (the server level and the location level share one path; the location
+    /// overrides the server).
     ///
-    /// 引用了没声明的窗口必须**硬失败**：闸门写错名字的结果是"运维以为挡住了、其实一路放行"，
-    /// 这是这套代码库认定最不能只留一条告警的那类静默失效（同 limit_conn 引用未声明区域）。
+    /// Author: yxpil
+    ///
+    /// Referencing an undeclared window must **hard-fail**: getting the gate name wrong means "the operator
+    /// believes the route is blocked while it in fact lets everything through", and that is the class of silent
+    /// failure this codebase holds least acceptable to leave as a mere warning (same as a limit_conn that
+    /// references an undeclared zone).
     fn parse_schedule_gate(
         d: &Directive,
         ctx: &str,
@@ -2384,26 +2392,26 @@ impl Router {
         for c in d.block.iter().filter(|x| x.name == "schedule_access") {
             let name = c.arg(0).ok_or_else(|| {
                 AppError::Other(format!(
-                    "第 {} 行 {ctx} 里 schedule_access 缺少窗口名（写成 schedule_access office;）",
+                    "line {} schedule_access in {ctx} is missing the window name (write it as schedule_access office;)",
                     c.line
                 ))
             })?;
             if found.is_some() {
                 return Err(AppError::Other(format!(
-                    "第 {} 行 {ctx} 里 schedule_access 出现了多次：一条路由只能挂一个窗口，\
-                     要组合多段开放时间请在顶层声明一个覆盖它们的窗口",
+                    "line {} schedule_access in {ctx} appears more than once: one route can carry only one \
+                     window, so to combine several open periods declare one top-level window covering them all",
                     c.line
                 )));
             }
             if !windows.iter().any(|w| w == name) {
                 let known = if windows.is_empty() {
-                    "（本配置没有任何 schedule_window）".to_string()
+                    " (this configuration declares no schedule_window at all)".to_string()
                 } else {
-                    format!("（已声明：{}）", windows.join(", "))
+                    format!(" (declared windows: {})", windows.join(", "))
                 };
                 return Err(AppError::Other(format!(
-                    "第 {} 行 {ctx} 里 schedule_access 引用了未声明的窗口 '{name}'{known}：\
-                     这条路由的定时闸门不会生效，而\"看起来挡住了\"比没有闸门更糟",
+                    "line {} schedule_access in {ctx} references the undeclared window '{name}'{known}: this \
+                     route's schedule gate will not take effect, and \"looking blocked\" is worse than no gate at all",
                     c.line
                 )));
             }
@@ -5349,8 +5357,9 @@ mod tests {
         assert!(r.groups[&addr2].servers[0].front_proxy.auto_trust);
     }
 
-    /// `schedule_access` 的引用完整性：写错名字必须硬失败（闸门静默失效比没有闸门更糟），
-    /// 而"声明了却没人引用"要留一条告警 —— 两者都是这套代码库不接受"看着生效"的那类形状。
+    /// The reference integrity of `schedule_access`: a misspelled name must hard-fail (a silently dead gate is
+    /// worse than no gate at all), while "declared but referenced by nobody" must leave one warning -- both are
+    /// shapes this codebase refuses to let merely "look configured".
     #[test]
     fn schedule_gate_references_are_resolved_at_build_time() {
         let win = "schedule_window office { tz +08:00; open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; }";
@@ -5361,39 +5370,39 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:18331".parse().unwrap();
         let srv = &r.groups[&addr].servers[0];
         assert_eq!(srv.schedule_gate.as_deref(), Some("office"));
-        // location 各自记下自己的值；没写的那条留 None = 继承 server（判定在 server.rs 里做）。
+        // each location records its own value; the one that wrote none keeps None = inherit the server (the decision itself is made in server.rs).
         assert_eq!(srv.locations[0].schedule_gate.as_deref(), None);
         assert_eq!(srv.locations[1].schedule_gate.as_deref(), Some("office"));
         assert!(
             !r.warnings.iter().any(|w| w.contains("schedule_window")),
-            "引用齐了却还告警：{:?}",
+            "references were complete yet it still warned: {:?}",
             r.warnings
         );
 
-        // 名字写错：硬失败，且报错里要点出到底是哪个名字、有哪些可选。
+        // misspelled name: hard-fail, and the error must spell out which name it is and which ones exist.
         let typo = format!("{win}\nserver {{ listen 127.0.0.1:18332; location / {{ schedule_access offic; return 200; }} }}");
-        let e = Router::build(&cfg(&typo), &PathBuf::from(".")).expect_err("拼错的窗口名该否决");
+        let e = Router::build(&cfg(&typo), &PathBuf::from(".")).expect_err("a misspelled window name should be rejected");
         let msg = e.to_string();
         assert!(msg.contains("offic") && msg.contains("office"), "{msg}");
 
-        // 一个窗口都没声明就写 schedule_access：同样否决，而不是"永远开放"。
+        // writing schedule_access with no window declared at all: rejected the same way, not "open forever".
         let orphan = "server { listen 127.0.0.1:18333; location / { schedule_access office; return 200; } }";
-        let e = Router::build(&cfg(orphan), &PathBuf::from(".")).expect_err("没有窗口该否决");
-        assert!(e.to_string().contains("没有任何 schedule_window"), "{e}");
+        let e = Router::build(&cfg(orphan), &PathBuf::from(".")).expect_err("no window declared should be rejected");
+        assert!(e.to_string().contains("no schedule_window at all"), "{e}");
 
-        // 缺参数与写两遍都在 -t 就停住。
+        // a missing argument and a duplicate both stop at -t.
         let noarg = format!("{win}\nserver {{ listen 127.0.0.1:18334; location / {{ schedule_access; return 200; }} }}");
         assert!(Router::build(&cfg(&noarg), &PathBuf::from(".")).is_err());
         let twice = format!("{win}\nserver {{ listen 127.0.0.1:18335; location / {{ schedule_access office; schedule_access office; return 200; }} }}");
-        let e = Router::build(&cfg(&twice), &PathBuf::from(".")).expect_err("一条路由挂两个窗口该否决");
-        assert!(e.to_string().contains("多次"), "{e}");
+        let e = Router::build(&cfg(&twice), &PathBuf::from(".")).expect_err("two windows on one route should be rejected");
+        assert!(e.to_string().contains("more than once"), "{e}");
 
-        // 声明了没人引用 ⇒ 告警（窗口会翻转但没有路由被挡）。
+        // declared but referenced by nobody => a warning (the window still flips but no route is blocked).
         let unused = format!("{win}\nserver {{ listen 127.0.0.1:18336; location / {{ return 200; }} }}");
         let r = build(&unused);
         assert!(
             r.warnings.iter().any(|w| w.contains("office") && w.contains("schedule_access")),
-            "声明未引用却没告警：{:?}",
+            "declared but unreferenced yet no warning: {:?}",
             r.warnings
         );
     }

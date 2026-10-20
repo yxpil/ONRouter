@@ -80,11 +80,15 @@ pub fn register_limits(l: &Arc<crate::limit::Limits>) {
     let _ = LIMITS.set(Arc::clone(l));
 }
 
-/// 定时窗口句柄：窗口在启动时建表、进程内不换（热重载只原地换定义），所以计数
-/// 跨重载延续 —— "这个窗口今天翻过几次、挡过多少请求"不能因为一次 SIGHUP 归零。
+/// Scheduled window handle: windows are built into the table at startup and never re-created within the
+/// process (a hot reload only swaps the definitions in place), so the counters survive a reload -- "how many
+/// times this window flipped today and how many requests it denied" must not be reset to zero by one SIGHUP.
 static SCHEDULE: OnceLock<Arc<crate::schedule::Scheduler>> = OnceLock::new();
 
-/// 登记窗口表，供 `/metrics` 渲染逐窗口的当前开合、下次触发时刻、翻转与拒绝计数。
+/// Register the window table so `/metrics` can render, per window, the current open/closed state, the next
+/// trigger time, the flip count and the denial count.
+///
+/// Author: yxpil
 pub fn register_schedule(s: &Arc<crate::schedule::Scheduler>) {
     let _ = SCHEDULE.set(Arc::clone(s));
 }
@@ -456,7 +460,7 @@ impl Metrics {
                 s.push_str("# TYPE onrouter_schedule_open gauge\n");
                 s.push_str("# HELP onrouter_schedule_next_fire_ms Absolute Unix-ms at which this window will next be re-evaluated. -1 = nothing scheduled (window removed from the config; its state is frozen). Compare it with your own clock to prove the gateway and the operator agree on the time.\n");
                 s.push_str("# TYPE onrouter_schedule_next_fire_ms gauge\n");
-                s.push_str("# HELP onrouter_schedule_enabled 0 once a window has been removed from the config by a reload — the row stays so the counters above remain attributable instead of silently vanishing.\n");
+                s.push_str("# HELP onrouter_schedule_enabled 0 once a window has been removed from the config by a reload -- the row stays so the counters above remain attributable instead of silently vanishing.\n");
                 s.push_str("# TYPE onrouter_schedule_enabled gauge\n");
                 s.push_str("# HELP onrouter_schedule_changes_total Times this window actually changed state. Note that a trigger does not imply a change: waking at a moment that leaves the state as it was is not counted.\n");
                 s.push_str("# TYPE onrouter_schedule_changes_total counter\n");
