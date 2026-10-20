@@ -22,6 +22,7 @@ _*.txt
 *.out
 __pycache__/
 /conf/.tmp_*/
+/conf/cache/
 bench_*.json
 
 # 系统文件

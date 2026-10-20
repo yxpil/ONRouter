@@ -83,6 +83,14 @@ def main():
         check("force_add 不覆盖既有值", f.get("val") == "1", f"val={f.get('val')}")
         check("force_set 覆盖生效", f.get("fs") == "true" and f.get("val2") == "5", f"fs={f.get('fs')} val2={f.get('val2')}")
 
+        st, body = get("/deleteret")
+        r = kv(body)
+        check("/deleteret 200", st == 200, f"st={st}")
+        check("delete 存在/不存在都返回 true，err 为 nil",
+              r.get("s1") == "true" and r.get("e1") == "nil"
+              and r.get("s2") == "true" and r.get("e2") == "nil", f"{r}")
+        check("delete 后 get 返回 nil", r.get("gone") == "nil", f"gone={r.get('gone')}")
+
         st, body = get("/count")
         c = kv(body)
         check("/count 200", st == 200, f"st={st}")

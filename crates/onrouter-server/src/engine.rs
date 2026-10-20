@@ -140,6 +140,35 @@ pub struct RequestCtx {
     pub body_builder: Option<Vec<u8>>,
     /// `ngx.eof()` 已结束响应：后续 `ngx.print/say` 输出丢弃
     pub eof_sent: bool,
+    /// `$upstream_cache_status`：本次请求的 proxy_cache 结果（HIT/MISS/EXPIRED/BYPASS/STALE）。
+    /// 请求根本没参与缓存（非幂等方法、未配 zone、流式请求体）时是空串，与 nginx 一致。
+    pub cache_status: String,
+    /// `$still_online`：本次响应是否由 Still ONLine 副本顶替（回放时为 `STALE`）。
+    /// 没配副本区、或本次正常回源成功时是空串——与 `$upstream_cache_status` 同理。
+    pub still_online: String,
+    /// `front_proxy` 命中的 profile 名；空串 = 没认出前置代理（CDN /  LB）。
+    /// 识别本身不代表信任，信任看 `$front_proxy_verified`。
+    pub front_proxy: String,
+    /// 前置代理给出的客户端国家码；只有直连对端验证过才会有值。
+    pub front_proxy_country: String,
+    /// 前置代理给出的对外可见域名（`X-Forwarded-Host` 一类头）；同样只有验证过才采信。
+    /// 刻意不回写 `ctx.host`：那个字段参与虚拟主机匹配、日志与缓存键，
+    /// 要用它拼 URL 或转发给后端请在配置里显式写 `$front_proxy_host`。
+    pub front_proxy_host: String,
+    /// 直连 TCP 对端是否落在 `profile.trust ∪ set_real_ip_from` 内。
+    /// 这是所有头部取值的准入闸门：闸门没过，地址/协议/Host/国家一个都不采信。
+    pub front_proxy_verified: bool,
+    /// 未被任何模块改写过的真实 TCP 对端地址（nginx `$realip_remote_addr` 同名）。
+    /// 审计用：拿它和 `$remote_addr` 一比就能看出"头部声称的地址"与"实际连上来的"差多少。
+    pub realip_remote_addr: String,
+    /// `set $name value;` 写入的请求级变量，后写覆盖先写。
+    /// 解析顺序在 map/geo/builtin 之前：nginx 里 `set` 注册的是独立变量，与它们不可能重名。
+    pub set_vars: Vec<(String, String)>,
+    /// `if (cond) { return ...; }` 命中后暂存的 return。
+    /// ONRouter 刻意**不**在 REWRITE 阶段立即结束请求，而是和裸 `return` 在同一处执行
+    /// （ACCESS 之后）：条件 return 因此不可能绕过 allow/deny 与 auth_basic。
+    /// 这是与 nginx 的已知差异（nginx 里 return 属于 rewrite 阶段，先于访问控制）。
+    pub rewrite_return: Option<ReturnAction>,
 }
 
 impl RequestCtx {
@@ -301,6 +330,15 @@ impl RequestCtx {
             http_version: 1.1,
             body_builder: None,
             eof_sent: false,
+            cache_status: String::new(),
+            still_online: String::new(),
+            front_proxy: String::new(),
+            front_proxy_country: String::new(),
+            front_proxy_host: String::new(),
+            front_proxy_verified: false,
+            realip_remote_addr: String::new(),
+            set_vars: Vec::new(),
+            rewrite_return: None,
         }
     }
 
@@ -373,6 +411,21 @@ pub fn unix_now() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// nginx `$host` 是**不带端口**的请求主机名（要端口用 `$http_host` 或 `$server_port`）。
+/// Host 头本身常带 `:port`，所以这里剥掉；IPv6 字面量取 `]` 之前的部分。
+fn nginx_host_value(h: &str) -> String {
+    if let Some(end) = h.rfind(']') {
+        return h[..=end].to_string();
+    }
+    // 只剥"名字:十进制端口"，免得把无括号的 IPv6 字面量截成空串
+    if let Some((name, port)) = h.split_once(':') {
+        if !name.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            return name.to_string();
+        }
+    }
+    h.to_string()
+}
+
 /// 内置 nginx 变量读取（`$uri` / `$http_*` / `$sent_http_*` / `$status` 等）。
 /// 这是 ngx.var 与 map 源解析共享的唯一事实源。
 pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
@@ -408,7 +461,14 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
         "uri" => Some(ctx.effective_path().to_string()),
         "args" | "query_string" => Some(ctx.query.clone()),
         "is_args" => Some(if ctx.query.is_empty() { String::new() } else { "?".to_string() }),
-        "host" => ctx.host.clone(),
+        // $host 去端口（要原始头用 $http_host）；无 Host 头时沿用既有的 "unknown" 回落，
+        // 让 Lua、add_header、cache key 三条路径共用同一个答案
+        "host" => Some(
+            ctx.host
+                .as_deref()
+                .map(nginx_host_value)
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
         // 仅 SSL 握手阶段的 ctx 持有 SNI；普通请求未把连接的 SNI 带进 ctx（返回空）
         "ssl_server_name" => ctx.ssl.as_ref().and_then(|s| s.server_name.clone()),
         "status" => Some(ctx.status.to_string()),
@@ -447,8 +507,78 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
         "upstream_header_time" | "upstream_response_time" => {
             Some(format!("{:.3}", ctx.upstream_header_time))
         }
+        "upstream_cache_status" => Some(ctx.cache_status.clone()),
+        "still_online" => Some(ctx.still_online.clone()),
+        "front_proxy" => Some(ctx.front_proxy.clone()),
+        "front_proxy_country" => Some(ctx.front_proxy_country.clone()),
+        "front_proxy_host" => Some(ctx.front_proxy_host.clone()),
+        "front_proxy_verified" => Some(if ctx.front_proxy_verified { "1".to_string() } else { String::new() }),
+        "realip_remote_addr" => Some(ctx.realip_remote_addr.clone()),
         _ => None,
     }
+}
+
+/// `builtin_var` 里能匹配到的固定变量名（不含 `http_`/`arg_` 这类前缀派生名）。
+/// 供变量展开判断"这个名字 nginx 认不认识"用；新增 builtin 变量时必须同步这里，
+/// `static_var_names_are_known` 单测会把每个名字拿去实际解析做交叉检查。
+const STATIC_VAR_NAMES: &[&str] = &[
+    "remote_addr",
+    "remote_port",
+    "server_port",
+    "server_addr",
+    "scheme",
+    "request_method",
+    "method",
+    "request_uri",
+    "uri",
+    "args",
+    "query_string",
+    "is_args",
+    "host",
+    "ssl_server_name",
+    "status",
+    "body_bytes_sent",
+    "content_type",
+    "content_length",
+    "request_length",
+    "request_body",
+    "request_time",
+    "msec",
+    "time_local",
+    "time_iso8601",
+    "https",
+    "hostname",
+    "proxy_add_x_forwarded_for",
+    "upstream_addr",
+    "upstream_status",
+    "upstream_header_time",
+    "upstream_response_time",
+    "upstream_cache_status",
+    "still_online",
+    "front_proxy",
+    "front_proxy_country",
+    "front_proxy_host",
+    "front_proxy_verified",
+    "realip_remote_addr",
+];
+
+/// 名字是不是 nginx 的前缀派生变量（`$http_x`/`$arg_x`/`$cookie_x`/`$sent_http_x`/
+/// `$upstream_http_x`/`$upstream_cookie_x`）：这类变量"没有值"是正常状态，展开为空串。
+pub fn is_derived_var_name(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "http_",
+        "sent_http_",
+        "arg_",
+        "cookie_",
+        "upstream_http_",
+        "upstream_cookie_",
+    ];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// 名字是不是 nginx 认识的固定变量（值可能取不到，但名字本身合法）。
+pub fn is_static_var_name(name: &str) -> bool {
+    STATIC_VAR_NAMES.contains(&name)
 }
 
 /// 从 query 串里取一个参数（百分号解码，`+` 视为空格）；重复参数取第一个。
@@ -496,6 +626,10 @@ fn percent_decode(s: &str) -> String {
 pub fn resolve_var(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
     if depth > 8 {
         return None;
+    }
+    // `set $x ...;` 写的请求级变量优先：后写覆盖先写，且它不该被同名 map 顶掉
+    if let Some((_, v)) = ctx.set_vars.iter().rev().find(|(k, _)| k == name) {
+        return Some(v.clone());
     }
     let def = {
         let store = map_store().read().unwrap();
@@ -989,6 +1123,68 @@ pub struct RewriteRule {
     pub flag: RewriteFlag,
 }
 
+/// REWRITE 阶段的一条步骤。nginx 把 `rewrite`/`set`/`if` 都排在 rewrite 阶段，
+/// **按配置书写顺序**执行，所以这里是一个有序的枚举列表而不是三张表。
+#[derive(Debug, Clone)]
+pub enum RewriteStep {
+    /// `rewrite regex replacement [flag];`
+    Rewrite(RewriteRule),
+    /// `set $name value;`：value 做一次变量展开后写入请求级变量
+    Set { name: String, value: String },
+    /// `if (cond) { return ...; }`：命中时记下 return 并停止后续步骤，实际执行在 ACCESS 之后
+    Return(ReturnAction),
+    /// `if (cond) { ... }`：条件成立才依次执行内层步骤（内层允许 rewrite/set/return）
+    If { cond: IfCond, then: Vec<RewriteStep> },
+}
+
+/// `if` 的条件：左值一定是变量（nginx 的语法要求），右值是字面量或变量模板。
+#[derive(Debug, Clone)]
+pub struct IfCond {
+    pub lhs: String,
+    pub op: CondOp,
+    /// 仅 `=`/`!=` 使用；其余比较为 None。
+    pub rhs: Option<String>,
+}
+
+/// nginx `if` 支持的比较。文件类测试（`-f`/`-d`/`-e`…）不在此列，解析期就告警拒绝。
+#[derive(Debug, Clone)]
+pub enum CondOp {
+    /// 非空即真（`if ($x)`）
+    NonEmpty,
+    /// 空即真（`if (!$x)`）
+    Empty,
+    Eq,
+    Ne,
+    /// `~`：区分大小写的部分匹配
+    Regex(regex::Regex),
+    /// `~*`：忽略大小写的部分匹配
+    IRegex(regex::Regex),
+    NotRegex(regex::Regex),
+    NotIRegex(regex::Regex),
+}
+
+/// `if` 条件求值。注意与 `proxy_cache_bypass` 那类谓词不同：nginx 的 `if` 只看"空/非空"，
+/// 字符串 "0" 在这里算真。
+pub fn eval_if_cond(cond: &IfCond, ctx: &RequestCtx) -> bool {
+    let lhs = crate::proxy::interpolate_vars(&cond.lhs, ctx);
+    match &cond.op {
+        CondOp::NonEmpty => !lhs.is_empty(),
+        CondOp::Empty => lhs.is_empty(),
+        CondOp::Eq => cond_rhs(cond, ctx).is_some_and(|r| lhs == r),
+        CondOp::Ne => cond_rhs(cond, ctx).map_or(true, |r| lhs != r),
+        CondOp::Regex(re) | CondOp::NotRegex(re) => {
+            re.is_match(&lhs) != matches!(&cond.op, CondOp::NotRegex(_))
+        }
+        CondOp::IRegex(re) | CondOp::NotIRegex(re) => {
+            re.is_match(&lhs) != matches!(&cond.op, CondOp::NotIRegex(_))
+        }
+    }
+}
+
+fn cond_rhs(cond: &IfCond, ctx: &RequestCtx) -> Option<String> {
+    cond.rhs.as_deref().map(|r| crate::proxy::interpolate_vars(r, ctx))
+}
+
 /// return 指令：状态码 + 可选文本/URL
 #[derive(Debug, Clone)]
 pub struct ReturnAction {
@@ -996,46 +1192,89 @@ pub struct ReturnAction {
     pub text: Option<String>,
 }
 
-/// 对 ctx 依次应用 rewrite 规则；返回是否需要停止处理
-pub fn apply_rewrites(ctx: &mut RequestCtx, rules: &[RewriteRule]) -> bool {
-    for rule in rules {
-        let path = ctx.effective_path().to_string();
-        if let Some(caps) = rule.pattern.captures(&path) {
-            let mut replaced = rule.replacement.clone();
-            // $1..$9 反向引用
-            for i in (1..10).rev() {
-                let cap = caps
-                    .get(i)
-                    .map(|m| m.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                replaced = replaced.replace(&format!("${i}"), &cap);
+/// 按书写顺序执行 REWRITE 阶段步骤；返回 `ctx.done`（需要立即结束请求处理）。
+/// `last`/`break` 的内部跳转语义由调用方（server.rs）通过 `ctx.internal_redirect` 处理。
+pub fn apply_rewrite_steps(ctx: &mut RequestCtx, steps: &[RewriteStep]) -> bool {
+    let _ = apply_steps(ctx, steps, 0);
+    ctx.done
+}
+
+/// 一条步骤执行后 rewrite 阶段是否就此收束。nginx 的 rewrite 模块命中 `last`/`break`
+/// 后立即停止本 location 的 rewrite 处理（包括后面书写的 set/return/if），所以不能简单
+/// 地"返回 false 继续下一条"。
+#[derive(Debug, PartialEq, Eq)]
+enum StepFlow {
+    Continue,
+    /// 停止后续步骤：last/break/return/redirect 都走这里
+    Stop,
+}
+
+fn apply_steps(ctx: &mut RequestCtx, steps: &[RewriteStep], depth: u8) -> StepFlow {
+    for step in steps {
+        match step {
+            RewriteStep::Rewrite(rule) => {
+                let path = ctx.effective_path().to_string();
+                let Some(caps) = rule.pattern.captures(&path) else {
+                    continue;
+                };
+                let mut replaced = rule.replacement.clone();
+                // $1..$9 反向引用
+                for i in (1..10).rev() {
+                    let cap = caps
+                        .get(i)
+                        .map(|m| m.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    replaced = replaced.replace(&format!("${i}"), &cap);
+                }
+                match rule.flag {
+                    RewriteFlag::Redirect | RewriteFlag::Permanent => {
+                        let code = if matches!(rule.flag, RewriteFlag::Permanent) { 301 } else { 302 };
+                        let target = if replaced.starts_with("http") {
+                            replaced
+                        } else {
+                            format!("http://{}{}", ctx.host.as_deref().unwrap_or("localhost"), replaced)
+                        };
+                        ctx.redirect = Some((code, target));
+                        ctx.done = true;
+                        return StepFlow::Stop;
+                    }
+                    RewriteFlag::Last => {
+                        ctx.rewritten_path = Some(replaced);
+                        ctx.internal_redirect = true;
+                        return StepFlow::Stop;
+                    }
+                    RewriteFlag::Break => {
+                        ctx.rewritten_path = Some(replaced);
+                        return StepFlow::Stop;
+                    }
+                }
             }
-            match rule.flag {
-                RewriteFlag::Redirect | RewriteFlag::Permanent => {
-                    let code = if matches!(rule.flag, RewriteFlag::Permanent) { 301 } else { 302 };
-                    let target = if replaced.starts_with("http") {
-                        replaced
-                    } else {
-                        format!("http://{}{}", ctx.host.as_deref().unwrap_or("localhost"), replaced)
-                    };
-                    ctx.redirect = Some((code, target));
-                    ctx.done = true;
-                    return true;
+            RewriteStep::Set { name, value } => {
+                let replaced = crate::proxy::interpolate_vars(value, ctx);
+                if let Some(existing) = ctx.set_vars.iter_mut().find(|(k, _)| k == name) {
+                    existing.1 = replaced;
+                } else {
+                    ctx.set_vars.push((name.clone(), replaced));
                 }
-                RewriteFlag::Last => {
-                    ctx.rewritten_path = Some(replaced);
-                    ctx.internal_redirect = true;
-                    return true;
-                }
-                RewriteFlag::Break => {
-                    ctx.rewritten_path = Some(replaced);
-                    return true;
+            }
+            RewriteStep::Return(ret) => {
+                // 记下但不在这里结束请求：见 RequestCtx::rewrite_return 的注释
+                ctx.rewrite_return = Some(ret.clone());
+                return StepFlow::Stop;
+            }
+            RewriteStep::If { cond, then } => {
+                // nginx 不支持 if 嵌套；解析期已拒绝，这里 depth 只是防御性上限
+                if depth < 4
+                    && eval_if_cond(cond, ctx)
+                    && apply_steps(ctx, then, depth + 1) == StepFlow::Stop
+                {
+                    return StepFlow::Stop;
                 }
             }
         }
     }
-    false
+    StepFlow::Continue
 }
 
 pub fn apply_return(ctx: &mut RequestCtx, ret: &ReturnAction) {
@@ -1512,5 +1751,189 @@ mod tests {
         assert_eq!(match_geo(&def, &"1.2.3.4".parse().unwrap()), "any-v4");
         // v6 不匹配 v4 的 /0
         assert_eq!(match_geo(&def, &"::1".parse().unwrap()), "other");
+    }
+
+    /// STATIC_VAR_NAMES 是"名字合法但这次取不到值"的白名单（add_header/proxy_cache_key
+    /// 靠它决定展开成空串还是保留字面量）。漏同步的后果很隐蔽，所以每个名字实际取一次。
+    #[test]
+    fn static_var_names_are_known() {
+        let mut ctx = RequestCtx::default();
+        ctx.host = Some("example.test".into());
+        ctx.listener = Some("127.0.0.1:8080".parse().unwrap());
+        ctx.req_headers = vec![
+            ("content-type".into(), "text/plain".into()),
+            ("content-length".into(), "3".into()),
+        ];
+        ctx.ssl = Some(SslState { server_name: Some("tls.example.test".into()), ..Default::default() });
+        for name in STATIC_VAR_NAMES {
+            // $hostname 读环境变量，CI 机器上可能两个都没有
+            if *name == "hostname" {
+                continue;
+            }
+            assert!(
+                builtin_var(&ctx, name).is_some(),
+                "'{name}' 列在 STATIC_VAR_NAMES 里，但 builtin_var 返回 None（两边没同步）"
+            );
+            assert!(is_static_var_name(name));
+        }
+        // 反面：既不在名单也不该被 builtin 认出来的名字必须保持"未知"
+        assert!(builtin_var(&ctx, "definitely_not_a_variable").is_none());
+        assert!(!is_static_var_name("definitely_not_a_variable"));
+        assert!(!is_derived_var_name("definitely_not_a_variable"));
+        // 前缀派生名：没有值也属于合法变量
+        for d in ["http_x_no_such", "arg_no_such", "cookie_no_such", "sent_http_no_such"] {
+            assert!(is_derived_var_name(d), "{d} 应识别为派生变量");
+            assert!(builtin_var(&ctx, d).is_none());
+        }
+    }
+
+    #[test]
+    fn host_var_drops_the_port_like_nginx() {
+        let mut ctx = RequestCtx::default();
+        ctx.req_headers = vec![("host".into(), "example.test:8080".into())];
+        ctx.host = Some("example.test:8080".into());
+        // $host 去端口；$http_host 保留原始头值
+        assert_eq!(builtin_var(&ctx, "host").as_deref(), Some("example.test"));
+        assert_eq!(builtin_var(&ctx, "http_host").as_deref(), Some("example.test:8080"));
+        // 无端口 / IPv6（带括号与不带括号）都不能被截坏
+        for (raw, want) in [
+            ("example.test", "example.test"),
+            ("[::1]:8080", "[::1]"),
+            ("[2001:db8::1]", "[2001:db8::1]"),
+            ("::1", "::1"),
+            ("host:notaport", "host:notaport"),
+        ] {
+            ctx.host = Some(raw.into());
+            assert_eq!(builtin_var(&ctx, "host").as_deref(), Some(want), "raw={raw}");
+        }
+    }
+
+    fn set_step(name: &str, value: &str) -> RewriteStep {
+        RewriteStep::Set { name: name.to_string(), value: value.to_string() }
+    }
+
+    #[test]
+    fn set_writes_request_var_and_last_write_wins() {
+        let mut ctx = RequestCtx::default();
+        ctx.path = "/a/b".into();
+        ctx.query = "n=7".into();
+        let steps = vec![
+            set_step("tag", "first"),
+            set_step("tag", "second-$arg_n"),
+            set_step("tail", "$uri-end"),
+        ];
+        assert!(!apply_rewrite_steps(&mut ctx, &steps));
+        assert_eq!(resolve_variable(&ctx, "tag").as_deref(), Some("second-7"));
+        // value 只展开一次：变量值里出现的 $ 不会被二次展开
+        assert_eq!(ctx.set_vars.len(), 2);
+        // 未参与 set 的变量仍走 builtin 通道
+        assert_eq!(resolve_variable(&ctx, "uri").as_deref(), Some("/a/b"));
+    }
+
+    #[test]
+    fn set_can_shadow_a_builtin_name_for_this_request() {
+        let mut ctx = RequestCtx::default();
+        ctx.uri = "/orig?q=1".into();
+        ctx.path = "/orig".into();
+        apply_rewrite_steps(&mut ctx, &[set_step("request_uri", "/fake")]);
+        assert_eq!(resolve_variable(&ctx, "request_uri").as_deref(), Some("/fake"));
+    }
+
+    #[test]
+    fn if_conds_follow_nginx_truthiness_and_string_rules() {
+        let mut ctx = RequestCtx::default();
+        ctx.uri = "/x".into();
+        ctx.query = "a=0".into();
+        ctx.req_headers = vec![("user-agent".into(), "Mozilla/5.0 MSIE".into())];
+        let cond = |lhs: &str, op: CondOp, rhs: Option<&str>| IfCond {
+            lhs: lhs.into(),
+            op,
+            rhs: rhs.map(|s| s.to_string()),
+        };
+        // 空/非空：nginx 只看变量是否有值，字符串 "0" 算真
+        assert!(eval_if_cond(&cond("$arg_a", CondOp::NonEmpty, None), &ctx));
+        assert!(!eval_if_cond(&cond("$arg_missing", CondOp::NonEmpty, None), &ctx));
+        assert!(eval_if_cond(&cond("$arg_missing", CondOp::Empty, None), &ctx));
+        // = / !=：右值本身也是模板
+        assert!(eval_if_cond(&cond("$arg_a", CondOp::Eq, Some("0")), &ctx));
+        assert!(eval_if_cond(&cond("$scheme", CondOp::Ne, Some("$arg_a")), &ctx));
+        // ~ 区分大小写、~* 忽略、!~ / !~* 取反
+        assert!(eval_if_cond(&cond("$http_user_agent", CondOp::Regex(re("MSIE")), None), &ctx));
+        assert!(!eval_if_cond(&cond("$http_user_agent", CondOp::Regex(re("msie")), None), &ctx));
+        assert!(eval_if_cond(&cond("$http_user_agent", CondOp::IRegex(re_ci("msie")), None), &ctx));
+        assert!(eval_if_cond(&cond("$http_user_agent", CondOp::NotRegex(re("msie")), None), &ctx));
+        assert!(!eval_if_cond(&cond("$http_user_agent", CondOp::NotIRegex(re_ci("MSIE")), None), &ctx));
+    }
+
+    #[test]
+    fn if_gates_inner_set_then_return() {
+        let mut ctx = RequestCtx::default();
+        ctx.query = "debug=1".into();
+        let steps = vec![RewriteStep::If {
+            cond: IfCond { lhs: "$arg_debug".into(), op: CondOp::NonEmpty, rhs: None },
+            then: vec![
+                set_step("why", "debug-on"),
+                RewriteStep::Return(ReturnAction { code: 403, text: Some("no".into()) }),
+            ],
+        }];
+        // return 只被"记下"：ONRouter 让它和裸 return 一样在 ACCESS 之后执行，
+        // 所以这里既不是 done，也不改 status
+        assert!(!apply_rewrite_steps(&mut ctx, &steps));
+        assert!(!ctx.done);
+        assert_eq!(ctx.status, 0);
+        assert_eq!(ctx.rewrite_return.as_ref().map(|r| r.code), Some(403));
+        // 内层 set 在 return 之前已生效（顺序语义）
+        assert_eq!(resolve_variable(&ctx, "why").as_deref(), Some("debug-on"));
+
+        // 条件不成立时整块跳过
+        let mut ctx2 = RequestCtx::default();
+        ctx2.query = "debug=".into();
+        assert!(!apply_rewrite_steps(&mut ctx2, &steps));
+        assert!(ctx2.rewrite_return.is_none());
+        assert_eq!(resolve_variable(&ctx2, "why"), None);
+    }
+
+    #[test]
+    fn recorded_return_stops_the_rest_of_the_sequence() {
+        let mut ctx = RequestCtx::default();
+        ctx.query = "go=1".into();
+        let steps = vec![
+            RewriteStep::If {
+                cond: IfCond { lhs: "$arg_go".into(), op: CondOp::NonEmpty, rhs: None },
+                then: vec![RewriteStep::Return(ReturnAction { code: 429, text: None })],
+            },
+            // if 命中后不该再执行：后面的 rewrite 不生效
+            RewriteStep::Rewrite(RewriteRule {
+                pattern: re("^/x$"),
+                replacement: "/y".into(),
+                flag: RewriteFlag::Break,
+            }),
+        ];
+        apply_rewrite_steps(&mut ctx, &steps);
+        assert_eq!(ctx.rewritten_path, None);
+        assert_eq!(ctx.rewrite_return.as_ref().map(|r| r.code), Some(429));
+    }
+
+    #[test]
+    fn rewrite_last_inside_if_stops_the_step_list() {
+        let mut ctx = RequestCtx::default();
+        ctx.path = "/old".into();
+        ctx.query = "go=1".into();
+        let steps = vec![
+            RewriteStep::If {
+                cond: IfCond { lhs: "$arg_go".into(), op: CondOp::NonEmpty, rhs: None },
+                then: vec![RewriteStep::Rewrite(RewriteRule {
+                    pattern: re("^/old$"),
+                    replacement: "/new".into(),
+                    flag: RewriteFlag::Last,
+                })],
+            },
+            // last 之后不该再执行：$tag 保持未定义
+            set_step("tag", "after"),
+        ];
+        assert!(!apply_rewrite_steps(&mut ctx, &steps));
+        assert_eq!(ctx.rewritten_path.as_deref(), Some("/new"));
+        assert!(ctx.internal_redirect);
+        assert_eq!(resolve_variable(&ctx, "tag"), None);
     }
 }

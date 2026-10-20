@@ -1830,7 +1830,7 @@ impl LuaEngine {
     }
 
     pub fn new(config: &Config, base_dir: &PathBuf) -> Result<Self, AppError> {
-        let dicts = SharedDicts::parse_all(config)?;
+        let dicts = SharedDicts::parse_all(config, base_dir)?;
 
         // init_by_lua / init_by_lua_file：收集脚本（每个 VM 各执行一次，对标每 worker 一次 init）
         let mut inits: Vec<(String, String)> = Vec::new();
@@ -5133,10 +5133,10 @@ impl LuaUserData for crate::shared_dict::SharedZone {
                 }
             },
         );
-        // d:delete(key)
+        // d:delete(key) -> true —— OpenResty 里 key 不存在也返回 true，删除本身不会失败
         methods.add_method("delete", |_, this, key: String| {
             this.delete(&key);
-            Ok(())
+            Ok((LuaValue::Boolean(true), LuaValue::Nil))
         });
         // d:incr(key, delta, init?) -> new_value | nil, err
         methods.add_method(

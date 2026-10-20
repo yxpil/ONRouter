@@ -754,6 +754,18 @@ fn looks_like_invalid_header(root: &str) -> bool {
 
 /// 配置值里的内置变量插值（proxy_set_header 与 rust handler 共用）
 pub fn interpolate_vars(template: &str, ctx: &RequestCtx) -> String {
+    interpolate_vars_with(template, ctx, |_| None)
+}
+
+/// 同 `interpolate_vars`，但调用方可以注入只在本处成立的变量（cache key 的 `$proxy_host`）。
+/// 词法只扫描**原模板**，替换结果不参与分词：否则 `$scheme$proxy_host` 先换成
+/// `$scheme127.0.0.1:80` 后，贪婪词法会把 `$scheme` 读成 `$scheme127`，键里留下一截
+/// 永远展开不了的字面量。
+pub(crate) fn interpolate_vars_with(
+    template: &str,
+    ctx: &RequestCtx,
+    extra: impl Fn(&str) -> Option<String>,
+) -> String {
     if !template.contains('$') {
         return template.to_string();
     }
@@ -802,18 +814,19 @@ pub fn interpolate_vars(template: &str, ctx: &RequestCtx) -> String {
             continue;
         }
         // 单遍替换：替换结果里的 `$` 不会被再次展开（用户数据里的 $arg_x 不该二次求值）。
-        let value = match name {
-            // 与既有语义保持一致：无 Host 头时回落 "unknown"
-            "host" => Some(ctx.host.clone().unwrap_or_else(|| "unknown".to_string())),
-            _ => crate::engine::resolve_var(ctx, name, 0),
-        };
+        let value = extra(name).or_else(|| crate::engine::resolve_var(ctx, name, 0));
         match value {
             Some(v) => out.push_str(&v),
-            // nginx 中缺失的 http/arg/cookie 变量展开为空串
-            None if name.starts_with("http_")
-                || name.starts_with("sent_http_")
-                || name.starts_with("arg_")
-                || name.starts_with("cookie_") => {}
+            // nginx 认识的变量名此刻没有值 → 空串：`$arg_x`/`$cookie_x`/`$http_x` 这类前缀
+            // 派生名、`$sent_http_x`/`$upstream_http_x`，以及 `builtin_var` 匹配不到的固定名
+            // （例如明文请求下的 `$ssl_server_name`）。这决定了
+            // `proxy_cache_bypass $arg_nocache $http_pragma;` 的判真：没带的头必须是"空"，
+            // 否则表达式永远为真，缓存形同关闭。
+            None if crate::engine::is_derived_var_name(name)
+                || crate::engine::is_static_var_name(name) => {}
+            // 名字根本不像 nginx 变量（拼错、或 `set` 之外的自定义名）：保留字面量。
+            // nginx 在解析期就 emerg "unknown \"x\" variable" 拒绝启动，我们没有全量变量
+            // 白名单，静默变空串会把配置错误藏起来；留字面量在响应里一眼能看见。
             None => out.push_str(&template[i..i + consumed]),
         }
         i += consumed;
@@ -1119,6 +1132,15 @@ mod tests {
             http_version: 1.1,
             body_builder: None,
             eof_sent: false,
+            cache_status: String::new(),
+            still_online: String::new(),
+            front_proxy: String::new(),
+            front_proxy_country: String::new(),
+            front_proxy_host: String::new(),
+            front_proxy_verified: false,
+            realip_remote_addr: String::new(),
+            set_vars: Vec::new(),
+            rewrite_return: None,
         }
     }
 
@@ -1159,6 +1181,44 @@ mod tests {
         // 替换结果里的 $ 不再二次求值（否则用户数据可影响 cache key / 头值）
         c.uri = "/x?q=$arg_a".to_string();
         assert_eq!(interpolate_vars("$request_uri", &c), "/x?q=$arg_a");
+    }
+
+    #[test]
+    fn known_but_valueless_var_expands_empty_unknown_stays_literal() {
+        let c = ctx();
+        // nginx 认识的名字但这次没值 → 空串（$upstream_cache_status 在非缓存请求上就是空）
+        assert_eq!(interpolate_vars("[$upstream_cache_status|$arg_no]", &c), "[|]");
+        // 根本不像 nginx 变量的名字（拼错、或 set 之外的自定义名）保留字面量，
+        // 让配置错误在响应头里看得见，而不是静默变成空值
+        assert_eq!(interpolate_vars("$hstop", &c), "$hstop");
+        assert_eq!(interpolate_vars("$upstream_cache_statusx", &c), "$upstream_cache_statusx");
+        // $host 去端口、$http_host 原样：两条路径共用 builtin_var 这一个事实源
+        let mut c2 = ctx();
+        c2.host = Some("example.test:8080".into());
+        c2.req_headers.push(("host".into(), "example.test:8080".into()));
+        assert_eq!(interpolate_vars("$host|$http_host", &c2), "example.test|example.test:8080");
+    }
+
+    #[test]
+    fn injected_var_does_not_break_lexical_boundaries() {
+        let c = ctx();
+        let key = |tmpl: &str| {
+            interpolate_vars_with(tmpl, &c, |n| {
+                (n == "proxy_host").then(|| "127.0.0.1:18271".to_string())
+            })
+        };
+        // 注入的值以数字开头：词法只扫原模板，否则 `$scheme` 会被贪婪读成 `$scheme127`
+        // 这个不存在的名字，键里留下一截永远展开不了的字面量
+        assert_eq!(
+            key("$scheme$proxy_host$request_uri"),
+            "https127.0.0.1:18271/api/x?a=1"
+        );
+        assert_eq!(key("${proxy_host}$uri"), "127.0.0.1:18271/api/x");
+        // 注入只覆盖同名变量，其余仍走常规解析
+        assert_eq!(
+            key("$scheme $host $proxy_host"),
+            "https www.example.com 127.0.0.1:18271"
+        );
     }
 
     #[test]

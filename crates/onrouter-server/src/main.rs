@@ -23,7 +23,10 @@ mod access;
 mod certs;
 mod compress;
 mod dns;
+mod disk_cache;
 mod engine;
+mod front_proxy;
+mod learning;
 mod limit;
 mod log;
 mod lua_engine;
@@ -38,10 +41,12 @@ mod router;
 mod server;
 mod settings;
 mod shared_dict;
+mod still_online;
 mod sockpool;
 mod stream;
 mod tls;
 mod upstream;
+mod vip;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -231,12 +236,35 @@ fn main() {
     let _err_log = log::init(&config, &base_dir);
 
     let (settings, setting_warnings) = Settings::from_config(&config);
+    // 告警副本同时留给 `-t` 直接打印：日志器是异步队列，-t 在 writer 线程排空前就 exit(0)，
+    // 只看 error_log 会把"配置里有指令被忽略"这件事整个丢掉
+    let mut startup_warnings: Vec<String> = Vec::new();
     for w in setting_warnings {
         log_warn!("{w}");
+        startup_warnings.push(w);
     }
     let limits = Arc::new(limit::Limits::parse_all(&config));
     for w in &limits.warnings {
         log_warn!("{w}");
+        startup_warnings.push(w.clone());
+    }
+    // 缓存学习：默认整条链路关着，只有 `learning on;` + 声明了学习区才会改变任何行为
+    let learning = Arc::new(learning::Learning::parse_all(&config));
+    for w in &learning.warnings {
+        log_warn!("{w}");
+        startup_warnings.push(w.clone());
+    }
+    // 队列：`limit_req_queue` 把"超限即拒"改成"有界排队"，`limit_req_learning` 再让排队
+    // 上界跟着 key 的突发形状走。启动与热重载共用这一条入口，两条路径不会分叉。
+    for note in limits.apply_queue(&config, &learning) {
+        log_warn!("队列: {note}");
+        startup_warnings.push(note);
+    }
+    // 信誉：`vip_learning` 学出来的重要客户只改两处行为——排队上界与缓存驻留加权。
+    // 申领排在缓存、队列之后：预算紧张时先让路的就是这份"锦上添花"。
+    for note in limits.apply_vip(&learning) {
+        log_warn!("信誉: {note}");
+        startup_warnings.push(note);
     }
 
     let router = match Router::build(&config, &base_dir) {
@@ -249,6 +277,7 @@ fn main() {
     };
     for w in &router.warnings {
         log_warn!("{w}");
+        startup_warnings.push(w.clone());
     }
 
     let pid_path = config
@@ -257,13 +286,15 @@ fn main() {
         .map(|p| resolve_path(p, &base_dir));
 
     if args.test {
-        std::process::exit(match check(&router, &settings) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("[onrouter] {e}");
-                1
-            }
-        });
+        std::process::exit(
+            match check(&router, &settings, &limits, &learning, &startup_warnings) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("[onrouter] {e}");
+                    1
+                }
+            },
+        );
     }
 
     let workers = std::thread::available_parallelism()
@@ -281,6 +312,7 @@ fn main() {
         router,
         settings,
         limits,
+        Arc::clone(&learning),
         base_dir,
         conf_path,
         workers,
@@ -293,7 +325,25 @@ fn main() {
 }
 
 /// `-t`：把运行期会踩的坑提前踩一遍（证书、限流引用、监听地址）
-fn check(router: &Router, settings: &Settings) -> Result<(), String> {
+/// 预算的人类可读口径（副本区按字节配额，与 proxy_cache 的条数预算不同）。
+fn human_bytes(n: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if n >= MIB && n % MIB == 0 {
+        format!("{} MiB", n / MIB)
+    } else if n >= 1024 && n % 1024 == 0 {
+        format!("{} KiB", n / 1024)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn check(
+    router: &Router,
+    settings: &Settings,
+    limits: &limit::Limits,
+    learning: &learning::Learning,
+    warnings: &[String],
+) -> Result<(), String> {
     if router.listeners.is_empty() {
         return Err("配置中没有任何 listen 指令".to_string());
     }
@@ -309,8 +359,41 @@ fn check(router: &Router, settings: &Settings) -> Result<(), String> {
         "  worker_connections={} keepalive_requests={} shutdown_grace={:?}",
         settings.worker_connections, settings.keepalive_requests, settings.shutdown_grace
     );
-    if !router.warnings.is_empty() {
-        println!("  （有 {} 条告警，见 error_log）", router.warnings.len());
+    if !router.still_zones.is_empty() {
+        let mut items: Vec<_> = router.still_zones.iter().collect();
+        items.sort();
+        // 列出区名与预算：确认顶层 still_online_zone 真的进了路由表，而不是只写了个名字
+        println!(
+            "  Still ONLine 副本区 {}",
+            items
+                .iter()
+                .map(|(n, b)| format!("{n}={}", human_bytes(**b)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // 限流队列：只在写了 limit_req_queue 时产生输出，老配置的 -t 结果保持原样
+    let queue = limits.queue_summary();
+    if !queue.is_empty() {
+        println!("  限流队列 {}", queue.join(" | "));
+    }
+    // 学习：同样只在真开着时打印——运维要能在 -t 就看到"这张表要占多少内存"，
+    // 而不是等启动日志里才发现预算不够、某区退回不学。
+    for line in learning.describe() {
+        println!("  {line}");
+    }
+    // 前置代理：把"声明了哪几家、各靠什么头识别、有几段授权网段"打在 -t 里。
+    // 这套配置最坏的失效是厂商网段过期后静默退回按节点 IP 计数，得让它在检查阶段就看得见。
+    let fps = front_proxy::snapshot();
+    if !fps.is_empty() {
+        println!("  前置代理识别 {}", front_proxy::describe(&fps));
+    }
+    if !warnings.is_empty() {
+        // 逐条打印：这些行就是"配置里有指令没生效"，只给个数量等于没给
+        println!("  告警 {} 条：", warnings.len());
+        for w in warnings {
+            println!("    - {w}");
+        }
     }
     println!("配置测试通过。");
     Ok(())
@@ -321,6 +404,7 @@ async fn run(
     router: Router,
     settings: Settings,
     limits: Arc<limit::Limits>,
+    learning: Arc<learning::Learning>,
     base_dir: PathBuf,
     conf_path: PathBuf,
     workers: usize,
@@ -341,7 +425,10 @@ async fn run(
         }
         None => Arc::new(ProxyEngine::new(Arc::clone(&pool))),
     };
-    let proxy_cache = proxy_cache::ProxyCache::with_capacities(router.cache_zones.clone());
+    let proxy_cache =
+        proxy_cache::ProxyCache::with_capacities(router.cache_zones.clone(), Arc::clone(&learning));
+    let still_online =
+        still_online::StillOnline::with_budgets(router.still_zones.clone());
     let access_log = access_log::AccessLog::new(&config, &base_dir);
 
     let listener_specs = router.listeners.clone();
@@ -358,6 +445,7 @@ async fn run(
         lua,
         proxy,
         proxy_cache,
+        still_online: Arc::clone(&still_online),
         access_log: Arc::clone(&access_log),
         settings: settings.clone(),
         limits: Arc::clone(&limits),
@@ -373,6 +461,12 @@ async fn run(
     crate::metrics::global(settings.worker_connections);
     // upstream 每节点连接数/健康/成败计数：注册的是运行中的 Arc，渲染时直接读原子量
     crate::metrics::register_upstreams(&pool);
+    // Still ONLine 副本层计数：实例进程内唯一（热重载只套用新预算），注册一次即可
+    crate::metrics::register_still_online(&still_online);
+    // 缓存学习账目：同样注册一次，重载只换配置不换实例
+    crate::metrics::register_proxy_cache(&state.proxy_cache);
+    // 限流队列：`Limits` 实例进程内唯一，热重载只原地换策略，计数不清零
+    crate::metrics::register_limits(&limits);
 
     // 先全部绑定再开始服务：端口冲突要在启动阶段就失败，而不是半启动状态
     let mut bound = Vec::with_capacity(listener_specs.len());
@@ -415,7 +509,8 @@ async fn run(
         }
     }
 
-    // 后台维护：清理限流状态表里的闲置 key（防状态表随客户端数量膨胀）
+    // 后台维护：清理限流状态表里的闲置 key（防状态表随客户端数量膨胀）、
+    // 清扫 DICT 冷层（过期/`inactive` 回收 + 容量逐出 + 账目自愈）
     let maintain = {
         let limits = Arc::clone(&limits);
         let access_log = Arc::clone(&state.access_log);
@@ -428,6 +523,11 @@ async fn run(
                 let n = limits.purge_idle_all(10 * 60 * 1000);
                 if n > 0 {
                     log_debug!("清理限流状态表 {n} 个闲置 key");
+                }
+                // 清扫要走文件系统，放到阻塞线程池，别占着 worker
+                match tokio::task::spawn_blocking(disk_cache::sweep_all).await {
+                    Ok(0) | Err(_) => {}
+                    Ok(n) => log_debug!("磁盘冷层清扫回收 {n} 个条目"),
                 }
                 let d = access_log.dropped_count();
                 if d > reported {
@@ -476,6 +576,13 @@ async fn run(
         ));
     }
 
+    // Still ONLine 后台重取：脏表里到期的 key 用匿名 GET 换回新鲜内容（副本层自己在
+    // 请求路径上回放，重取只负责"恢复后重试"，所以没配副本区时这个循环基本是空转）。
+    tokio::spawn(server::still_online_refresh_loop(
+        Arc::clone(&state),
+        rx.clone(),
+    ));
+
     println!(
         "[onrouter] 启动完成：{} 个监听（含 {} 个 stream），{workers} 个 worker 线程，配置 {conf_display}",
         listener_specs.len() + stream_specs.len(),
@@ -487,12 +594,47 @@ async fn run(
     for line in limits.describe() {
         log_info!("生效 {line}");
     }
+    for line in learning.describe() {
+        log_info!("生效 {line}");
+    }
     log_info!(
         "worker_connections={}，Lua VM={}，upstream={:?}",
         settings.worker_connections,
         state.lua.vm_count(),
         pool.map.keys().collect::<Vec<_>>()
     );
+    let so_rows = still_online.zone_rows();
+    if !so_rows.is_empty() {
+        log_info!(
+            "Still ONLine 副本区：{}（只存 GET 2xx、无 Set-Cookie、且上游没声明私有（Cache-Control 不缓存 / Vary 按身份分变体）的响应，凭证请求一律不写；回放带 X-Still-Online: stale，计数见 /metrics 的 onrouter_still_online_*）",
+            so_rows
+                .iter()
+                .map(|(n, _, _, b)| format!("{n}={}", human_bytes(*b)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if disk_cache::enabled() {
+        let cold = disk_cache::snapshot();
+        log_info!(
+            "DICT 磁盘冷层：{} 个区已启用（{}），落盘/冷命中见 /metrics 的 onrouter_dict_disk_*",
+            cold.len(),
+            cold
+                .iter()
+                .map(|(n, s)| format!("{n}: {:?}", s.config().root))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let fps = front_proxy::snapshot();
+    if !fps.is_empty() {
+        log_info!(
+            "前置代理识别：{}；命中/采用/挡下计数见 /metrics 的 onrouter_front_proxy_total，\
+             头部取值一律要先过对端验证",
+            front_proxy::describe(&fps)
+        );
+    }
 
     // 所有 accept 循环在停机信号后置位并排空在途连接，这里等它们自然结束
     while tasks.join_next().await.is_some() {}
@@ -506,6 +648,10 @@ async fn run(
     }
     log_info!("已退出");
     drop(state);
+    // 冷层：把排队的落盘/删除写完再退，否则重启后扫目录会少一批数据
+    if tokio::task::spawn_blocking(disk_cache::flush_all_pending).await.is_err() {
+        log_warn!("磁盘冷层排空任务异常结束（尽力而为，冷层丢数据只影响命中率）");
+    }
     // 冲刷并回收两个日志线程：优雅退出不该丢访问日志/诊断日志
     access_log::shutdown();
     log::shutdown();
@@ -677,6 +823,26 @@ fn do_reload(
             Ok((new_router, fresh_listeners)) => {
                 let warnings = new_router.warnings.clone();
                 state.swap_router(new_router);
+                // 缓存学习：账本跨重载延续（见 learning::Budget），这里只换配置并逐区对齐
+                let learning = learning::Learning::parse_all(&cfg);
+                for w in &learning.warnings {
+                    log_warn!("热重载告警: {w}");
+                }
+                for line in learning.describe() {
+                    log_info!("热重载生效 {line}");
+                }
+                for note in state.proxy_cache.apply_learning(learning) {
+                    log_warn!("缓存学习: {note}");
+                }
+                // 队列套用放在缓存之后：两者共用同一本进程级账本，而账本只有 apply_learning
+                // 做过"旧账延续"，队列必须用那份套用完的配置申领/退回，否则预算会被重复申领。
+                let live = state.proxy_cache.learning_cfg();
+                for note in state.limits.apply_queue(&cfg, &live) {
+                    log_warn!("热重载队列: {note}");
+                }
+                for note in state.limits.apply_vip(&live) {
+                    log_warn!("热重载信誉: {note}");
+                }
                 // 证书 / ssl_protocols / ssl_certificate_by_lua 脚本按新配置原地刷新；
                 // 监听 socket 不动，新连接下一次握手即用新证书
                 state.tls_registry.reload(

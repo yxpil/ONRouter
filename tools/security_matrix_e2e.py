@@ -11,8 +11,17 @@
 #   S5 流式上传（proxy_request_buffering off）不受 client_body_timeout 约束 → 慢客户端钉住连接
 #   S6 sub_filter 命中大静态文件时整份读入内存 → 大文件 × 并发 = 内存放大
 #   S7 Lua `while true` 无迭代上限 → 单进程内所有 Lua 端点一起失联（爆炸半径）
+#   S8 run_phases 极性反了 → 阶段脚本报错被当成"检查通过"（见 rce_matrix 的 r1）
+#   S9 Still ONLine 副本区不看响应 Cache-Control：`private` 的按租户响应被存下来，
+#      上游一挂就回放给**另一个客户端**（跨用户泄漏）。对照：public 响应仍要能顶住。
+#   S10 冷层 atomic_write 的临时文件名可预测（<hex>.<pid>.tmp）且用 File::create：
+#      预先在 tmp 路径上放一个硬链接到别处的文件，落盘就会把那个文件截断（任意覆盖写）。
+#   S11 limit_req_zone 的 key 变量在请求路径上从不展开（永远按 $remote_addr）：
+#      写了 `$http_x_api_key` 的运维以为按令牌限流，实际是按 IP 限流 —— -t 必须否决。
+#   S12 信誉表是直接映射 + 冲突即覆盖：算出一个 tag 撞进 VIP 槽位的地址，
+#      一个请求就把那个 VIP 的分数清零（定向降级）。realip 还让 key 可伪报。
 #
-# 每个探针独立起一个进程（互不污染），端口 18320，后端 18321/18322。
+# 每个探针独立起一个进程（互不污染），端口 18320，后端 18321/18322/18323。
 import base64
 import hashlib
 import os
@@ -31,8 +40,17 @@ ROOT = os.path.dirname(HERE)
 PORT = 18320
 WS_BACKEND = 18321
 SINK_BACKEND = 18322
+VARIANT_BACKEND = 18323
 
 results = []
+VARIANT = None  # s9 用的按租户后端，在 main() 里起
+DBG = bool(os.environ.get("SECDBG"))
+
+
+def dbg(*args):
+    """SECDBG=1 时打印诊断行：探针在断言之前的原始观测（指标原文、启动日志尾巴）。"""
+    if DBG:
+        print("    dbg:", *args, flush=True)
 
 
 def check(name, ok, detail=""):
@@ -90,6 +108,7 @@ class Gateway:
         path = os.path.join(tmp, f"{tag}.conf")
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(conf)
+        self.conf = path
         self.log = open(os.path.join(tmp, f"stdout_{tag}.log"), "ab")
         self.proc = subprocess.Popen([find_binary(), "-c", path], cwd=ROOT,
                                      stdout=self.log, stderr=subprocess.STDOUT)
@@ -97,7 +116,8 @@ class Gateway:
 
     def ready(self):
         if not wait_port(PORT):
-            self.dead = self.read_err()
+            # error_log 常常是空的：配置加载失败、指令拼错这些走的是进程 stdout/stderr
+            self.dead = self.read_err() or self.boot_output()
             return False
         return True
 
@@ -105,6 +125,15 @@ class Gateway:
         try:
             with open(self.err, "rb") as fh:
                 return fh.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def boot_output(self):
+        """进程自己的 stdout/stderr 落点：配置加载失败这类"根本不会进 error_log"的话在这儿。"""
+        p = os.path.join(os.path.dirname(self.conf), f"stdout_{os.path.basename(self.conf)[:-5]}.log")
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
         except OSError:
             return ""
 
@@ -256,6 +285,134 @@ class SinkBody(threading.Thread):
             pass
         finally:
             c.close()
+
+
+class VariantBackend(threading.Thread):
+    """按请求头分租户的后端：用来证明"响应带 Cache-Control: private"的按租户正文
+    会不会被 Still ONLine 收进副本区、然后回放给没有凭证的另一个客户端。
+
+    /priv/panel -> Cache-Control: private（正文随 X-Api-Key 变，无 Set-Cookie）
+    /pub/panel  -> Cache-Control: public, max-age=60（正文恒定）
+    dead=True   -> 接受连接后立刻断开（上游故障，触发回放路径）
+    """
+
+    def __init__(self, port):
+        super().__init__(daemon=True)
+        self.port = port
+        self.dead = False
+        self.ss = socket.socket()
+        self.ss.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.ss.bind(("127.0.0.1", port))
+        self.ss.listen(8)
+
+    def run(self):
+        while True:
+            try:
+                c, _ = self.ss.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.handle, args=(c,), daemon=True).start()
+
+    def handle(self, c):
+        try:
+            c.settimeout(6)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                got = c.recv(4096)
+                if not got:
+                    return
+                buf += got
+            if self.dead:
+                c.close()
+                return
+            path = buf.split(b"\r\n", 1)[0].split(b" ")[1].decode("latin-1")
+            key = ""
+            for line in buf.split(b"\r\n")[1:]:
+                k, _, v = line.partition(b":")
+                if k.strip().lower() == b"x-api-key":
+                    key = v.strip().decode("latin-1")
+            if path.startswith("/priv/"):
+                who = "VICTIM" if key.startswith("victim") else "ANON"
+                body = f"TENANT-{who}-DATA".encode()
+                head = "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nCache-Control: private, max-age=300\r\nConnection: close\r\n\r\n" % len(body)
+            else:
+                body = b"PUBLIC-PANEL-DATA"
+                head = "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nCache-Control: public, max-age=60\r\nConnection: close\r\n\r\n" % len(body)
+            c.sendall(head.encode() + body)
+        except OSError:
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+
+def run_t(tmp, tag, conf_text):
+    """跑 `onrouter -c <conf> -t`，返回 (退出码, 合并输出)。用于"配置期就该拦住"的断言。"""
+    path = os.path.join(tmp, f"{tag}_t.conf")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(conf_text)
+    p = subprocess.run([find_binary(), "-c", path, "-t"], cwd=ROOT,
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def murmur_hash2(data: bytes) -> int:
+    """与 engine::murmur_hash2 逐位一致（nginx 的 32 位 murmur，种子 = len ^ 0x9dc03ac8）。
+    复刻它不是为了绕过什么，而是为了**证明**信誉表是直接映射：能算出撞进同一个槽的地址。"""
+    M = 0x5BD1E995
+    MASK = 0xFFFFFFFF
+    ln = len(data)
+    h = (ln ^ 0x9DC03AC8) & MASK
+    i = 0
+    while i + 4 <= ln:
+        k = int.from_bytes(data[i:i + 4], "little")
+        k = (k * M) & MASK
+        k ^= k >> 24
+        k = (k * M) & MASK
+        h = (h * M) & MASK
+        h ^= k
+        i += 4
+    rem = ln - i
+    if rem == 3:
+        h ^= data[i + 2] << 16
+        h ^= data[i + 1] << 8
+        h ^= data[i]
+        h = (h * M) & MASK
+    elif rem == 2:
+        h ^= data[i + 1] << 8
+        h ^= data[i]
+        h = (h * M) & MASK
+    elif rem == 1:
+        h ^= data[i]
+        h = (h * M) & MASK
+    h ^= h >> 13
+    h = (h * M) & MASK
+    h ^= h >> 15
+    return h
+
+
+def fnv_key_hash(key: str) -> int:
+    """与 disk_cache::key_hash 一致（FNV-1a 64 + 末位混淆）：用来预测冷层条目文件的路径。"""
+    h = 0xCBF29CE484222325
+    for b in key.encode():
+        h ^= b
+        h = (h * 0x00000100000001B3) & 0xFFFFFFFFFFFFFFFF
+    h ^= h >> 33
+    h = (h * 0xFF51AFD7ED558CCD) & 0xFFFFFFFFFFFFFFFF
+    h ^= h >> 29
+    return h
+
+
+def entry_path_of(root, key: str, levels=(1, 2)) -> str:
+    hexs = "%016x" % fnv_key_hash(key)
+    p = root
+    off = 0
+    for l in levels:
+        off = min(off + l, len(hexs))
+        p = os.path.join(p, hexs[:off])
+    return os.path.join(p, hexs + ".bin")
 
 
 def metrics(pid_port=None):
@@ -421,9 +578,12 @@ def s6_sub_filter_memory(tmp):
         for _ in range(2 * 16):
             fh.write(block)
         fh.write(b"NEEDLE\n")
-    # 32 MiB：高于上限，应当原样流式发送并在 error_log 里说明跳过原因
+    # 64 MiB：高于上限，应当原样流式发送并在 error_log 里说明跳过原因。
+    # 体积就是测量余量：缓冲整份的特征是 TTFB ≈ 总耗时，文件太小（32 MiB）时
+    # 热页缓存下一趟 0.04s 就传完，比值正好压在 0.5 的判据上抖；64 MiB 让流式路径
+    # 的 TTFB 稳在总量的 1/8 左右，判据两边都有余量。
     with open(os.path.join(root, "huge.html"), "wb") as fh:
-        for _ in range(32 * 16):
+        for _ in range(64 * 16):
             fh.write(block)
         fh.write(b"NEEDLE\n")
     gw = Gateway(tmp, "s6",
@@ -489,14 +649,206 @@ def s7_lua_infinite_loop(tmp):
         gw.stop()
 
 
+def s9_lkg_private_body_leaks(tmp):
+    """Still ONLine 不许收 `Cache-Control: private` 的响应：副本区是"上游挂了顶给下一个读者"，
+    按租户的正文一旦入区，就会在故障期间回放给完全没有凭证的另一个客户端。
+    对照：public 响应必须照常入区并顶住 —— 否则这个"修复"是把功能关掉，不是把洞补上。"""
+    gw = Gateway(
+        tmp, "s9",
+        '  location = /ping { return 200 "pong"; }\n'
+        "  location = /metrics { content_by_rust metrics; }\n"
+        f"  location /priv/ {{ proxy_pass http://127.0.0.1:{VARIANT_BACKEND}; still_online lkg; still_online_retry 600s; }}\n"
+        f"  location /pub/ {{ proxy_pass http://127.0.0.1:{VARIANT_BACKEND}; still_online lkg; still_online_retry 600s; }}",
+        head="still_online_zone lkg 8m;\n",
+    )
+    stored = 'onrouter_still_online_total{kind="stored"}'
+    try:
+        assert gw.ready(), gw.dead
+        base = metrics()[0].get(stored, 0)
+        st, _, body, _ = http_call("/priv/panel", headers={"X-Api-Key": "victim-secret-key"})
+        check("S9 对照组：租户能看到自己的正文", st == 200 and b"TENANT-VICTIM" in body,
+              f"status={st} body={body[:40]!r}")
+        st, _, body, _ = http_call("/pub/panel")
+        check("S9 对照组：公共正文正常返回", st == 200 and body == b"PUBLIC-PANEL-DATA",
+              f"status={st} body={body[:40]!r}")
+        wrote = metrics()[0].get(stored, 0) - base
+        dbg("两次响应后 stored 增量 =", wrote, "基线 =", base)
+        # private 那份不该入区，所以两次响应只该留下 1 条副本
+        check("S9 private 响应不入副本区（写入闸门看响应侧的 Cache-Control）", wrote <= 1,
+              f"两次响应后 stored 计数 +{wrote:.0f}（应当只有 public 那条入区）")
+        VARIANT.dead = True
+        time.sleep(0.3)
+        st, hd, body, _ = http_call("/priv/panel")
+        check("S9 上游故障时不把别人的正文回放给匿名访客", b"TENANT-VICTIM" not in body,
+              f"status={st} body={body[:48]!r} 头 X-Still-Online={hd.get('x-still-online', '-')}")
+        st, hd, body, _ = http_call("/pub/panel")
+        check("S9 公共副本仍能顶住（修复没有牺牲功能）",
+              st == 200 and body == b"PUBLIC-PANEL-DATA", f"status={st} body={body[:40]!r}")
+    finally:
+        gw.stop()
+        VARIANT.dead = False
+
+
+def s10_dict_tmp_link_overwrite(tmp):
+    """冷层用 `<十六进制条目名>.<pid>.tmp` 做临时名再 rename。两个问题叠在一起：
+    名字可预测（条目名由 key 哈希确定、pid 从进程来），且 `File::create` 会**跟随**已存在的
+    路径。攻击者只要先在那个名字上放一个硬链接指向别处的文件，下一次落盘就把那个文件截断了
+    —— 一个"缓存目录里能放文件"就能换到"覆盖网关用户能写的任意文件"的原语。"""
+    root = os.path.join(tmp, "disk10")
+    gw = Gateway(
+        tmp, "s10",
+        "  location = /metrics { content_by_rust metrics; }\n"
+        "  location /fill {\n    content_by_lua \"\n"
+        "      local d = ngx.shared.s10\n"
+        "      local a = ngx.req.get_uri_args()\n"
+        "      if a.v then d:set('victim-key', string.rep('v', 900)) end\n"
+        "      if a.n then for i = 0, tonumber(a.n) do d:set('k' .. i, string.rep('x', 900)) end end\n"
+        "      ngx.say('done')\n\";\n  }\n"
+        '  location /read {\n    content_by_lua "\n'
+        "      local v = ngx.shared.s10:get('victim-key')\n"
+        '      ngx.say(v and #v or 0)\n";\n  }',
+        head=f'lua_shared_dict s10 8k disk={slash(root)} max_disk=4m spill_after=0 max_value=2k;\n',
+    )
+    pending = 'onrouter_dict_disk_pending_jobs{dict="s10"}'
+    ORIGINAL = b"IMPORTANT-NOT-CACHE-DATA"
+
+    def drain(limit=6.0):
+        end = time.time() + limit
+        while time.time() < end:
+            if metrics()[0].get(pending, 0) == 0:
+                return True
+            time.sleep(0.05)
+        return False
+
+    try:
+        if not gw.ready():
+            dbg("启动日志:", (gw.dead or "")[-900:])
+            dbg("配置原文:", open(gw.conf, encoding="utf-8").read())
+        assert gw.ready(), gw.dead
+        http_call("/fill?v=1")
+        http_call("/fill?n=20")  # 内存 8k 只留得下 ~8 条，最早那条（victim-key）被淘汰落盘
+        check("S10 前提：淘汰下来的条目确实按可预测文件名落盘", drain(), "落盘队列没排空")
+        entry = entry_path_of(root, "victim-key")
+        check("S10 前提：文件名可由 key 独立推算（这就是可预测性）", os.path.exists(entry),
+              f"预期 {slash(entry)} 不存在")
+        victim = os.path.join(tmp, "victim.txt")
+        with open(victim, "wb") as fh:
+            fh.write(ORIGINAL)
+        # 临时名 = 去掉 .bin 后接 ".<pid>.tmp"（与 Rust 侧 with_extension 一致）
+        planted = entry[: -len(".bin")] + ".%d.tmp" % gw.proc.pid
+        try:
+            os.link(victim, planted)
+        except OSError as exc:
+            check("S10 能在预测出的临时名上放硬链接", False, f"{type(exc).__name__}: {exc}")
+            return
+        # 读一次把它提回内存，再灌 20 条逼它第二次落盘 —— 这次会走 atomic_write
+        http_call("/read")
+        http_call("/fill?n=21")
+        drain()
+        with open(victim, "rb") as fh:
+            after = fh.read()
+        check("S10 预先占位的临时名不会截断别处的文件", after == ORIGINAL,
+              f"victim.txt 被改成 {len(after)} 字节：{after[:32]!r}")
+        st, _, body, _ = http_call("/read")
+        check("S10 修复不许牺牲落盘本身：条目仍完整可读回",
+              st == 200 and body.strip().splitlines()[-1: ] == [b"900"],
+              f"读回长度={body!r}")
+        os.remove(planted) if os.path.exists(planted) else None
+    finally:
+        gw.stop()
+
+
+def s11_limit_key_var_is_a_hard_error(tmp):
+    """限流区只能按客户端地址建 key。写了别的变量（`$http_x_api_key`、`$uri`…）时，
+    请求路径**根本不展开它**，于是运维以为在按令牌限流，实际在按 IP 限流。
+    这类"配置写了但那一维不存在"是静默的按预期失败放行，必须在 -t 就硬否决。"""
+    head = 'error_log "%s" warn;\npid "%s";\n' % (slash(os.path.join(tmp, "s11_t_err.log")),
+                                                  slash(os.path.join(tmp, "s11_t.pid")))
+    bad = head + ("limit_req_zone $http_x_api_key zone=bykey:1m rate=10r/s;\n"
+                  "server { listen 127.0.0.1:18320; server_name sec.local;"
+                  " location / { limit_req zone=bykey; return 200 \"ok\"; } }\n")
+    rc, out = run_t(tmp, "s11", bad)
+    check("S11 -t 否决非地址 key 的 limit_req_zone", rc != 0, f"rc={rc} 输出尾部={out[-300:]!r}")
+    check("S11 报错点名那个 key 并说清只支持什么",
+          "$http_x_api_key" in out and "只支持" in out, out[-300:])
+    ok = head + ("limit_req_zone $binary_remote_addr zone=byip:1m rate=10r/s;\n"
+                 "server { listen 127.0.0.1:18320; server_name sec.local;"
+                 " location / { limit_req zone=byip; return 200 \"ok\"; } }\n")
+    rc2, out2 = run_t(tmp, "s11ok", ok)
+    check("S11 对照组：$binary_remote_addr 照常通过", rc2 == 0, f"rc={rc2} {out2[-300:]!r}")
+
+
+def s12_vip_slot_collision(tmp):
+    """信誉表是直接映射（8k → 682 个 12 字节槽），冲突时的写法是"旧的那位直接换成新的、分数归零"。
+    于是一个只想废掉某个 VIP 的人，不需要任何凭据：算一个 tag 撞进同一格的地址，发一个请求就行。
+    安全的方向是——宁可让新来的这位学不到东西，也不能把已有分数的槽位清空。"""
+    victim = "203.0.113.77"
+    gw = Gateway(
+        tmp, "s12",
+        "  real_ip_header X-Forwarded-For;\n"
+        "  set_real_ip_from 127.0.0.0/8;\n"
+        "  location = /metrics { content_by_rust metrics; }\n"
+        '  location /vip/ { limit_req zone=vip; return 200 "ok"; }',
+        head="learning on;\nlearning_memory_budget 64k;\n"
+             "vip_learning table=8k min=10 decay=30s;\n"
+             "limit_req_zone $remote_addr zone=vip:1m rate=10r/s burst=0;\n",
+    )
+    try:
+        assert gw.ready(), gw.dead
+        for _ in range(14):  # 14 次放行 = 14 分，越过 min=10
+            http_call("/vip/", headers={"X-Forwarded-For": victim})
+            time.sleep(0.14)
+        mm = metrics()[0]
+        dbg("晋升后指标原文:", [l for l in http_call("/metrics")[2].decode("utf-8", "replace")
+                              .splitlines() if l.startswith("onrouter_vip")])
+        check("S12 对照组：守规矩的地址已晋升为 VIP",
+              mm.get("onrouter_vip_clients", 0) >= 1, f"vip_clients={mm.get('onrouter_vip_clients')}")
+        slots = int(mm.get("onrouter_vip_slots{kind=\"total\"}", 682))
+        want = max(murmur_hash2(victim.encode()), 1) % slots
+        attacker = None
+        for i in range(20000):
+            cand = "198.18.%d.%d" % (i // 250 + 1, i % 250 + 1)
+            if max(murmur_hash2(cand.encode()), 1) % slots == want:
+                attacker = cand
+                break
+        check("S12 能算出一个撞进同一槽的地址（在 %d 个槽里）" % slots, attacker is not None,
+              "搜索空间被算尽了还没找到——那这条断言本身要重看")
+        if attacker is None:
+            return
+        http_call("/vip/", headers={"X-Forwarded-For": attacker})
+        mm = metrics()[0]
+        check("S12 撞槽的新地址不得清空已有分数的 VIP 槽位",
+              mm.get("onrouter_vip_clients", 0) >= 1,
+              f"一个来自 {attacker} 的请求之后 vip_clients={mm.get('onrouter_vip_clients')}")
+        # realip 是信誉的信任根：这个前提必须写在 -t 输出里，而不是埋在 README 里
+        head = ('error_log "%s" warn;\npid "%s";\n' % (slash(os.path.join(tmp, "s12_t_err.log")),
+                                                      slash(os.path.join(tmp, "s12_t.pid")))
+                + "limit_req_zone $remote_addr zone=vip:1m rate=10r/s;\n"
+                  "learning on;\nvip_learning table=8k min=10 decay=30s;\n"
+                  "server { listen 127.0.0.1:18320; server_name sec.local;"
+                  " real_ip_header X-Forwarded-For; set_real_ip_from 127.0.0.0/8;"
+                  " location / { limit_req zone=vip; return 200 \"ok\"; } }\n")
+        rc, out = run_t(tmp, "s12t", head)
+        check("S12 -t 说明 realip 信任范围就是信誉的信任范围（告警但不否决）",
+              rc == 0 and "set_real_ip_from" in out and "信誉" in out,
+              f"rc={rc} 输出尾部={out[-300:]!r}")
+    finally:
+        gw.stop()
+
+
 def main():
+    global VARIANT
     tmp = tempfile.mkdtemp(prefix="orr_sec_")
     ws = WsEcho(WS_BACKEND)
     sink = SINK_BACKEND and SinkBody(SINK_BACKEND)
+    VARIANT = VariantBackend(VARIANT_BACKEND)
     ws.start()
     sink.start()
+    VARIANT.start()
     probes = [s1_auth_without_file, s2_empty_hash, s3_htpasswd_staleness,
-              s4_upgrade_uri_desync, s5_stalled_upload, s6_sub_filter_memory, s7_lua_infinite_loop]
+              s4_upgrade_uri_desync, s5_stalled_upload, s6_sub_filter_memory, s7_lua_infinite_loop,
+              s9_lkg_private_body_leaks, s10_dict_tmp_link_overwrite,
+              s11_limit_key_var_is_a_hard_error, s12_vip_slot_collision]
     if len(sys.argv) > 1:  # python tools/security_matrix_e2e.py s5,s6
         want = {x.strip() for x in sys.argv[1].split(",")}
         probes = [p for p in probes if p.__name__.split("_")[0] in want]

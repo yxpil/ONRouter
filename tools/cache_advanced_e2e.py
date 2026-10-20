@@ -5,7 +5,8 @@
 #   * proxy_cache_use_stale error：上游进程被关掉后仍能回放（STALE）
 #   * proxy_cache_use_stale updating + lock：刷新进行中，后来请求立刻 STALE
 #   * proxy_cache_bypass：跳过读取但仍写入新响应
-#   * proxy_no_cache：既跳过读取也不写入
+#   * proxy_no_cache：nginx 语义只禁止写入，读取照常命中；/nocache_ctl/ 里它和
+#     proxy_cache_bypass 同用 $arg_nocache，所以带参数时两条一起生效，不带参数时照常缓存
 #   * keys_zone 容量（tiny:1k → 8 条）：按 LRU 淘汰最久未使用
 #   * HEAD 只读不写：可从 GET 缓存命中，但不会把空体写进共享 key
 #

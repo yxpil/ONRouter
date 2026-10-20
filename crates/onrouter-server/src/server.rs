@@ -103,6 +103,8 @@ pub struct AppState {
     pub lua: Arc<LuaEngine>,
     pub proxy: Arc<ProxyEngine>,
     pub proxy_cache: Arc<crate::proxy_cache::ProxyCache>,
+    /// Still ONLine 的"最后已知良好响应"副本区（与 proxy_cache 完全独立）
+    pub still_online: Arc<crate::still_online::StillOnline>,
     pub access_log: Arc<AccessLog>,
     pub settings: Settings,
     pub limits: Arc<crate::limit::Limits>,
@@ -129,6 +131,8 @@ impl AppState {
     pub fn swap_router(&self, next: Router) {
         // 新的 proxy_cache_path keys_zone 容量随配置生效（已有 zone 立即裁剪）
         self.proxy_cache.apply_capacities(&next.cache_zones);
+        // 副本区的字节预算同理；条目超限立刻按 LRU 裁掉
+        self.still_online.apply_budgets(&next.still_zones);
         let mut w = self
             .router
             .write()
@@ -922,10 +926,20 @@ async fn handle_request(
         http_version: http_version_f64(version),
         body_builder: None,
         eof_sent: false,
+        cache_status: String::new(),
+        still_online: String::new(),
+        front_proxy: String::new(),
+        front_proxy_country: String::new(),
+        front_proxy_host: String::new(),
+        front_proxy_verified: false,
+        realip_remote_addr: meta.peer.map(|p| p.ip().to_string()).unwrap_or_default(),
+        set_vars: Vec::new(),
+        rewrite_return: None,
     };
 
     // ---- realip / limit_conn（Upgrade 与普通请求共用同一实现）----
     apply_realip(&server, &mut ctx, meta.peer);
+    apply_front_proxy(&server, &mut ctx, meta.peer);
     // 访问日志与 $remote_addr 保持一致：日志记录的是 realip 之后的客户端地址
     rec.set_remote(ctx.remote_addr.clone());
     let conn_guards = match acquire_conn_guards(&state, &server, &ctx.remote_addr) {
@@ -1060,9 +1074,11 @@ async fn start_streaming_content(
     scope: &mut RequestScope,
 ) -> StreamStart {
     let (tx, mut rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
+    // 流式响应在首次 flush 时头就定型，之后 ctx 被移交给后台 Lua 任务无法再求值：
+    // 此刻就把 add_header 的变量展开好带进 StreamSink。
     let extra = router::effective_add_headers(Some(loc), server)
         .into_iter()
-        .cloned()
+        .map(|(k, v)| (k.clone(), crate::proxy::interpolate_vars(v, ctx)))
         .collect();
     ctx.stream = Some(StreamSink::new(tx, extra));
     let shared = Arc::new(Mutex::new(std::mem::take(ctx)));
@@ -1411,6 +1427,16 @@ pub async fn run_capture(
         http_version: parent.http_version,
         body_builder: None,
         eof_sent: false,
+        cache_status: String::new(),
+        still_online: String::new(),
+        // 子请求继承父请求的前置代理画像：同一个连接、同一批请求头，重新判定只会得出同样结论
+        front_proxy: parent.front_proxy.clone(),
+        front_proxy_country: parent.front_proxy_country.clone(),
+        front_proxy_host: parent.front_proxy_host.clone(),
+        front_proxy_verified: parent.front_proxy_verified,
+        realip_remote_addr: parent.realip_remote_addr.clone(),
+        set_vars: Vec::new(),
+        rewrite_return: None,
     };
     if !body.is_empty() {
         ctx.req_headers
@@ -1483,8 +1509,11 @@ async fn run_ingress<'a>(
             return Err(error_page(StatusCode::NOT_FOUND));
         }
 
-        // 1) rewrite 指令
-        if !loc.rewrites.is_empty() && engine::apply_rewrites(ctx, &loc.rewrites) {
+        // 1) REWRITE 阶段指令：rewrite / set / if，按配置书写顺序混排执行
+        // 记下的 return 属于"本 location 的这一段序列"，重新匹配 location 时必须作废
+        ctx.rewrite_return = None;
+        if !loc.rewrite_steps.is_empty() {
+            engine::apply_rewrite_steps(ctx, &loc.rewrite_steps);
             if let Some((code, target)) = ctx.redirect.take() {
                 return Err(redirect_response(code, &target));
             }
@@ -1512,7 +1541,7 @@ async fn run_ingress<'a>(
             continue;
         }
         // 3) PREACCESS：limit_req
-        if let Some(resp) = check_limit_req(state, ctx, loc) {
+        if let Some(resp) = check_limit_req(state, ctx, loc).await {
             return Err(resp);
         }
         // 3.5) ACCESS：内置 allow/deny（IP）+ auth_basic（basic auth），先于 access_by_*
@@ -1537,8 +1566,11 @@ async fn run_ingress<'a>(
             continue;
         }
 
-        // return 指令在 access 之前生效（nginx 的 return 属于 rewrite 阶段，这里保持原实现语义）
-        if let Some(ret) = &loc.ret {
+        // return 指令在这里生效：裸 `return` 与 `if` 块里记下的 return 走同一处，
+        // 都在 limit_req / allow-deny / auth_basic / access_by_* 之后。nginx 把 return 归
+        // rewrite 阶段（先于访问控制），ONRouter 刻意不同：条件 return 不许绕过访问控制。
+        let ret = ctx.rewrite_return.clone().or_else(|| loc.ret.clone());
+        if let Some(ret) = &ret {
             engine::apply_return(ctx, ret);
             if let Some((code, target)) = ctx.redirect.take() {
                 return Err(redirect_response(code, &target));
@@ -1617,7 +1649,8 @@ async fn process(
         };
         if let Some((_, _, CacheHit::Hit, Some(resp), _)) = &lookup {
             let resp = Arc::clone(resp);
-            return serve_from_cache(resp, loc, server, "HIT");
+            ctx.cache_status = "HIT".to_string();
+            return serve_from_cache(resp, loc, server, "HIT", ctx);
         }
         // 过期条目在 stale 滞留期内仍可被 use_stale 回放
         let stale_response = match &lookup {
@@ -1633,6 +1666,14 @@ async fn process(
                 _ => "",
             }
         };
+        // `$upstream_cache_status`：只有真正参与了缓存的请求才有值。POST 这类非幂等方法、
+        // 流式请求体、以及没配 proxy_cache 的 location 都是空串（nginx 同义：没有缓存中的响应
+        // 就没有状态），add_header 因此发成一个空值头而不是字面量。
+        ctx.cache_status = if cache_target.is_none() {
+            String::new()
+        } else {
+            status_tag.to_string()
+        };
 
         // proxy_cache_lock：同 key 并发 MISS 只放一个请求回源；等待者拿到锁后二次查缓存。
         // `updating` + stale：刷新进行中时直接回放过期内容，避免所有并发请求一起等。
@@ -1646,11 +1687,13 @@ async fn process(
                         Ok(g) => acquired = Some(g),
                         Err(_) => {
                             log_debug!("proxy_cache updating: {key} 刷新进行中，回放 stale");
+                            ctx.cache_status = "STALE".to_string();
                             return serve_from_cache(
                                 Arc::clone(stale_response.as_ref().unwrap()),
                                 loc,
                                 server,
                                 "STALE",
+                                ctx,
                             );
                         }
                     }
@@ -1674,7 +1717,8 @@ async fn process(
                     let (hit, cached) = state.proxy_cache.peek(zone, key);
                     if hit == CacheHit::Hit {
                         if let Some(resp) = cached {
-                            return serve_from_cache(resp, loc, server, "HIT");
+                            ctx.cache_status = "HIT".to_string();
+                            return serve_from_cache(resp, loc, server, "HIT", ctx);
                         }
                     }
                 }
@@ -1705,6 +1749,31 @@ async fn process(
             other => other,
         };
 
+        // ---- Still ONLine：最后已知良好响应副本（与 proxy_cache 相互独立）----
+        // 只有 GET + 缓冲请求体参与：POST 这类"动作"绝不能由别的请求的副本顶替，
+        // 流式上传转发到一半失败时后端已经收到过数据，回放副本只会掩盖问题。
+        let so_target = match (&loc.still_online, &body) {
+            (Some(zone), ProxyBody::Buffered(_)) if ctx.method.eq_ignore_ascii_case("GET") => {
+                Some((zone.clone(), build_cache_key(&loc.proxy_cache_key, ctx, target)))
+            }
+            _ => None,
+        };
+        // 凭证闸门（硬规则 3）：请求带 Cookie/Authorization 时**永不**写入副本区；
+        // 默认也不回放，`still_online_allow_credentials on` 只放开"读"这一半。
+        let so_creds = crate::still_online::request_has_credentials(&ctx.req_headers);
+        let so_read = so_target.is_some()
+            && (!so_creds || loc.still_online_allow_credentials)
+            // proxy_cache_bypass 写明的请求同样不读副本：运维既然要求"绕开缓存"，
+            // 副本也是缓存。
+            && !cache_expr_truthy(&loc.proxy_cache_bypass, ctx);
+        let so_write = so_target.is_some()
+            && !so_creds
+            && !ctx.internal_request
+            && !cache_expr_truthy(&loc.proxy_no_cache, ctx);
+        if so_creds && so_target.is_some() {
+            state.still_online.note_credential_reject();
+        }
+
         return match state
             .proxy
             .forward(ctx, target, &loc.pattern, &opts, body)
@@ -1720,7 +1789,21 @@ async fn process(
                             "proxy_cache use_stale {token}：回放过期响应 {}",
                             ctx.effective_path()
                         );
-                        return serve_from_cache(Arc::clone(stale), loc, server, "STALE");
+                        ctx.cache_status = "STALE".to_string();
+                        return serve_from_cache(Arc::clone(stale), loc, server, "STALE", ctx);
+                    }
+                }
+                // Still ONLine：上游还活着但回了 5xx —— 后端崩溃最常见的形态。
+                // 有副本就顶住这次请求（5xx 本身永远进不了副本区）。
+                if upstream_status >= 500 && so_read {
+                    if let Some((zone, key)) = &so_target {
+                        if let Some(resp) = serve_still_online(state, loc, server, ctx, zone, key) {
+                            log_warn!(
+                                "Still ONLine：上游返回 {upstream_status}，回放副本 {zone} {}",
+                                ctx.effective_path()
+                            );
+                            return resp;
+                        }
                     }
                 }
                 // 未启用缓存：若声明了 header_filter_by_lua/body_filter_by_lua/sub_filter，则缓冲代理
@@ -1736,7 +1819,26 @@ async fn process(
                         .iter()
                         .find(|(p, n, _)| *p == Phase::Content && n.starts_with("body_filter_by_lua"));
                     if hf.is_none() && bf.is_none() && loc.sub_filter.is_none() {
-                        return convert_upstream_response(upstream_resp, loc, server);
+                        if so_target.is_none() {
+                            return convert_upstream_response(upstream_resp, loc, server, ctx);
+                        }
+                        // 要留副本就必须缓冲整份响应（与 sub_filter/body_filter 同一个取舍）
+                        let buffered = match buffer_upstream(upstream_resp).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log_error!("代理响应体收集失败: {e}");
+                                return error_response(ctx, server, Some(loc), 502).await;
+                            }
+                        };
+                        let (status, hdrs, body) = buffered;
+                        if so_write {
+                            if let Some((zone, key)) = &so_target {
+                                store_still_online(state, loc, ctx, zone, key, status, &hdrs, &body);
+                            }
+                        }
+                        return build_buffered_response(
+                            status, &hdrs, body, loc, server, "", false, ctx,
+                        );
                     }
                     // 过滤器需要整体缓冲：收集状态/头/体灌入 ctx 供 Lua 读写
                     let (parts, ibody) = upstream_resp.into_parts();
@@ -1777,7 +1879,9 @@ async fn process(
                     }
                     let body_bytes = bytes::Bytes::from(ctx.body.take().unwrap_or_default());
                     let hdrs = ctx.resp_headers.clone();
-                    return build_buffered_response(ctx.status, &hdrs, body_bytes, loc, server, "", false);
+                    return build_buffered_response(
+                        ctx.status, &hdrs, body_bytes, loc, server, "", false, ctx,
+                    );
                 }
                 let (zone, key) = cache_target.clone().unwrap();
                 let status = upstream_status;
@@ -1796,19 +1900,20 @@ async fn process(
                     .filter(|(k, _)| !is_hop_by_hop(k.as_str()) && k.as_str().to_ascii_lowercase() != "content-length")
                     .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect();
+                // `proxy_ignore_headers`：被点名的头不再参与"能不能缓存、缓存多久"的判定，
+                // 但它们仍然照原样存下来、透传给客户端（nginx 是"停止处理"，不是"删除"）。
+                let counts = |name: &str| crate::proxy_cache::header_counts_for_cache(name, &loc.proxy_ignore_headers);
                 let has_set_cookie = hdrs
                     .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("set-cookie"));
+                    .any(|(k, _)| k.eq_ignore_ascii_case("set-cookie") && counts(k));
                 let now_unix = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                let ttl = crate::proxy_cache::effective_ttl(
-                    &loc.proxy_cache_valid,
-                    status,
-                    &hdrs,
-                    now_unix,
-                );
+                let decided: Vec<(String, String)> =
+                    hdrs.iter().filter(|(k, _)| counts(k)).cloned().collect();
+                let ttl =
+                    crate::proxy_cache::effective_ttl(&loc.proxy_cache_valid, status, &decided, now_unix);
                 let cacheable = ttl.is_some()
                     && !has_set_cookie
                     && !no_cache
@@ -1818,7 +1923,9 @@ async fn process(
                     && use_count >= loc.proxy_cache_min_uses;
                 let body = bytes::Bytes::from(collected.to_vec());
                 if cacheable {
-                    state.proxy_cache.store(
+                    // 替学出来的重要客户写入时做驻留加权：对象在频率草图里更"热"，
+                    // 因此下一轮扫库流量来了，被挤掉的是别的条目。见 `vip_learning`。
+                    state.proxy_cache.store_as(
                         &zone,
                         &key,
                         crate::proxy_cache::CachedResponse {
@@ -1827,7 +1934,14 @@ async fn process(
                             body: Arc::new(body.clone()),
                         },
                         ttl.unwrap(),
+                        state.limits.is_vip(&ctx.remote_addr),
                     );
+                }
+                // 副本区独立写入：proxy_cache 因为 TTL/HEAD/min_uses 不收这条也没关系
+                if so_write {
+                    if let Some((so_zone, so_key)) = &so_target {
+                        store_still_online(state, loc, ctx, so_zone, so_key, status, &hdrs, &body);
+                    }
                 }
                 build_buffered_response(
                     status,
@@ -1837,6 +1951,7 @@ async fn process(
                     server,
                     if cacheable { status_tag } else { "BYPASS" },
                     !status_tag.is_empty(),
+                    ctx,
                 )
             }
             Err(e) => {
@@ -1850,7 +1965,8 @@ async fn process(
                             target,
                             ctx.effective_path()
                         );
-                        return serve_from_cache(Arc::clone(stale), loc, server, "STALE");
+                        ctx.cache_status = "STALE".to_string();
+                        return serve_from_cache(Arc::clone(stale), loc, server, "STALE", ctx);
                     }
                 }
                 log_error!("代理失败 {}{}: {e}", target, ctx.effective_path());
@@ -1861,6 +1977,19 @@ async fn process(
                 // 流式上传卡住同样是客户端问题：nginx 对 client_body_timeout 回 408
                 if e.contains(STREAM_BODY_TIMEOUT_ERR) {
                     return error_response(ctx, server, Some(loc), 408).await;
+                }
+                // Still ONLine：后端连不上/超时——这才是"崩了"的主形态。有副本就顶住，
+                // 并把该 key 挂进脏表等恢复后重取；没有副本仍按 502 回（不编造内容）。
+                if so_read {
+                    if let Some((zone, key)) = &so_target {
+                        if let Some(resp) = serve_still_online(state, loc, server, ctx, zone, key) {
+                            log_warn!(
+                                "Still ONLine：回源失败，回放副本 {zone} {target}{}: {e}",
+                                ctx.effective_path()
+                            );
+                            return resp;
+                        }
+                    }
                 }
                 error_response(ctx, server, Some(loc), 502).await
             }
@@ -2004,21 +2133,45 @@ async fn run_lua(
     false
 }
 
-/// limit_req：命中返回 429（带 Retry-After），未命中返回 None
-fn check_limit_req(state: &Arc<AppState>, ctx: &mut RequestCtx, loc: &Location) -> Option<BoxResponse> {
+/// limit_req：命中返回 429（带 Retry-After），未命中返回 None。
+///
+/// 区里没写 `limit_req_queue` 时行为与从前逐字节一致（超限即拒，等价 nginx `nodelay`）。
+/// 写了之后，超限的请求改为"占住一个有界队列名额 + 预留这一格令牌 → 等到令牌成熟 → 放行"：
+/// 令牌在判定时就记成欠账，所以醒来不会被别人抢走，也不需要在原地反复重试。
+/// 客户端在这段等待里断开，future 被丢弃、名额随之归还，队列不会被幽灵排队占死。
+/// 写了 `vip_learning` 时，这里的每种判定结果都会记进进程级信誉表（放行加分、429 扣分），
+/// 信誉再反过来决定这个 key 的排队上界与缓存驻留加权——它不参与"能不能放行"。
+async fn check_limit_req(
+    state: &Arc<AppState>,
+    ctx: &mut RequestCtx,
+    loc: &Location,
+) -> Option<BoxResponse> {
+    let vip = state.limits.vip();
     for rule in &loc.limit_req {
-        let retry_after = state
-            .limits
-            .req_zone(&rule.zone)
-            .and_then(|z| z.check(&ctx.remote_addr, rule.burst));
-        if let Some(secs) = retry_after {
-            log_debug!("limit_req '{}' 命中: {}", rule.zone, ctx.remote_addr);
-            crate::metrics::get().on_limit_req_rejected();
-            ctx.status = state.limits.req_status;
-            let mut resp = status_page(state.limits.req_status);
-            set_header(&mut resp, "retry-after", &secs.to_string());
-            return Some(resp);
-        }
+        let Some(zone) = state.limits.req_zone(&rule.zone) else {
+            continue;
+        };
+        let retry_after = match zone.admit(&ctx.remote_addr, rule.burst, vip.as_ref()) {
+            crate::limit::Admit::Pass => continue,
+            crate::limit::Admit::Reject { retry_after_secs } => retry_after_secs,
+            crate::limit::Admit::Queued { wait_ms, permit } => {
+                log_debug!(
+                    "limit_req '{}' 排队 {wait_ms}ms: {}",
+                    rule.zone,
+                    ctx.remote_addr
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                // 名额用完立刻归还；预留的令牌不退（见 limit::Admit::Queued）
+                drop(permit);
+                continue;
+            }
+        };
+        log_debug!("limit_req '{}' 命中: {}", rule.zone, ctx.remote_addr);
+        crate::metrics::get().on_limit_req_rejected();
+        ctx.status = state.limits.req_status;
+        let mut resp = status_page(state.limits.req_status);
+        set_header(&mut resp, "retry-after", &retry_after.to_string());
+        return Some(resp);
     }
     None
 }
@@ -2036,6 +2189,54 @@ fn apply_realip(server: &Server, ctx: &mut RequestCtx, peer: Option<std::net::So
             log_debug!("realip：{} → {}（源自 ${}", peer, real, server.real_ip.header);
             ctx.remote_addr = real;
         }
+    }
+}
+
+/// front_proxy：认出直连对端属于哪家前置代理（CDN / LB），并在 egress 模式下按该 profile
+/// 声明的头链还原真实客户端地址，附带来源侧协议、可见域名与国家。
+///
+/// 位置紧贴在 `apply_realip` 之后、`rec.set_remote` / limit_conn / allow-deny / VIP /
+/// location 匹配之前，所以改写一次就全链路一致；判定是**每请求一次**而非每连接一次，
+/// CDN 那种长连接复用不会把上一个请求的结论带过来（这也是"复用"这一项的实际含义）。
+///
+/// 采信闸门在 `front_proxy::decide` 内部：直连对端不在 `profile.trust ∪ set_real_ip_from`
+/// 里时，地址、协议、Host、国家一个都不采用；`detect` 模式则只识别、不改写任何东西。
+fn apply_front_proxy(server: &Server, ctx: &mut RequestCtx, peer: Option<std::net::SocketAddr>) {
+    use crate::front_proxy as fp;
+    if !server.front_proxy.enabled() {
+        return;
+    }
+    let realip = fp::RealIpState {
+        enabled: server.real_ip.enabled(),
+        header: &server.real_ip.header,
+        trusted: &server.real_ip.trusted,
+        recursive: server.real_ip.recursive,
+    };
+    let d = fp::decide(&server.front_proxy, &ctx.req_headers, peer.map(|p| p.ip()), &realip);
+    let Some(name) = d.profile else {
+        return;
+    };
+    ctx.front_proxy = name;
+    ctx.front_proxy_verified = d.verified;
+    if let Some(ip) = d.real_ip {
+        log_debug!(
+            "front_proxy '{}'：{} → {ip}（源自 {}）",
+            ctx.front_proxy,
+            ctx.remote_addr,
+            d.ip_source.unwrap_or_default()
+        );
+        ctx.remote_addr = ip;
+    }
+    // 协议取自前置代理，只影响 $scheme/$https 与发给后端的 X-Forwarded-Proto：
+    // CDN  terminates TLS 而回源走 http 时，源站据此才不会生成 http:// 的降级跳转。
+    if let Some(s) = d.scheme {
+        ctx.scheme = s;
+    }
+    if let Some(h) = d.host {
+        ctx.front_proxy_host = h;
+    }
+    if let Some(c) = d.country {
+        ctx.front_proxy_country = c;
     }
 }
 
@@ -2285,7 +2486,7 @@ async fn serve_static_flow(
             let mut resp = builder
                 .body(body)
                 .unwrap_or_else(|_| error_page(StatusCode::INTERNAL_SERVER_ERROR));
-            apply_add_headers(&mut resp, loc, server);
+            apply_add_headers(&mut resp, loc, server, ctx);
             resp
         }
         // 304 只带校验头，没有响应体（Content-Type/Content-Length 由协议层省掉）
@@ -2298,7 +2499,7 @@ async fn serve_static_flow(
                 .header("accept-ranges", "bytes")
                 .body(empty_body())
                 .unwrap_or_else(|_| error_page(StatusCode::INTERNAL_SERVER_ERROR));
-            apply_add_headers(&mut resp, loc, server);
+            apply_add_headers(&mut resp, loc, server, ctx);
             resp
         }
         StaticHit::RangeUnsatisfiable(m) => {
@@ -2930,6 +3131,7 @@ fn convert_upstream_response(
     resp: Response<crate::proxy::UpstreamBody>,
     loc: &Location,
     server: &Server,
+    ctx: &RequestCtx,
 ) -> BoxResponse {
     let (mut parts, body) = resp.into_parts();
     let mut builder = Response::builder().status(parts.status);
@@ -2961,20 +3163,13 @@ fn convert_upstream_response(
                 hm.insert(name, v);
             }
         }
-        for (k, v) in router::effective_add_headers(Some(loc), server) {
-            if let (Ok(name), Ok(val)) = (
-                HeaderName::try_from(k.as_str()),
-                HeaderValue::try_from(v.as_str()),
-            ) {
-                hm.insert(name, val);
-            }
-        }
+        push_add_headers(hm, Some(loc), server, ctx);
         apply_proxied_header_rewrites(hm, loc);
     }
     builder.body(body.boxed()).unwrap_or_else(|_| error_page(StatusCode::INTERNAL_SERVER_ERROR))
 }
 
-/// 缓存键：把 `$proxy_host` 先用 proxy_pass 的 authority 替换，其余交给变量插值。
+/// 缓存键：`$proxy_host` 由 proxy_pass 的 authority 供值，其余交给变量插值。
 /// 默认模板 `$scheme$proxy_host$request_uri` 对齐 nginx。
 fn build_cache_key(template: &str, ctx: &RequestCtx, target: &str) -> String {
     let rest = target.trim_start_matches("http://").trim_start_matches("https://");
@@ -2982,8 +3177,9 @@ fn build_cache_key(template: &str, ctx: &RequestCtx, target: &str) -> String {
         Some((h, _)) => h,
         None => rest,
     };
-    let with_host = template.replace("$proxy_host", proxy_host);
-    crate::proxy::interpolate_vars(&with_host, ctx)
+    crate::proxy::interpolate_vars_with(template, ctx, |name| {
+        (name == "proxy_host").then(|| proxy_host.to_string())
+    })
 }
 
 /// nginx 的 bypass/no_cache 条件：任一表达式展开后非空且不为 "0" 即成立。
@@ -2998,12 +3194,252 @@ fn use_stale_allows(tokens: &[String], token: &str) -> bool {
     tokens.iter().any(|t| t == token)
 }
 
+/// 把上游响应整体缓冲成 `(状态, 可回放头, 体)`：剔除 hop-by-hop 与 Content-Length
+/// （回发时按体长重算）。Still ONLine 要留副本就必须看到完整响应体。
+async fn buffer_upstream(
+    resp: Response<crate::proxy::UpstreamBody>,
+) -> Result<(u16, Vec<(String, String)>, Bytes), String> {
+    let (parts, ibody) = resp.into_parts();
+    let collected = match ibody.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => return Err(e.to_string()),
+    };
+    let hdrs: Vec<(String, String)> = parts
+        .headers
+        .iter()
+        .filter(|(k, _)| {
+            !is_hop_by_hop(k.as_str()) && !k.as_str().eq_ignore_ascii_case("content-length")
+        })
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    Ok((parts.status.as_u16(), hdrs, collected))
+}
+
+/// 写入副本（准入闸门 1：只收 2xx、只收上游没发 `Set-Cookie` 的响应，
+/// 且响应本身没声明"这份内容是这个访客专属的"（硬规则 4）；
+/// 调用方已保证请求不带 Cookie/Authorization，且不是子请求）。
+/// 存成功意味着这条 key 刚刚拿到过新鲜内容，顺手撤销后台的待重取标记。
+fn store_still_online(
+    state: &AppState,
+    loc: &Location,
+    ctx: &RequestCtx,
+    zone: &str,
+    key: &str,
+    status: u16,
+    headers: &[(String, String)],
+    body: &Bytes,
+) {
+    if !(200..300).contains(&status) {
+        return;
+    }
+    if crate::still_online::response_has_set_cookie(headers) {
+        // 会话签发响应天然是"这个人专属"的，进副本区就等于把登录态发给下一个客户端
+        state.still_online.note_credential_reject();
+        return;
+    }
+    if let Some(reason) = crate::still_online::response_forbids_copy(headers) {
+        // 没带凭证头不等于公开：上游用 Cache-Control/Vary 说过"按访客分过变体"，
+        // 而副本 key 里没有身份，存下来就会把第一个访客的正文回放给所有人。
+        state.still_online.note_private_reject();
+        log_debug!("still_online 拒绝收录 {key}：{reason}");
+        return;
+    }
+    let snap = crate::still_online::Snapshot {
+        resp: Arc::new(crate::proxy_cache::CachedResponse {
+            status,
+            headers: headers.to_vec(),
+            body: Arc::new(body.clone()),
+        }),
+        stored_at: std::time::SystemTime::now(),
+        listener: ctx.listener,
+        host: ctx.host.clone(),
+        scheme: ctx.scheme.clone(),
+        // 存原始请求行：后台重取要照它重新走一遍路由（rewrite 步骤也得重跑）
+        uri: ctx.uri.clone(),
+    };
+    if state.still_online.store(zone, key, snap, loc.still_online_max_body) {
+        // 存进去的就是新鲜内容：后台那条待重取标记可以撤了
+        state.still_online.clear_dirty(zone, key);
+    }
+}
+
+/// 回放副本（准入闸门 2：`Set-Cookie` 一律剥掉，永不随副本下发）。
+/// 同时把该 key 挂进脏表，交给后台在健康恢复后单飞重取。
+fn serve_still_online(
+    state: &AppState,
+    loc: &Location,
+    server: &Server,
+    ctx: &mut RequestCtx,
+    zone: &str,
+    key: &str,
+) -> Option<BoxResponse> {
+    let snap = state
+        .still_online
+        .lookup(zone, key, loc.still_online_max_age)?;
+    let policy = crate::still_online::RetryPolicy {
+        base: loc.still_online_retry,
+        max: loc.still_online_retry_max,
+        deadline: loc.still_online_retry_deadline,
+    };
+    state.still_online.mark_dirty(zone, key, &snap, &policy);
+    let age = snap.age().as_secs();
+    let headers = crate::still_online::strip_for_replay(&snap.resp.headers);
+    ctx.still_online = "STALE".to_string();
+    let mut resp = build_buffered_response(
+        snap.resp.status,
+        &headers,
+        (*snap.resp.body).clone(),
+        loc,
+        server,
+        "",
+        false,
+        ctx,
+    );
+    {
+        let hm = resp.headers_mut();
+        if let Ok(v) = HeaderValue::from_str("stale") {
+            hm.insert(HeaderName::from_static("x-still-online"), v);
+        }
+        if let Ok(v) = HeaderValue::from_str(&age.to_string()) {
+            hm.insert(HeaderName::from_static("age"), v);
+        }
+    }
+    Some(resp)
+}
+
+/// Still ONLine 后台重取循环：把脏表里到期的 key 用**匿名 GET** 重新走一遍正常请求路径。
+///
+/// * 单飞由脏表本身保证——`due_jobs` 取走即出表，同一 key 不可能有两个并发重取；
+/// * 重取请求走 `process()`，所以 location 匹配、rewrite、限流、allow/deny 与 auth_basic
+///   对它一视同仁，且成功时副本由写入闸门自动更新（不再需要第二套写入逻辑）；
+/// * 响应带 `X-Still-Online` 说明这次"成功"其实是我们自己的旧副本（后端还没回来），按失败退避；
+/// * 逐个串行处理：后端刚恢复时不再制造并发洪峰。
+pub async fn still_online_refresh_loop(state: Arc<AppState>, mut stop: watch::Receiver<bool>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = stop.changed() => {}
+            _ = tick.tick() => {}
+        }
+        if *stop.borrow_and_update() {
+            return;
+        }
+        if state.still_online.dirty_len() == 0 {
+            continue;
+        }
+        for job in state.still_online.due_jobs(Instant::now()) {
+            if refresh_copy(&state, &job).await {
+                log_info!(
+                    "Still ONLine：副本 {} {} 已换成新鲜内容",
+                    job.zone,
+                    job.key
+                );
+                state.still_online.note_refreshed(&job.zone, &job.key);
+            } else {
+                state.still_online.requeue(job);
+            }
+        }
+    }
+}
+
+/// 合成一次匿名重取请求；返回是否真的换到了新鲜内容。
+/// 请求头只带 Host：既够虚拟主机匹配，也保证凭证闸门把它认成匿名请求
+/// （副本层因此永远拿不到任何 Cookie/Authorization）。
+async fn refresh_copy(state: &Arc<AppState>, job: &crate::still_online::RefreshJob) -> bool {
+    let Some(listener) = job.listener else {
+        return false;
+    };
+    let router = state.routing();
+    let Some(server) = router.match_server(listener, job.host.as_deref()).map(Arc::clone) else {
+        // 热重载后这个监听/虚拟主机已经不在了：副本继续服务到 max_age，但无法重建请求
+        log_debug!("Still ONLine：重取无法定位虚拟主机（{} {:?}）", listener, job.host);
+        return false;
+    };
+    let Ok(uri) = job.uri.parse::<hyper::Uri>() else {
+        return false;
+    };
+    let Some(path) = decode_and_normalize(uri.path()) else {
+        return false;
+    };
+    let mut ctx = RequestCtx {
+        method: "GET".to_string(),
+        path,
+        query: uri.query().unwrap_or("").to_string(),
+        // 用原始请求行重建：cache key 模板里的 $request_uri 必须和当初一致
+        uri: job.uri.clone(),
+        host: job.host.clone(),
+        // 网关自己发起的请求：源地址取本监听族的回环，便于按 IP 审计
+        remote_addr: if listener.ip().is_ipv4() {
+            "127.0.0.1".to_string()
+        } else {
+            "::1".to_string()
+        },
+        remote_port: 0,
+        server_port: listener.port(),
+        req_headers: vec![(
+            "host".to_string(),
+            job.host.clone().unwrap_or_else(|| "unknown".to_string()),
+        )],
+        resp_headers: Vec::new(),
+        rewritten_path: None,
+        status: 200,
+        body: None,
+        stream: None,
+        done: false,
+        internal_redirect: false,
+        req_body: Bytes::new(),
+        exec_depth: 0,
+        redirect: None,
+        scheme: job.scheme.clone(),
+        // 不是内部请求：`internal;` 的 location 本就不该被对外回源，副本也只服务外部可见 URL
+        internal_request: false,
+        filter_chunk: None,
+        filter_eof: false,
+        listener: Some(listener),
+        capture_depth: 0,
+        balancer_peer: None,
+        balancer_timeouts: None,
+        balancer_more_failures: None,
+        balancer_recreate_request: false,
+        upstream_addr: String::new(),
+        upstream_status: 0,
+        upstream_header_time: 0.0,
+        ssl: None,
+        start_time: unix_now(),
+        http_version: 1.1,
+        body_builder: None,
+        eof_sent: false,
+        cache_status: String::new(),
+        still_online: String::new(),
+        // 重取由网关自己发起：没有前置代理，也没有"改写前的对端"可审计
+        front_proxy: String::new(),
+        front_proxy_country: String::new(),
+        front_proxy_host: String::new(),
+        front_proxy_verified: false,
+        realip_remote_addr: String::new(),
+        set_vars: Vec::new(),
+        rewrite_return: None,
+    };
+    let mut scope = RequestScope {
+        guards: Vec::new(),
+        streamed: false,
+        allow_stream: false,
+    };
+    let resp = process(state, &mut ctx, &server, ProxyBody::Buffered(None), &mut scope).await;
+    let replayed = resp.headers().contains_key("x-still-online");
+    let ok = resp.status().is_success();
+    drop(resp);
+    ok && !replayed
+}
+
 /// 命中缓存：用存储的状态/头/体重建响应，带上 X-Cache-Status 与 add_header。
 fn serve_from_cache(
     resp: Arc<crate::proxy_cache::CachedResponse>,
     loc: &Location,
     server: &Server,
     status_tag: &str,
+    ctx: &RequestCtx,
 ) -> BoxResponse {
     build_buffered_response(
         resp.status,
@@ -3013,6 +3449,7 @@ fn serve_from_cache(
         server,
         status_tag,
         true,
+        ctx,
     )
 }
 
@@ -3025,6 +3462,7 @@ fn build_buffered_response(
     server: &Server,
     status_tag: &str,
     with_status_tag: bool,
+    ctx: &RequestCtx,
 ) -> BoxResponse {
     let mut builder = Response::builder().status(
         StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
@@ -3050,18 +3488,28 @@ fn build_buffered_response(
                 }
             }
         }
-        for (k, v) in router::effective_add_headers(Some(loc), server) {
-            if let (Ok(name), Ok(val)) = (
-                HeaderName::try_from(k.as_str()),
-                HeaderValue::try_from(v.as_str()),
-            ) {
-                hm.insert(name, val);
-            }
-        }
+        push_add_headers(hm, Some(loc), server, ctx);
         if with_status_tag {
             crate::metrics::get().record_cache_status(status_tag);
             if let Ok(val) = HeaderValue::from_str(status_tag) {
                 hm.insert(HeaderName::from_static("x-cache-status"), val);
+            }
+            // RFC 9209：本机作为源站，把自己那层缓存判定报给前置代理，让它能量化"回源有多少
+            // 是真活、多少是命中"。只在 egress 且直连对端验证过时才报——没验证就等于不知道
+            // 对面是不是声明的那家，报出去只会污染它的观测。
+            if server.front_proxy.mode == crate::front_proxy::FrontProxyMode::Egress
+                && ctx.front_proxy_verified
+            {
+                let prev = headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("cache-status"))
+                    .map(|(_, v)| v.as_str());
+                let ours = crate::front_proxy::cache_status_field(status_tag);
+                if let Ok(val) = HeaderValue::from_str(&crate::front_proxy::append_cache_status(
+                    prev, &ours,
+                )) {
+                    hm.insert(HeaderName::from_static("cache-status"), val);
+                }
             }
         }
         apply_proxied_header_rewrites(hm, loc);
@@ -3127,14 +3575,7 @@ fn finish_response(ctx: &RequestCtx, server: &Server, loc: Option<&Location>) ->
                 }
             }
         }
-        for (k, v) in router::effective_add_headers(loc, server) {
-            if let (Ok(name), Ok(val)) = (
-                HeaderName::try_from(k.as_str()),
-                HeaderValue::try_from(v.as_str()),
-            ) {
-                hm.insert(name, val);
-            }
-        }
+        push_add_headers(hm, loc, server, ctx);
         if !hm.contains_key(hyper::header::CONTENT_TYPE) && !body.is_empty() {
             hm.insert(
                 hyper::header::CONTENT_TYPE,
@@ -3224,9 +3665,29 @@ fn set_header(resp: &mut BoxResponse, name: &str, value: &str) {
 }
 
 /// add_header 对静态响应同样生效（这里覆盖的都是 2xx/3xx：nginx 的 add_header 默认不加到 4xx/5xx）
-fn apply_add_headers(resp: &mut BoxResponse, loc: &Location, server: &Server) {
-    for (k, v) in router::effective_add_headers(Some(loc), server) {
-        set_header(resp, &k, &v);
+fn apply_add_headers(resp: &mut BoxResponse, loc: &Location, server: &Server, ctx: &RequestCtx) {
+    let hm = resp.headers_mut();
+    push_add_headers(hm, Some(loc), server, ctx);
+}
+
+/// nginx 的 add_header：`Parameter value can contain variables.`
+/// 每个响应按当前请求做一次变量展开；取值失败的头仍然加（nginx 的 headers filter 不因空值跳过），
+/// 缺失的 `$arg_/$cookie_/$http_` 之类就是空串——这正是 `$upstream_cache_status` 在非缓存方法下
+/// 该表现成空串的原因。
+fn push_add_headers(
+    hm: &mut hyper::HeaderMap,
+    loc: Option<&Location>,
+    server: &Server,
+    ctx: &RequestCtx,
+) {
+    for (k, v) in router::effective_add_headers(loc, server) {
+        let val = crate::proxy::interpolate_vars(v, ctx);
+        if let (Ok(name), Ok(hv)) = (
+            HeaderName::try_from(k.as_str()),
+            HeaderValue::try_from(val.as_str()),
+        ) {
+            hm.insert(name, hv);
+        }
     }
 }
 
@@ -3291,10 +3752,20 @@ async fn handle_upgrade(
         http_version: http_version_f64(req.version()),
         body_builder: None,
         eof_sent: false,
+        cache_status: String::new(),
+        still_online: String::new(),
+        front_proxy: String::new(),
+        front_proxy_country: String::new(),
+        front_proxy_host: String::new(),
+        front_proxy_verified: false,
+        realip_remote_addr: meta.peer.map(|p| p.ip().to_string()).unwrap_or_default(),
+        set_vars: Vec::new(),
+        rewrite_return: None,
     };
     // Upgrade 不再是旁路：realip / limit_conn / rewrite / limit_req / allow-deny / auth /
     // access_by_lua 全部与普通请求一致，之后才允许进入 101 切换。
     apply_realip(&server, &mut ctx, meta.peer);
+    apply_front_proxy(&server, &mut ctx, meta.peer);
     rec.set_remote(ctx.remote_addr.clone());
     let conn_guards = match acquire_conn_guards(&state, &server, &ctx.remote_addr) {
         Ok(g) => g,
@@ -4102,5 +4573,23 @@ mod tests {
         // 文件被截断/删除后打开失败 → 调用方回 404，而不是挂起或发出空体
         assert!(DiskBody::open(&dir.join("missing.bin"), 0, 10).await.is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bypass_and_no_cache_predicates_follow_nginx_truthiness() {
+        let mut c = RequestCtx::default();
+        c.query = "a=1&b=0&c=&d=x".into();
+        // 多值：任一表达式成立即成立
+        assert!(cache_expr_truthy(&["$arg_b".into(), "$arg_a".into()], &c));
+        assert!(cache_expr_truthy(&["$arg_a".into(), "$arg_nope".into()], &c));
+        // 空值、"0"、缺失变量都不成立（"0" 在 nginx 里明确是假）
+        assert!(!cache_expr_truthy(&["$arg_c".into()], &c));
+        assert!(!cache_expr_truthy(&["$arg_b".into()], &c));
+        assert!(!cache_expr_truthy(&["$arg_nope".into(), "$http_x_nope".into()], &c));
+        // 字面量与模板
+        assert!(cache_expr_truthy(&["always".into()], &c));
+        assert!(cache_expr_truthy(&["prefix-$arg_d".into()], &c));
+        // 没配指令 = 空列表 = 永不成立
+        assert!(!cache_expr_truthy(&[], &c));
     }
 }

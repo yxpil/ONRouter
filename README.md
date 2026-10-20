@@ -61,9 +61,24 @@ all gateway logic is hand-written.
 - **Bounded blast radius**: `sub_filter` buffers at most 8 MiB per response (larger files stream
   unfiltered, with a warning), and Lua coroutines are preempted every `lua_slice_instructions`
   VM instructions (default 1 000 000) so a runaway loop can no longer stall the single process.
+- **Still ONLine copies cannot carry a session**: the last-known-good replay layer has three hard
+  rules with no configuration switch — a response containing `Set-Cookie` is never stored, a request
+  carrying `Cookie`/`Authorization` never writes a copy (and by default is not served one either, so a
+  shared copy can never be handed to a logged-in visitor as if it were theirs), and `Set-Cookie` is
+  stripped from every replayed response. Only anonymous `GET` + 2xx responses enter the zone, and the
+  background re-fetch after recovery is itself an anonymous request that goes through the normal ACL /
+  `limit_req` / rewrite path.
+- **CDN headers cannot move an identity**: every value `front_proxy` derives from a request header —
+  client address, `$scheme`, country, visible host — is used only when the direct TCP peer falls inside a
+  `trust` range the operator declared (or `set_real_ip_from`), so a client that copies a real provider's
+  whole header set is left on the node address for `allow`/`deny`, `limit_req`, `geo`, VIP reputation, the
+  access log and the cache key alike. Recognition alone only labels; a profile with no `probe` can never
+  match; and promoting a profile's own ranges into a rewriting authority needs the explicit
+  `front_proxy_auto_trust on`, which warns once per profile and names the vhost at `-t`. `Cache-Status` is
+  likewise suppressed for unverified peers, so a hit rate a client could inflate is not a metric.
 - Security tests: `sec_test.py` (30 checks, covering traversal / smuggling / CRLF injection /
   malformed requests / oversized requests / default response headers),
-  `tools/security_matrix_e2e.py` (20 checks, one gateway process per probe, reproducing each finding
+  `tools/security_matrix_e2e.py` (36 checks, one gateway process per probe, reproducing each finding
   from `docs/SECURITY_AUDIT.md` with real traffic — every probe fails on the pre-fix binary) and
   `tools/rce_matrix_e2e.py` (27 checks on the remote-execution surface: Lua-source/path injection,
   `internal` location escape, `proxy_pass` SSRF with a canary listener, encoded-CRLF request
@@ -93,6 +108,12 @@ all gateway logic is hand-written.
   traffic shows 100/100 inline for a no-yield script and 50/50 adopt for `ngx.sleep`.
 - **16-shard ngx.shared.DICT**: sharded by key hash, each shard with its own lock, so multi-core
   concurrent reads/writes never block each other.
+- **Optional DICT disk cold tier**: hot data stays in the sharded memory map, eviction victims that are
+  warm enough spill to disk and are promoted back on the next read, so a small `lua_shared_dict` can
+  cache far more than its memory size. Three disciplines keep it off the request path: writes are
+  always handed to one background writer thread per store, the cold index is in memory so a true miss
+  costs zero disk I/O, and capacity trimming is a coalesced job on that writer thread rather than work
+  inside `set()`.
 - **Lock-free hot paths**: round-robin cursor / node health state / VM selection are all atomic.
 - **Async access log**: a dedicated writer thread + buffered batch flush; the request hot path does
   only one lock-free enqueue.
@@ -113,9 +134,12 @@ all gateway logic is hand-written.
 | passive health checks `max_fails` / `fail_timeout` | failure counting + node removal + expiry recovery (falls back to full set when all are down) | `upstream.rs` |
 | `proxy_pass` reverse proxy | hyper connection pool, `proxy_set_header` variable interpolation, prefix replacement | `proxy.rs` |
 | `resolver` + async DNS | pure-Rust non-blocking UDP stub resolver (A/AAAA, RFC1035 + compression pointers), `valid=` TTL cache | `dns.rs` |
-| `proxy_cache` response caching | in-memory named zones sized from `keys_zone` with LRU eviction, `proxy_cache_valid`/key/methods/min_uses, `proxy_cache_lock` coalescing, `use_stale` (error/timeout/updating/http_xxx), `bypass`/`no_cache`, upstream `Cache-Control`/`Expires` precedence, `X-Cache-Status` | `proxy_cache.rs` |
+| `proxy_cache` response caching | in-memory named zones sized from `keys_zone` with LRU eviction, `proxy_cache_valid`/key/methods/min_uses, `proxy_cache_lock` coalescing, `use_stale` (error/timeout/updating/http_xxx), `proxy_cache_bypass`/`proxy_no_cache` (multi-value, nginx truthiness: a value counts only when non-empty and not `"0"`), `proxy_ignore_headers`, upstream `Cache-Control`/`Expires` precedence, `X-Cache-Status` + `$upstream_cache_status` | `proxy_cache.rs` |
 | `proxy_pass https://` / `wss://` backends | pure-Rust rustls client over one pooled `Service<Uri>` connector shared with http backends; `proxy_ssl_verify`/`_trusted_certificate`/`_name`/`_server_name` + `proxy_ssl_certificate`/`_certificate_key` (mTLS client cert), TLS policy incl. client cert in the pool key | `proxy_tls.rs`, `proxy.rs` |
+| `Still ONLine` last-known-good replay | separate **byte-budgeted** zones (`still_online_zone <name> <size>;`) opened per server/location with `still_online <zone>;` (`off` stops inheritance); only anonymous `GET` + 2xx responses without `Set-Cookie` are stored (`still_online_max_body`), retained copies replay as `200` + `X-Still-Online: stale` + `Age` + `$still_online` when the origin is unreachable **or** answers 5xx, until `still_online_max_age` expires them; recovery-triggered anonymous re-fetch runs through the normal request path (so `rewrite`/location/`limit_req`/ACL apply) with single-flight + exponential backoff (`still_online_retry`/`_retry_max`/`_retry_deadline`). Credential hard rules, with **no switch to turn them off**: `Set-Cookie` is never stored and never replayed, a request carrying `Cookie`/`Authorization` never writes a copy, and by default never reads one either — `still_online_allow_credentials on` only opens the *read* side | `still_online.rs`, `server.rs`, `router.rs` |
 | `rewrite ... last/break/redirect/permanent` | regex engine + `$1..$9` back-references | `engine.rs` |
+| `set $var <value>;` + `if (cond) { … }` | REWRITE-phase subset executed **in config order** (nginx-like): `set` writes request-scoped variables (and may shadow a built-in for that request), `if` supports `$var` truthiness / `!$var`, and `=`, `!=`, `~`, `~*`, `!~`, `!~*` against a `$var` or literal RHS; the block may contain `rewrite`/`set`/`return`, nested `if` is rejected at parse time, file tests (`-f`/`-d`/`-e`/`-x`) fail with an explicit message instead of being ignored. Deliberate divergence: a `return` recorded inside `if` runs **after** the ACCESS phase, so it can never preempt `allow`/`deny`/`auth_basic` (nginx's `return` is a rewrite-phase directive and does) | `engine.rs`, `router.rs`, `server.rs` |
+| `add_header` / `proxy_set_header` / cache-key variable semantics | every value surface interpolates through one resolver (`engine::resolve_var`): known variables take their value, a known-but-currently-valueless one (`$arg_missing`, `$cookie_missing`, `$upstream_cache_status` on a POST) expands to **empty**, and a name that is not an nginx variable at all keeps its literal so a typo stays visible in the response. `$host` strips the port (bracketed IPv6 kept intact), `$http_host` returns the raw header; both Lua `ngx.var`, `add_header` and cache keys share the one resolver | `proxy.rs`, `engine.rs` |
 | `map $src $dst { … }` derived variables | exact/`~`/`~*`/capture-group cases + `default`, shared resolver for `ngx.var` + config interpolation | `engine.rs`, `router.rs` |
 | `geo [$src] $dst { … }` IP-derived variables | longest-prefix CIDR match (IPv4+IPv6), host `/32`, networks, `default`, same shared resolver | `engine.rs`, `router.rs` |
 | `split_clients <key> $dst { … }` weighted-derived variables | MurmurHash2 over an interpolated key template, `%` buckets (fractional allowed) + `*` catch-all, same shared resolver | `engine.rs`, `router.rs` |
@@ -137,6 +161,12 @@ all gateway logic is hand-written.
 | `ngx_lua` scripting layer | mlua (Lua 5.4), see the Lua API list below | `lua_engine.rs` |
 | `lua_slice_instructions <n>;` | ONRouter-only cooperative preemption quantum: every coroutine resume arms a Lua count hook that yields back to the VM scheduler after `n` VM instructions (default 1 000 000 ≈ 10 ms of pure Lua; `0` disables). Bounds how long one script can hold a VM/tokio worker, so a runaway loop no longer blackouts the single process. Normal request scripts never reach a slice, so measured Lua throughput is unchanged (12.9k → 13.3k req/s within noise) | `lua_engine.rs`, `tools/security_matrix_e2e.py` |
 | `lua_shared_dict` / `ngx.shared.DICT` | full OpenResty method surface: `get`/`get_stale`/`get_plus`/`get2`, `set`/`safe_set`/`force_set`/`set_auto`, `add`/`force_add`/`replace`, `incr`/`decr`/`bump`, `delete`/`flush_all`/`flush_expired`, `ttl`/`key_present`/`size`/`len`/`num`/`capacity`/`free_space`/`get_keys`/`expire` (true multi-value returns) | `shared_dict.rs`, `lua_engine.rs` |
+| `lua_shared_dict … disk=` cold tier (ONRouter-only) | optional second tier per zone: eviction victims whose access frequency passes `spill_after` are written to `disk=` (always async, one writer thread per store, temp+rename), everything else is dropped. A cold hit reads the entry back and promotes it into memory, so **one key lives in exactly one tier at a time**. Cold index is in memory, so a true miss costs zero disk I/O; `num()`/`size()`/`get_keys()`/`ttl()`/`delete()` see both tiers while `capacity()`/`free_space()` stay memory-only. Restart rebuilds the index by scanning the directory (no index file). `max_disk=` caps the tier, `max_value=` skips oversized blobs, and a corrupt/truncated entry file is counted and dropped, never a panic | `disk_cache.rs`, `shared_dict.rs`, `tools/disk_cache_e2e.py` |
+| `Learning` subsystem: one shared byte budget (ONRouter-only) | `learning on;` master switch (**default off** — with it off every learning path below short-circuits and behavior is identical to a build without it) plus one process-wide ledger `learning_memory_budget <size>;` (default 1 MiB, clamped to 8 KiB…16 MiB). Every learned structure — cache frequency sketch, burst-shape table, reputation table — claims from and releases back into this one ledger, so "the models fit in a tiny amount of memory" is a number the operator sets rather than something the gateway grows into. A claim that does not fit is refused, counted (`onrouter_learning_budget_denied_total`), written to the log, and that feature falls back to its configured unlearned behavior — never a silent partial table | `learning.rs`, `metrics.rs` |
+| `proxy_cache_learning` TinyLFU admission + eviction (ONRouter-only) | `proxy_cache_learning <zone> [sketch=<size>];` (default 256 KiB per zone, minimum 8 KiB): a 4-row × 4-bit count-min sketch (estimate = min over rows, aging = whole table halved once every counter has been written on average) sits in front of `proxy_cache`. A newcomer is admitted only when its estimate beats the coldest of the `8` oldest entries, so one-shot URLs can no longer flush a hot object; when a newcomer does win, the eviction inside that window is by frequency, not by pure LRU. Weighted writes still advance the aging clock, so a saturating scanner cannot freeze the sketch's memory of the old hot set | `learning.rs`, `proxy_cache.rs` |
+| `limit_req_queue` bounded waiting + `limit_req_learning` burst-shape learning (ONRouter-only) | `limit_req_queue <zone> [depth=10] [depth_min=1] [max_delay=5s];` makes an over-rate request wait instead of 429, up to `depth` concurrent waiters per key (the token is reserved at admit time, so a request that got a slot is never refused after waiting; `depth` is hard-capped at 4096). `limit_req_learning <zone> [table=<size>];` (default 64 KiB, 12 B per key, direct-mapped) then lets each key's own history choose its depth inside `[depth_min, depth]`: it records the length of **finished** bursts (a gap over `gap_cap` = 2× the token period, clamped 20 ms…1 s, ends one), and a burst that reaches `depth × 4` without ever ending is classified as a flood and wipes the memory — so a deep queue is never a buffer for an attacker, and the ceiling is still whatever the operator wrote | `limit.rs` |
+| `vip_learning` client reputation → queue priority + cache retention (ONRouter-only) | `vip_learning [table=<size>] [min=24] [decay=30s];` (default 64 KiB, 12 B per key). Fed only by `limit_req` verdicts, never by headers or business signals: in-rate `+1`, queued `0` (already over rate — not a merit), rejected `−8`, minus one more point per `decay` of silence, so an address that keeps coming back *within* rate crosses `min` and one that goes quiet or misbehaves falls back. Reputation buys exactly two things: while trusted, that key's queue opens to the configured `depth` ceiling instead of the learned floor — **the rate is untouched**, the same bucket still releases tokens one at a time — and objects it causes to be cached get a `+4` sketch boost, which buys *retention*, never a jump past admission. A promoted client that starts flooding loses the status through the same 429s | `vip.rs`, `limit.rs`, `proxy_cache.rs` |
+| `front_proxy` profiles + `front_proxy_mode off/detect/egress` (ONRouter-only) | know a CDN/LB sits in front **without naming the vendor**: each front is declared as config data (`front_proxy <name> { probe <hdr> [~ substr]; ip_header <hdr>; country_header/proto_header/host_header <hdr>; trust <cidr>; }`) and the engine only sees roles, so adding a provider is a config edit, never a code change. Recognition is never trust: a probe match only labels, and **every** header-derived value requires the direct TCP peer to fall inside `trust` ∪ `set_real_ip_from` — otherwise the request keeps the node address (a client that guesses a vendor header cannot move `$remote_addr`, `$scheme` or the cache key). `detect` labels (`$front_proxy`) and counts; `egress` additionally repoints `$remote_addr`/`limit_req`/`geo`/ACL/`access_log`/VIP reputation at the true client, restores `$scheme` from the declared protocol header, forwards the real client + protocol upstream, and emits `Cache-Status: onrouter; detail=hit\|miss\|stale\|bypass\|proxy-revalidated` (RFC 9209) on buffered cached responses so the CDN can measure its own hit rate. `front_proxy_auto_trust on` is the one explicit way to promote a profile's own `trust` ranges into a rewrite authority root (loud one-shot warning + `-t` naming the vhost); a mode typo, `egress` with no trusted range at all, and `auto_trust` outside `egress` are `-t` **errors**, not warnings | `front_proxy.rs`, `router.rs`, `server.rs` |
 | `access_log` combined format | local file + stdout; `$remote_addr` is captured after realip, so logs show the real client, not the trusted proxy; each line also carries `$request_time` and the `$upstream_addr` / `$upstream_status` / `$upstream_header_time` triple (`- - -` when no upstream was contacted; Upgrade tunnels log the `101` peer); a full async queue drops and counts lines instead of blocking request tasks | `access_log.rs` |
 | third-party C modules | `content_by_rust` / `access_by_rust` compile-time registered Rust handlers | `engine.rs` |
 | `stub_status` / Prometheus scraping | process-global runtime metrics (accepted/active/capacity + requests + 2xx/3xx/4xx/5xx) plus per-upstream node connections/health/success/failure, cache-status counters, TLS handshake failures, limit_req/limit_conn rejections and dropped access-log lines, rendered as Prometheus text via `content_by_rust metrics` | `metrics.rs` |
@@ -161,6 +191,12 @@ rust/
             ├── proxy.rs     # reverse proxy engine (reports failures to health checks)
             ├── engine.rs    # rewrite/return engine + native Rust handler registry
             ├── shared_dict.rs # ngx.shared.DICT shared dict
+            ├── disk_cache.rs  # DICT disk cold tier (async writer thread, hash-named entry files)
+            ├── limit.rs     # limit_req/limit_conn token buckets + bounded queue + burst-shape learning
+            ├── proxy_cache.rs # proxy_cache zones: LRU + TinyLFU admission/eviction
+            ├── learning.rs  # learning master switch, frequency sketch, process-level byte ledger, directive parsing
+            ├── vip.rs       # client reputation table (limit verdicts in, queue ceiling + cache retention out)
+            ├── front_proxy.rs # vendor-free CDN/LB profiles: probes, header dialects, trust gate, Cache-Status
             ├── lua_engine.rs# Lua VM + ngx.* API
             ├── access_log.rs# combined access log
             ├── stream.rs    # L4 stream{} proxy + ssl_preread SNI routing (byte-transparent TCP)
@@ -170,7 +206,6 @@ rust/
 ## Running
 
 ```bash
-cd rust
 # Option 1: run directly with cargo (debug)
 cargo run -- conf/onrouter.conf
 # Option 2: packaged exe (release)
@@ -180,7 +215,15 @@ target\release\onrouter.exe conf\onrouter.conf
 # start two demo backends (either way):
 python -m http.server 9001 --bind 127.0.0.1
 python -m http.server 9002 --bind 127.0.0.1
+
+# config test (also the place to see which directives were accepted and which were ignored)
+target\release\onrouter.exe -t conf\onrouter.conf
 ```
+
+`-t` validates listeners, certificates and limit references, then prints `配置测试通过。` **and every
+startup warning line** (`告警 N 条：` followed by one bullet each — e.g. an unknown directive that was
+ignored, or a server-level `return`/`rewrite`/`set`/`if` that is not supported there). Exit code stays
+`0` for ignored directives, so read the printed warnings, not just the exit code.
 
 ### HTTPS / certificates
 
@@ -269,6 +312,26 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   `[0]` whole match, `[N]` groups and named groups; `opt`'s handle avoids recompiling on the hot path.
 - Encoding: `ngx.encode_base64 / decode_base64 / escape_uri / unescape_uri / decode_args / encode_args`
 - Shared memory: `ngx.shared.<zone>:get / get_stale / set / safe_set / add / replace / delete / incr / ttl / flush_all / get_keys(max?) / expire(key, ttl)`
+  — the Lua surface is unchanged by the optional disk tier; it is configured purely by directives:
+
+  ```nginx
+  lua_shared_dict tier 24k disk=cache/tier max_disk=4m levels=1:2 inactive=10m spill_after=2 max_value=2k;
+  ```
+
+  `disk=` turns on the cold tier for that zone (path resolved like every other relative path: against
+  `-p <prefix>`, else against the config file's directory; **write the path bare** — these `k=v`
+  arguments are taken literally, so `disk="cache/tier"` tries to create a directory whose name includes
+  the quote characters). Eviction then splits by frequency: a victim
+  whose self-decaying access count reaches `spill_after` (default 3) is written to disk, anything colder
+  is dropped as before. `max_value=` (default 64 KiB) keeps big blobs out of the tier, `max_disk=` caps
+  it, `levels=` shapes the directory tree nginx-style (≤3 levels, hex digits), `inactive=` (default off)
+  lets the background sweep also retire entries nobody has read in that long. Writes are 100% async (one writer thread per store, temp+rename), so an entry that was just
+  evicted becomes visible on disk a moment later — the request path never waits for it. Each zone needs
+  its own directory; two zones sharing one `disk=` is rejected at config load, because entry files are
+  named only by key hash and one zone's `delete` would erase the other's data. Gauges and counters are
+  exported as `onrouter_dict_disk_*` on `/metrics` per zone. Verified by `tools/disk_cache_e2e.py`
+  (53 checks on real traffic, incl. spill/promote counts, byte ledger, restart rebuild, truncated
+  entry files, 20-way concurrency, cold-read vs true-miss latency, and path-traversal keys).
 - Background timers: `ngx.timer.at(delay_sec, cb, ...) / ngx.timer.every(interval_sec, cb, ...) / running_count() / pending_count()`
   — seconds unit, `premature` as the callback's first argument, user varargs forwarded verbatim,
   failures return `(nil, err)`, `return false` stops the interval (semantics aligned with official t/106/152/107)
@@ -338,9 +401,15 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   $request_uri / $args / $query_string / $is_args / $method→request_method / $scheme / $host /
   $remote_addr / $remote_port / $server_addr / $server_port / $hostname / $content_type /
   $content_length / $status / $body_bytes_sent / $request_length / $request_body / $request_time /
-  $msec / $time_local / $time_iso8601 / $https / $arg_<name> / $cookie_<name> /
+  $msec / $time_local / $time_iso8601 / $https / $realip_remote_addr (the direct TCP peer, i.e. the
+  node address before any realip/front_proxy rewrite — kept for audit on every request) /
+  $front_proxy (name of the recognised CDN profile, empty when none) / $front_proxy_verified (`1`
+  only when that peer fell in a trusted range, else empty) / $front_proxy_country / $front_proxy_host
+  (`$host` is the request name **without** the port,
+  `[::1]:8080` → `[::1]`, while `$http_host` returns the raw header), `$arg_<name> / $cookie_<name> /
   $http_<name> (request header) / $sent_http_<name> (response header) / $proxy_add_x_forwarded_for /
-  $upstream_addr / $upstream_status / $upstream_header_time(≡$upstream_response_time)`, all returned
+  $upstream_addr / $upstream_status / $upstream_header_time(≡$upstream_response_time) /
+  $upstream_cache_status (empty string when the request never engaged the cache, e.g. a POST)`, all returned
   as strings with `nil` for undefined vars (OpenResty semantics). `$uri` (rewrites the path) and
   `$status` are writable; read-only vars ignore assignment. Verified by `tools/ngxvar_e2e.py` (19
   checks: live request metadata, `$http_x_test` header echo, undefined→nil, `$uri` write-then-read,
@@ -382,6 +451,29 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   bucket for fixed keys, a 1200-request distribution giving ~25/25/25/25 and ~10%-with-`*`-catch-all
   splits, and cross-path agreement) + unit tests `murmur_hash2_*`, `pick_split_bucket_*`,
   `expand_split_key_*` and `parse_splits_*`.
+- REWRITE-phase conditionals — the nginx `set` and `if` directives, plus `rewrite`/`return`, now parsed
+  into one ordered step list per location (`loc.rewrite_steps`) and executed **in the order written**,
+  exactly like nginx. `set $name <value…>;` writes a request-scoped variable — the value is interpolated
+  (`set $who anon-$arg_who;`), the last write wins, and `set` may deliberately shadow a built-in for that
+  request (`set $uri /not-real-uri;`). `if (<cond>) { … }` supports bare truthiness `if ($v)` /
+  `if (!$v)` (only an empty expansion is false — `"0"` is *true* here, unlike `proxy_cache_bypass`
+  where `"0"` is false, matching nginx in both places) and the string operators `=`, `!=`, `~`,
+  `~*`, `!~`, `!~*`, whose right-hand side may itself be a variable and is interpolated before comparing;
+  the block may hold `rewrite`, `set` or `return`. Nested `if` and the file tests `-f`/`-d`/`-e`/`-x` are
+  rejected at config-parse time with a message naming what to use instead — they are never silently
+  dropped, and `if` without its `{ }` block is a hard parse error. Two deliberate divergences from nginx:
+  (1) a `return` recorded inside an `if` block is applied at the *same* point as a bare `return`, i.e.
+  **after** the ACCESS phase, so `if (…) { return …; }` can never preempt `allow`/`deny`/`auth_basic`
+  (in nginx `return` is a rewrite-module directive and does run first) — a fail-safe ordering, since a
+  conditionally-ignored ACL is worse than a conditionally-late response; (2) `server`-level `return` /
+  `rewrite` / `set` / `if` are not supported and now emit an explicit "已被忽略" warning naming the line,
+  instead of the previous silent fail-open where they parsed as known directives and did nothing.
+  Verified by `tools/set_if_e2e.py` (26 checks on real traffic: `set` ordering and interpolation,
+  built-in shadowing, `if`-gated `set`, each operator incl. case-insensitive regex and negation, POST-only
+  branch, `rewrite … break` stopping the rest of the sequence, `last` re-matching the location, and
+  `/acl` proving an `if`-block `return` cannot bypass `allow`/`deny`) + unit tests `set_writes_request_var_*`,
+  `if_conds_follow_nginx_truthiness_*`, `if_gates_inner_set_then_return`, `recorded_return_stops_the_rest_*`,
+  `if_and_set_reject_unsupported_forms_at_parse_time`, `server_level_rewrite_directives_warn_instead_of_failing_open`.
 - Response rewrite — the nginx `sub_filter` output filter. `sub_filter <match> <replacement>;`
   (repeatable) substitutes into the buffered response body; the match may be a literal string or a
   `~regex` / `~*case-insensitive regex`, and the replacement expands `&` to the just-matched text
@@ -418,6 +510,77 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   the true client under `recursive on`, a `geo $net` derived variable tracking the rewritten IP through
   each case, and the on-disk access-log line starting with `203.0.113.9` for the trusted case) + pure
   unit tests in `realip.rs` and router tests `parse_real_ip_directives_into_server`.
+- Front-proxy / CDN awareness — ONRouter-only, and **vendor-free by construction** (`front_proxy.rs`).
+  Nothing in the engine knows what a Cloudflare, Fastly or EdgeOne header is: each front in front of the
+  gateway is *declared* as a profile of roles, so supporting a new provider — or a second CDN in front of
+  the first — is a config edit, never a code path. A profile names how it is recognised (`probe <header>`
+  [ `~ <substring>` ], all probes must appear and match: AND), where the true client lives (`ip_header
+  <header>`, repeatable, tried in declaration order as a fallback chain), and which optional headers carry
+  the visitor country, the original scheme and the public host:
+
+  ```nginx
+  front_proxy demo-edge {
+      probe X-Demo-Edge-Id ~ edge;   # evidence: header present AND value contains the substring
+      probe X-Demo-Edge-Ray;
+      ip_header X-Demo-Real-Client;  # preferred: the front's own capability header
+      ip_header X-Forwarded-For;     # fallback: the generic chain, tried in this order
+      country_header X-Demo-Edge-Country;
+      proto_header   X-Demo-Edge-Visitor;
+      host_header    X-Forwarded-Host;
+      trust 203.0.113.0/24;          # this front's node ranges = the authority root
+  }
+  server { front_proxy_mode egress; front_proxy_auto_trust on; }
+  ```
+
+  The hard rule, with no switch: **recognition is not trust**. A probe match only *labels* the request;
+  every value that comes out of a header (address, scheme, country, host) is used only if the **direct TCP
+  peer** falls inside `trust` ∪ `set_real_ip_from`. Peer not in range → the request keeps the node address
+  and the real scheme, and `$front_proxy` still names the profile that was recognised (that asymmetry is
+  the point: the label is a metric, the rewrite is a privilege). A profile declaring no `probe` can never
+  match — otherwise "any request with an `X-Forwarded-For`" would become a spoofable identity. When
+  several profiles match, the ranking is `(peer verified, probe count)` and strictly-greater wins, so the
+  first declared profile breaks ties. Header *dialects* are normalised in one place: bare IP, `a, b, c`
+  chains, `ip:port` / `[v6]:port`, percent-encoded IPv6+port, `{"scheme":"https","…"}` JSON, `https, http`
+  chains and `on`/`ssl`/`1` scheme aliases — the config picks the header name, the code handles the shape.
+  Three per-server modes: `off` (default, nothing runs), `detect` (label + counters only, no rewrite at
+  all), `egress` (apply and optimise). In `egress` the decision runs at the same seam as realip — before
+  the access-log record, `limit_req`/`limit_conn` guards, `match_location`, `geo`, cache keys and the
+  upstream headers — so one rewrite moves *all* of them onto the real client, and it is recomputed per
+  request, which is what a connection-reusing CDN requires (two visitors can share one inbound stream).
+  `egress` then does four things: keys counters, reputation, ACLs and logs on the true client; restores
+  `$scheme` from the declared protocol header (so `https` redirects and `X-Forwarded-Proto` to the origin
+  stop looping); publishes the visible domain as `$front_proxy_host` **without** overwriting `$host`
+  (routing already picked the vhost from it, and silently replacing it would change which server answers);
+  and, when this gateway is itself the origin, appends its own `Cache-Status: onrouter; detail=hit|miss|
+  stale|bypass|proxy-revalidated` (RFC 9209) to buffered cached responses — appended after any upstream
+  entry, so a chain of proxies keeps each layer's judgement — which lets the CDN quantify how much of the
+  traffic it is *not* absorbing. Only when the peer was verified: an unverified "hit" rate would be a
+  number the client controls.
+  Trust promotion is explicit and noisy: `front_proxy_auto_trust on` makes a profile's own `trust` ranges a
+  rewriting authority root (default `off`, where the profile only describes the front and `set_real_ip_from`
+  alone authorises). With it off but a profile chain configured, every request logs nothing and every rewrite
+  silently falls back to the node address, so the first such request emits **one** warning per profile naming
+  both fixes (`set_real_ip_from`, or `front_proxy_auto_trust on;`) and `ip_blocked` climbs — the config reads
+  as if it were rate-limiting real clients while it is rate-limiting one CDN node. Four config-time
+  rejections (same class as S11: "declared but inert" is an error, not a warning): an unrecognised
+  `front_proxy_mode` value, `egress` with no trusted range anywhere, `auto_trust` on while the mode is not
+  `egress`, and a non-parseable `trust` CIDR. `-t` prints the declared profiles with their probe count,
+  address chain and range count, and names each vhost that turned `auto_trust` on. Verified by
+  `tools/front_proxy_e2e.py` (54 checks: egress rewriting `$remote_addr`/`geo`/the access-log first field,
+  forged headers from an out-of-range peer changing nothing, `auto_trust off` leaving the node address,
+  `detect` labelling only, the dialect fall-through incl. percent-encoded IPv6 and a poisoned `CN;evil`
+  country value, `limit_req` splitting 8 faked clients into 8 buckets on the egress vhost while both control
+  vhosts lump them, a real `MISS→HIT` pair with `Cache-Status` and exactly one origin request, an upstream
+  `Cache-Status` kept with ours appended, no header at all when unverified, the XFF-only profile, the real
+  client and scheme reaching the origin, per-profile metric deltas, one-shot advisories, the startup banner
+  and the `-t` rejections) + 13 unit tests in `front_proxy.rs` and router test
+  `front_proxy_config_validation`. **When you declare a real provider**, take its header names and `trust`
+  ranges from its own published list at deploy time rather than from a table in this repo — the ranges are
+  a rolling announcement, and some of its headers are *not* trust-critical: `True-Client-IP` and
+  `CF-Connecting-IP`-style headers are only meaningful from that provider's ranges (which is exactly what
+  the gate enforces), `Fastly-Client-IP` is only added when absent, and `CloudFront` deletes the generic
+  `X-Forwarded-For`/`X-Real-IP` and uses `CloudFront-Viewer-Address` (`ip:port`) instead — so verify against
+  the vendor docs, and keep the ranges in the config file where `-t` can check them.
 - Proxy response-header rewrite — the nginx `proxy_redirect` + `proxy_cookie_domain`/`proxy_cookie_path`
   (`resp_rewrite.rs`). These are config-time string rewrites applied to the upstream `Location`/`Refresh`
   and `Set-Cookie` response headers. `proxy_redirect <match> <replacement>` (repeatable) treats `match` as a
@@ -549,6 +712,66 @@ them as standalone runnable assertion scripts.
   `bypass`/`no_cache` store-vs-skip semantics, keys_zone-driven LRU eviction, and HEAD
   serving from (but never populating) the shared GET cache entry; the basic suite
   `tools/proxy_cache_e2e.py` remains 13/13.
+- `tools/still_online_e2e.py`: 25/25 passing — Still ONLine under a real backend kill/restart. The
+  backend is Python's `ThreadingHTTPServer` with keep-alive, so "crash" is simulated by hard-closing
+  established connections too (a bare `shutdown()` would leave pooled connections serving 200s and
+  the outage would be invisible). Covers: copy written on healthy `GET` 2xx, replay as `200` +
+  `X-Still-Online: stale` + `Age` with byte-identical body while the origin is dead, credentialed
+  `GET` → 502 (no read of someone else's copy) unless `still_online_allow_credentials on`, replays
+  never carrying `Set-Cookie`, `POST` staying 502, `Set-Cookie` and over-`max_body` responses never
+  entering the zone, a no-zone control location always returning a plain 502, `served`/
+  `rejected_credential`/`pending_jobs` counters moving, then after the origin returns both dirty keys
+  are re-fetched (`refreshed +2`), the queue drains to zero, and a second outage replays the
+  *recovered* version instead of the pre-crash one.
+- `tools/disk_cache_e2e.py`: 53/53 passing — the DICT disk cold tier under real traffic. Filling a
+  24 KiB zone proves the evicted tail lands on disk (`spill`/`entries` gauges) and reads back
+  byte-identical through `get()` (`cold_hit`/`promote`), that `num()` spans both tiers while
+  `free_space()` stays exact to `key+value+64` per memory entry, that one key never sits in both tiers,
+  that a process restart rebuilds 15 entries by scanning the directory, that truncating **every**
+  entry file only costs those entries (`corrupt` == file count, service keeps serving and re-spilling),
+  that a true miss leaves both cold-tier counters frozen and is as fast as a diskless control zone,
+  that traversal-shaped keys can only ever land in hex directories, that `spill_after=2` writes
+  exactly the one warm key to disk while 200 one-shot writes are all refused, and that `flush_all()`
+  arriving while spills are still queued discards that whole generation (no resurrected keys, no
+  orphan files) — the last three checks fail 3/3 on a build with the generation guard removed.
+- `tools/learning_cache_e2e.py`: 34/34 passing — cache learning under real traffic, with a control
+  zone. Two `proxy_cache_path` zones of the *same* capacity (`keys_zone=1k` → 8 entries each), one
+  declaring `proxy_cache_learning`, one not. The same flood of one-shot URLs runs through both: on the
+  learning side the hot object survives and the one-shots are refused entry
+  (`onrouter_cache_learning_events_total{role="admission_rejected"}` climbing while `evicted_cold`
+  stays 0), on the plain-LRU side the hot object is flushed out (`HIT` → `MISS`), which is the point —
+  the assertion is about observable cache status, not about sketch internals. Also covers the budget
+  ledger (`used` == the zone's sketch bytes), a zone that is declared but refused (bytes stay 0), and
+  the hot-reload path where shrinking `learning_memory_budget` drops the sketch and returns to LRU.
+  Its last two checks are the `-t` round: the three directives are not reported as unknown, the
+  per-zone learning summary is printed, and a `proxy_cache_learning` naming a `keys_zone` that was
+  never declared is **rejected** — `apply_learning` only walks existing zones, so a typo there would
+  silently learn nothing.
+- `tools/queue_learning_e2e.py`: 42/42 passing — three locations over one `10r/s burst=0` zone, only
+  "what happens when a request is over rate" differing. `plain` (no queue): 12 concurrent → 1 released,
+  11×`429` with `Retry-After`, and `/metrics` renders **no** queue rows for it. `stat` (queue, no
+  learning): 12 concurrent → 1 + `depth(8)` = 9 released, the per-request latency of the queued ones is
+  measured to really be hundreds of ms, and the queue stays bounded. `learn` (learning on): the first
+  burst of a cold key gets only `depth_min=1`, then with **no config change** the identical burst gets
+  all 8 slots and `onrouter_queue_depth{kind="learned"}` jumps to ≥ 8 — that is the evidence depth
+  adapted by itself, under an operator-held ceiling. Then a dense flood wipes the learned shape
+  (`learned` back to the floor, `429` dominant), a hot reload shrinking `learning_memory_budget` below
+  the table releases it (`used` → 0, log says why) while the queue keeps serving at the configured
+  ceiling, and restoring the budget rebuilds it.
+- `tools/vip_learning_e2e.py`: 51/51 passing — reputation with real client addresses, fed through
+  `real_ip_header X-Forwarded-For` + `set_real_ip_from 127.0.0.0/8` (proven by the access log's first
+  field being the virtual address), because `limit_req` zones can only key on `$remote_addr`. Covers:
+  an address with no reputation getting 1 queue slot for a burst of 9 and 8×`429`; the same address
+  after sparse in-rate traffic crossing `min=10` (`onrouter_vip_clients` 0 → 1, `role="promoted"` ≥ 1)
+  then getting all 8 slots for the *same* burst with zero `429`s and a measured ≥ 300 ms wait for the
+  last one; queuing scoring nothing either way (`role="queued"` recorded, score unchanged); cache
+  retention as a differential — the VIP's object is still `HIT` after 7 hotter newcomers displaced the
+  identical object written by a no-reputation address (`evicted_cold` ≥ 7, `retained` == 1), and the
+  boost never skips admission (a VIP write into a full zone is still refused); a promoted client that
+  starts flooding losing the status (`vip_clients` 1 → 0, `demoted` ≥ 1, `rejected` ≥ the number of
+  `429`s) and its learned depth being knocked back to the floor by the flood line; and the ledger
+  check that `onrouter_learning_memory_bytes{role="used"}` equals burst table + sketch + reputation
+  table bytes exactly, under `learning_memory_budget 64k`, with `budget_denied` at 0.
 - `tools/observability_e2e.py`: 26/26 passing, one process and real traffic for the #40 telemetry:
   a live + dead node pair (`success`/`failure` per node, connection gauge back to 0, healthy gauge),
   a MISS→HIT→BYPASS→EXPIRED cache sequence matched against `X-Cache-Status` **and** the per-status
@@ -556,12 +779,29 @@ them as standalone runnable assertion scripts.
   `ngx.sleep` request and recovery afterwards, a raw TLS-garbage probe bumping the handshake-failure
   counter, a WebSocket 101 upgrade counted against its upstream, and access-log line assertions for
   `$request_time` + the upstream triple (proxied, no-upstream `- - -`, and Upgrade `101`).
-- The whole suite (unit tests + 65 Python E2E scripts: every `tools/*_e2e.py` plus the root
-  scenario/compat/security/static/upstream suites) is re-run after these changes:
-  every E2E script passes with real traffic (`python run_regression.py summaryE.txt` →
-  `TOTAL 65 scripts, nonzero=0`, 2026-10-19) and `cargo test --workspace` passes.
+- `tools/front_proxy_e2e.py`: 54/54 passing — CDN awareness proved on both sides of the trust gate, over
+  six ports (`conf/front_proxy_e2e.conf`: egress+`auto_trust`, an out-of-range control, `auto_trust off`,
+  `detect`, an origin vhost with `proxy_cache`, and a Python fake origin). The address rewrite is proved
+  where it matters — the access log's first column and a `geo $net` derived variable — and the forged case
+  is proved to change *nothing* while still being labelled. `limit_req` gives the causal split: the same 8
+  faked client addresses are 8 buckets on the egress vhost (all 200) and one bucket on both controls
+  (node address, 429s). `Cache-Status` is asserted as a real `MISS→HIT` pair with exactly **one** origin
+  request, as ours appended after an upstream `Cache-Status`, and as absent on an unverified peer. The
+  config layer gets its own `-t` rejections (inert `auto_trust`, `egress` with no range, mode typo, bad
+  CIDR, mode without profiles), and the advisory layer is asserted to stay one line per profile after
+  dozens of blocked requests.
+- The whole suite (386 unit tests + 73 Python E2E scripts: every `tools/*_e2e.py`
+  plus the root scenario/compat/security/static/upstream suites) is re-run after
+  these changes: every E2E script passes with real traffic
+  (`python run_regression.py frontProxy.txt` → `TOTAL 73 scripts, nonzero=0`,
+  2026-10-20 — the run that covers `front_proxy` 54/54 alongside the three learning
+  suites, `learning_cache` 34/34, `queue_learning` 42/42 and `vip_learning` 51/51) and
+  `cargo test --workspace` → 386/386
+  (373 in `onrouter-server` + 13 in `onrouter-config`).
   `python run_regression.py <name>.txt` runs all of them and writes the exit-code
-  roll-up plus per-script logs under `logs/regression/`.
+  roll-up plus per-script logs under `logs/regression/`. `tls_legacy_e2e.py` rebuilds
+  the release binary with `--features native-tls` and restores the default build, so
+  never start two suites at once on this host.
 - The official suite is vendored under `vendor/lua-nginx-module/t/` (gitignored) as a semantics
   reference. Running a full `.t` directly via Test::Nginx requires a real OpenResty binary as
   `TEST_NGINX_BINARY` plus `*_by_lua_block` syntax and Unix signals, which do not run on this Windows
@@ -577,6 +817,21 @@ them as standalone runnable assertion scripts.
 - `bench_ab.py` runs ONRouter vs OpenResty on the same endpoints (Windows and Linux);
   `tools/linux_ab.sh` renders an OpenResty config into a temporary prefix and runs the sweep.
   Procedure, caveats, and the pending Linux baseline are in `docs/LINUX_AB.md`.
+- `bench_front_proxy.py` costs a single feature seam rather than a whole gateway, and it is the
+  pattern any new per-request path should follow. One binary serves five identically-shaped vhosts
+  that differ only in `front_proxy_mode` (`conf/bench_front_proxy.conf`: off / detect / egress +
+  `front_proxy_auto_trust` / egress without it / egress with no vendor headers at all), plus a floor
+  gateway that declares no `front_proxy` block whatsoever (`conf/bench_front_proxy_floor.conf`) — so
+  "cost of this seam" is separable from "cost of this vhost shape". Every row sends the *same*
+  header set, so the mode is the only variable. Before timing anything it proves each branch actually
+  ran: a `/who` Lua echo of `$remote_addr` / `$front_proxy` / `$front_proxy_verified` / `$scheme`,
+  `Cache-Status` on the buffered path, the first access-log field, and the per-window delta of
+  `onrouter_front_proxy_total{role=…}` around each cell — a row whose counters did not move is not
+  measuring that seam. Multiple passes take the median (single-pass numbers on this host carry
+  ~10% jitter, enough to invent a 10% difference on a code path that runs zero instructions).
+  Run it with `python bench_front_proxy.py --passes 5 --levels 1,32`; never at the same time as a
+  build or a regression pass, and never concurrently with `tls_legacy_e2e.py`, which swaps the
+  release binary to a `native-tls` build.
 - `docs/OPENRESTY_GAP_ANALYSIS.md` is the current capability/gap matrix with test evidence.
 - `docs/USR2_HOT_UPGRADE.md` explains why nginx-style USR2 needs a process-model change,
   gives two designs (SO_REUSEPORT handover / master+worker FD inheritance), and a Linux test plan.
@@ -625,6 +880,22 @@ Already done (previously listed as gaps, now implemented):
 - **`lua_shared_dict` capacity enforcement**: `set`/`incr` keep total usage within the declared
   capacity via Redis-style approximate LRU eviction; `safe_set` refuses to evict and returns
   `no memory` instead.
+- **`lua_shared_dict` disk cold tier — what it costs**: the `ngx.shared.DICT` bindings are
+  synchronous Lua calls, so a cold read is a disk read inside whichever VM worker is serving that
+  request. Three things keep that affordable: the cold index lives in memory (a key that was never
+  spilled resolves as a miss with **zero** disk I/O — asserted by frozen `cold_hit`/`entries` counters
+  under 200 real misses), values above `max_value` (default 64 KiB) are never written to the tier, and
+  every write goes to one background writer thread per store (temp file + rename). That last choice has
+  a visible consequence: an entry that was *just* evicted is not yet readable from disk, so a `get()`
+  landing inside that window returns `nil` instead of promoting it. The request thread never waits for
+  the disk, which is the intended trade — data that is only in flight between tiers is a brief
+  throughput miss, not corruption, and the next read gets it back (`tools/disk_cache_e2e.py` synchronises
+  on the `onrouter_dict_disk_pending_jobs` gauge wherever it needs the write to be durable).
+  `capacity()`/`free_space()` deliberately stay memory-tier-only; `num()`/`size()`/`get_keys()`/`ttl()`
+  span both tiers. `flush_all()` is not fooled by that window either: the store carries a generation
+  counter, so a spill that was still queued when the flush happened is discarded instead of registering
+  itself back into the index — otherwise a flushed zone would resurrect entries (and files) later, or
+  after a restart.
 - **Active health checks**: `health_check interval=… fails=… rises=… uri=… timeout=…` drives a
   background prober per upstream (in addition to passive `max_fails`/`fail_timeout`).
 - **WebSocket / Upgrade tunnel**: `proxy_pass` auto-detects Upgrade requests and, after completing the
@@ -728,8 +999,17 @@ Already done (previously listed as gaps, now implemented):
   reads the singleton and renders it in the Prometheus text exposition format (`# HELP`/`# TYPE` +
   `onrouter_uptime_seconds`, `onrouter_connections_{accepted,active,capacity}`,
   `onrouter_http_requests_total`, `onrouter_http_responses_total{class="…"}`, the cache/TLS/limit/log
-  families above, the upstream-server families, and the Lua scheduling-path counters
-  `onrouter_lua_phase_{inline,adopted,scheduled}_total`), escaping label values. It uses the singleton
+  families above, the upstream-server families, the cold-tier gauges
+  `onrouter_dict_disk_{entries,bytes,value_bytes,capacity_bytes,pending_jobs,pending_bytes}{dict=…}`
+  and `onrouter_dict_disk_operations_total{dict,op="spill|spill_skipped|cold_hit|promote|evict|expire|corrupt|cold_error|never_read|warm_recovered"}`
+  (only for zones that actually declared `disk=`, so a diskless deployment carries no zero-valued noise
+  series), and the Lua scheduling-path counters
+  `onrouter_lua_phase_{inline,adopted,scheduled}_total`, and the CDN-awareness counter
+  `onrouter_front_proxy_total{profile,role="matched|ip_applied|ip_blocked|origin_applied|origin_blocked|country_applied"}`
+  — one series per declared profile and role, nothing rendered when no profile is declared, so
+  `ip_blocked` climbing while `ip_applied` stays at 0 is the signature of "recognised but the rewrite was
+  not authorised"; the counters live with the profile table, so `SIGHUP` restarts them, exactly as nginx's
+  `stub_status` counters restart on reload), escaping label values. It uses the singleton
   because the native handler signature has no access to `AppState`. (`metrics.rs`, `server.rs`,
   `engine.rs`, verified by `tools/metrics_e2e.py` 38/38 and `tools/observability_e2e.py` 26/26 with
   real traffic: with traffic interleaved between two scrapes, `requests_total`/`2xx`/`4xx` deltas track
@@ -797,31 +1077,162 @@ Already done (previously listed as gaps, now implemented):
   `connect` still uses system resolution.
 - **`proxy_cache` response caching**: an in-memory, named-zone cache (`proxy_cache.rs`) for the
   `proxy_pass` path. Directives: `proxy_cache <zone>|off`, `proxy_cache_key <template>` (default
-  `$scheme$proxy_host$request_uri`), `proxy_cache_valid <codes…|any> <time>` (multi-line),
+  `$scheme$proxy_host$request_uri`; variables are lexed on the template itself rather than on the
+  half-substituted string — a naive text replacement of `$proxy_host` with a dotted-numeric
+  authority turns the *preceding* `$scheme` into the non-existent `$scheme127`, and the key keeps an
+  unexpandable literal), `proxy_cache_valid <codes…|any> <time>` (multi-line),
   `proxy_cache_methods` (default `GET HEAD`), `proxy_cache_min_uses` (default 1),
   `proxy_cache_lock on` + `proxy_cache_lock_timeout`, `proxy_cache_use_stale
-  error|timeout|updating|http_xxx`, `proxy_cache_bypass`, `proxy_no_cache`; top-level
+  error|timeout|updating|http_xxx`, `proxy_cache_bypass <v…>` / `proxy_no_cache <v…>` (both take
+  multiple values and follow nginx truthiness: a value counts only when it expands to a non-empty
+  string that is not `"0"`, so `proxy_no_cache $arg_nc` stays inert until `?nc=` is actually given),
+  `proxy_ignore_headers <name…>` (case-insensitive) which removes the named upstream headers from
+  the *cache-decision* view only — an ignored `Cache-Control: no-store` no longer forbids caching and
+  an ignored `Set-Cookie` no longer blocks storing, while both are still forwarded to the client
+  unchanged; top-level
   `proxy_cache_path … keys_zone=<name>:<size>` sets per-zone capacity (128 B/entry; the path itself
   is never written — the cache is memory-only). Freshness precedence matches nginx: the upstream's
   own `Cache-Control`/`Expires` wins (and an explicit `no-store`/`no-cache`/`private`/`max-age=0`
   forbids caching outright), falling back to `proxy_cache_valid` only when the upstream gives no
-  hint. Responses carrying `Set-Cookie` are never stored (shared-cache safety).
+  hint. Responses carrying `Set-Cookie` are never stored (shared-cache safety) unless
+  `proxy_ignore_headers Set-Cookie` says otherwise.
   `proxy_cache_lock` coalesces concurrent same-key misses into one origin fetch (20 concurrent
   requests → exactly 1 backend hit, 1 `MISS` + 19 `HIT`). Expired entries stay in memory for an
   hour so `proxy_cache_use_stale` can replay them (`STALE`) on origin 5xx, connect failure, or while
   another request is already refreshing (`updating`, served immediately without queueing on the
-  lock). `bypass` skips reads but still stores the fresh response; `no_cache` skips both. HEAD
+  lock). Matches nginx's split: `proxy_cache_bypass` skips the *read* but still stores the fresh
+  response, `proxy_no_cache` only skips the *store* (a later normal request can still hit). HEAD
   requests can be served from a GET-populated entry (the HTTP layer suppresses the body) but never
   populate the cache themselves, so an empty HEAD response cannot poison the shared GET key. Zones
   evict least-recently-used entries at capacity, expired entries are cleaned as writes accumulate, and a
   config reload applies new `keys_zone` sizes to live zones. Every response through a cached
-  location carries `X-Cache-Status: HIT|MISS|EXPIRED|BYPASS|STALE`, and the same status feeds
-  `onrouter_cache_requests_total{status=…}` on `/metrics`.
-  (Verified by `tools/proxy_cache_e2e.py` 13/13 and `tools/cache_advanced_e2e.py` 32/32: concurrent
+  location carries `X-Cache-Status: HIT|MISS|EXPIRED|BYPASS|STALE` — `BYPASS` also covers "the origin
+  answer was fetched but deliberately not stored" (blocked by `proxy_no_cache`, `Set-Cookie`,
+  `min_uses` or a non-cacheable method), and the same status feeds
+  `onrouter_cache_requests_total{status=…}` on `/metrics`. `$upstream_cache_status` is exposed as a
+  built-in variable for `add_header`/`proxy_set_header`/`access_log`/cache keys, and is an **empty
+  string** when the request never engaged the cache (POST and other non-idempotent methods, streaming
+  bodies, a location without `proxy_cache`), so `add_header X-Cs $upstream_cache_status` emits an empty
+  header instead of a literal — same as nginx.
+  (Verified by `tools/proxy_cache_e2e.py` 13/13, `tools/cache_advanced_e2e.py` 32/32: concurrent
   coalescing, 502/error/updating stale replay, bypass/no_cache, keys_zone-driven LRU, and HEAD
-  non-poisoning; `tools/observability_e2e.py` asserts the status→counter mapping 1:1.) Not yet
+  non-poisoning; `tools/observability_e2e.py` asserts the status→counter mapping 1:1; and
+  `tools/cache_header_gap_e2e.py` 25/25 for the semantics aligned in this round: `add_header` variable
+  expansion, `$upstream_cache_status` on a POST, multi-value `proxy_cache_bypass` / `proxy_no_cache`
+  including all-`"0"` and never-set variables, and `proxy_ignore_headers` with a control location that
+  does not ignore.) Not yet
   implemented: revalidation (`If-None-Match` to origin), `proxy_cache_purge`, `proxy_cache_lock_age`,
-  on-disk persistence, `Vary`-aware keying, and the `$upstream_cache_status` variable.
+  on-disk persistence, `Vary`-aware keying.
+- **Learning (ONRouter-only: cache admission, queue depth, client reputation)**: three small online
+  models, all built on the premise that a gateway that learns must still be a gateway whose memory you
+  can state in one sentence. Everything hangs off `learning on;` (**off by default**; with it off, the
+  admission check, the depth lookup and the reputation lookup each short-circuit, so the shipped
+  default build is the un-learned build) and off one process-level byte ledger
+  (`learning_memory_budget`, default 1 MiB) that every structure claims from and releases back. Tables
+  are rounded *down* to whole slots and the rounding remainder is returned to the ledger immediately,
+  so `onrouter_learning_memory_bytes{role="used"}` equals the sum of the per-zone table bytes exactly —
+  the E2E asserts that identity rather than trusting a comment.
+  What each model is, and what it deliberately is not:
+  **Cache** (`proxy_cache_learning <zone> [sketch=<size>]`): TinyLFU, i.e. a 4-row × 4-bit count-min
+  sketch whose estimate is the min over rows and whose aging is a whole-table halving every time each
+  counter has been written once on average. It answers exactly one question — may this newcomer take a
+  slot from the coldest of the 8 oldest entries — so the property being bought is that a scan of
+  one-shot URLs no longer evicts the object everyone actually reads. It is not a hit-rate predictor and
+  it changes nothing about TTLs, `use_stale`, or the revalidation gap above.
+  **Queue** (`limit_req_queue <zone> [depth] [depth_min] [max_delay]` + `limit_req_learning <zone>
+  [table]`): the learned quantity is the length of a key's *finished* bursts (a gap larger than
+  `gap_cap`, 2× the token period clamped to 20 ms…1 s, is what commits a length), and it only ever
+  moves the per-key depth inside `[depth_min, depth]` — `depth` stays the operator's hard ceiling and
+  is clamped at 4096. A burst that reaches `depth × 4` without ever ending is classified as a flood and
+  the memory is zeroed mid-burst **and** at burst end, so "attack for a minute then stop" cannot buy a
+  deep queue either. Admitting a request to the queue reserves its token (`st.tokens -= 1.0`, the bucket
+  goes into debt), which is why a queued request never gets a 429 after waiting — and why the E2E sleeps
+  between phases: that debt must be repaid at the configured rate before the next phase measures it.
+  **Reputation** (`vip_learning [table] [min] [decay]`): the only signal is the rate limiter's own verdict
+  — in-rate `+1`, queued `0`, rejected `−8`, decayed by 1 point per `decay` of silence — so nothing a
+  client sends (header, cookie, path, User-Agent) can claim VIP status; it has to be earned from
+  behaviour the limiter already observed. The key is `$remote_addr` (that is all a `limit_req_zone` can
+  key on), which is why the E2E runs on `realip`-presented virtual client addresses. It acts on two
+  places and no others: a trusted key's queue opens to the configured ceiling instead of the learned
+  floor — the **rate is untouched**, the same token bucket still releases one request per period, so
+  this reorders waiting, it does not permit more traffic — and objects written on behalf of a trusted
+  key get a fixed `+4` sketch boost applied *after* the admission check, so reputation buys retention,
+  never a jump past admission. Everything else about being "important" is explicitly out of scope.
+  Aging/decay counters are driven by writes and by silence, never by a background thread, and there is
+  no cross-process or shared-memory state: a reload rebuilds in place, `apply_queue`/`apply_vip` reuse
+  an unchanged table by comparing the **operator-requested** size (not the rounded allocation) so a
+  reload that changes nothing else never wipes live reputation.
+  `-t` knows all six directives, prints a per-zone learning summary, and warns rather than fails on a
+  bad size/`min`/unknown argument (falling back to the default and saying so); referencing a
+  `limit_req_queue`/`limit_req_learning`/`proxy_cache_learning` zone that was never declared is an
+  error. Metrics: `onrouter_learning_enabled`, `onrouter_learning_memory_bytes{role="used|budget"}`,
+  `onrouter_learning_budget_denied_total`, `onrouter_cache_learning_sketch_bytes{zone}`,
+  `onrouter_cache_learning_aging_total{zone}`, `onrouter_cache_learning_events_total{zone,role=
+  "admission_rejected|evicted_cold|retained"}`, `onrouter_queue_depth{zone,kind="min|max|learned"}`,
+  `onrouter_queue_max_delay_ms{zone}`, `onrouter_queue_occupied{zone,kind}`,
+  `onrouter_queue_events_total{zone,role}`, `onrouter_queue_wait_ms_total{zone}`,
+  `onrouter_queue_depth_adjust_total{zone}`, `onrouter_queue_table_bytes{zone}`,
+  `onrouter_queue_table_slots{zone,kind}`, `onrouter_vip_table_bytes`, `onrouter_vip_slots{kind}`,
+  `onrouter_vip_score{kind="threshold|max"}`, `onrouter_vip_clients`, `onrouter_vip_decay_ms`,
+  `onrouter_vip_events_total{role="passed|queued|rejected|promoted|demoted|collision"}`. The slot table is
+  direct-mapped, so collisions are expected; the rule is that the **newcomer loses** — a key that hits a
+  slot still holding reputation never erases it (`role="collision"` counts how often that happened, and a
+  growing number means `table=` is too small). Reputation is keyed on the client address, so combining
+  `vip_learning` with `set_real_ip_from` makes part of that key client-asserted; `-t` warns about it
+  (it cannot change whether a request is allowed, only queue depth and cache retention). Runnable examples live in
+  `conf/learning_cache.conf`, `conf/queue_learning.conf` and `conf/vip_learning.conf`; verification is
+  `tools/learning_cache_e2e.py` (34/34), `tools/queue_learning_e2e.py` (42/42),
+  `tools/vip_learning_e2e.py` (51/51) plus the unit tests in `learning.rs`, `limit.rs`, `proxy_cache.rs`
+  and `vip.rs`. Not learned, on purpose: nothing per-user across processes, no rate limits being
+  relaxed for anyone, and no model whose output can only be read off a dashboard — every effect above is
+  asserted through the response a client actually got.
+- **Still ONLine (last-known-good replay)**: a second, deliberately separate layer (`still_online.rs`)
+  for "the origin is down, keep serving what this URL looked like". `proxy_cache` cannot host those
+  copies: its capacity is an *entry count* derived from `keys_zone`, its lifetime is bound to the TTL and
+  `use_stale` window, and its entries are exactly what a revalidation is supposed to replace — a
+  last-known-good copy must survive all of that. So zones are declared as **byte** budgets
+  (`still_online_zone <name> <size>;`, floored at one entry cap so a zone can always hold one copy) and
+  opened per server or location with `still_online <zone>;` (`off` re-disables, and a location that
+  references a zone nobody declared is a `-t` **error**, not a warning).
+  Retention/pricing knobs per block: `still_online_max_age` (default 7 d — older than that the copy is
+  dropped on read rather than shown), `still_online_max_body` (default 1 MiB — bigger responses are
+  skipped, never truncated), `still_online_retry`/`_retry_max`/`_retry_deadline` (default 5 s / 300 s /
+  30 min backoff curve for the background re-fetch).
+  What enters a zone: an anonymous (no `Cookie`, no `Authorization`) **`GET`** whose upstream answer was
+  `2xx` and carried **no `Set-Cookie`**, buffered, not an internal subrequest, and not excluded by
+  `proxy_no_cache`. What replays: origin connect/read failure **or** an upstream 5xx (a crashing backend
+  mostly answers 500/502 first), producing the stored status/body with `X-Still-Online: stale`, a real
+  `Age`, and `$still_online` = `STALE` for logs/`add_header`; `X-Cache-Status` stays whatever the cache
+  layer said because the two are independent. Cold miss stays honest: no `still_online_page` is served
+  by default — you get the normal `502` (nginx has no such directive at all, so inventing a friendly
+  error page here would only hide an outage).
+  Recovery is health-triggered, not request-triggered: every replay parks the key in a bounded dirty
+  table, and a background loop (1 s tick) re-drives an **anonymous** `GET` for due keys through the
+  normal `process()` pipeline — so `rewrite`, location matching, `limit_req`, `allow`/`deny`
+  and `auth_basic` apply to the re-fetch exactly as to a client request, and the successful answer is
+  stored by the same write gate rather than a second copy path. Single-flight falls out of the table
+  (`due_jobs` removes the key when it hands it out), failures back off exponentially and give up after
+  the deadline, and a response that itself carries `X-Still-Online` counts as a failure (that "success"
+  was only ever our own stale copy). Jobs for zones removed by a config reload are dropped with the
+  zone.
+  Credential rules are hardcoded and have **no off switch** — this is the part that would otherwise
+  leak a login: `Set-Cookie` responses are never stored, `Set-Cookie` is stripped from every replay, and
+  a credentialed request never writes. `still_online_allow_credentials on` relaxes *only* the credentialed
+  read (a logged-in visitor may be shown the shared public copy); it cannot make a copy containing a
+  session be stored or replayed. Non-`GET` methods are never replayed, so nobody's "action" is answered
+  from another visitor's copy.
+  A fourth hardcoded rule covers the case where the credential is not in a credential header: the copy
+  key is `$scheme$proxy_host$request_uri`, so if the *upstream* says the response belongs to this one
+  visitor — `Cache-Control: private` / `no-store` / `no-cache` / `max-age=0`, a zero hinted TTL, or
+  `Vary` naming anything but `Accept-Encoding` — it is not stored either. A tenant authenticated by a
+  custom header looks anonymous to the three credential gates above; the response's own cache directive
+  is what says it is not public. Same predicate `proxy_cache` already uses, so the two layers cannot
+  disagree.
+  Metrics: `onrouter_still_online_total{kind="stored|served|refreshed|refresh_failed|rejected_credential|rejected_private|evicted"}`,
+  `onrouter_still_online_pending_jobs`, `onrouter_still_online_zone_entries{zone}` and
+  `onrouter_still_online_zone_bytes{zone,role="used|budget"}`. Verified by
+  `tools/still_online_e2e.py` (25/25, real kill + restart of the backend) and 22 unit tests in
+  `still_online.rs` / `router.rs`.
 - **HTTP/2 serving**: ONRouter serves HTTP/2 over both transports. On TLS endpoints the `h2` protocol is
   negotiated through ALPN (`listen … ssl http2`). On cleartext endpoints `http2 on;` turns on
   prior-knowledge h2c: the connection layer peeks the first 24 bytes with `MSG_PEEK` (`TcpStream::peek`,
