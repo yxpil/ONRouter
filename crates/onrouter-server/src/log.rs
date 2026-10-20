@@ -335,24 +335,54 @@ pub fn with_log(level: Level, msg: String) {
     }
 }
 
+/// 这条级别现在会落盘吗？给宏做**前置**判定用。
+///
+/// 为什么要在调用点判：`format!(...)` 是实参，展开后无条件执行 —— 生产阈值 warn 下，
+/// 每个请求一路 `log_debug!` 都要付一次字符串构造与堆分配，消息最后又被扔掉。
+/// 请求路径上的诊断因此变成了真实性价成本（front_proxy 的 egress 档首次压测就被这项吃走）。
+pub fn enabled(level: Level) -> bool {
+    match LOG.get() {
+        Some(log) => log.enabled(level),
+        // 未初始化时 with_log 只把 warn 以上打到 stderr，判定必须与它一致
+        None => level >= Level::Warn,
+    }
+}
+
+// 四档宏都先判级别再 format —— 见 [`enabled`]。
 #[macro_export]
 macro_rules! log_error {
-    ($($arg:tt)*) => { $crate::log::with_log($crate::log::Level::Error, format!($($arg)*)) };
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::Level::Error) {
+            $crate::log::with_log($crate::log::Level::Error, format!($($arg)*))
+        }
+    };
 }
 
 #[macro_export]
 macro_rules! log_warn {
-    ($($arg:tt)*) => { $crate::log::with_log($crate::log::Level::Warn, format!($($arg)*)) };
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::Level::Warn) {
+            $crate::log::with_log($crate::log::Level::Warn, format!($($arg)*))
+        }
+    };
 }
 
 #[macro_export]
 macro_rules! log_info {
-    ($($arg:tt)*) => { $crate::log::with_log($crate::log::Level::Info, format!($($arg)*)) };
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::Level::Info) {
+            $crate::log::with_log($crate::log::Level::Info, format!($($arg)*))
+        }
+    };
 }
 
 #[macro_export]
 macro_rules! log_debug {
-    ($($arg:tt)*) => { $crate::log::with_log($crate::log::Level::Debug, format!($($arg)*)) };
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::Level::Debug) {
+            $crate::log::with_log($crate::log::Level::Debug, format!($($arg)*))
+        }
+    };
 }
 
 #[cfg(test)]
@@ -387,5 +417,29 @@ mod tests {
             dropped: Arc::new(AtomicU64::new(0)),
         };
         assert!(!off.enabled(Level::Crit), "off 级别不产生任何日志");
+    }
+
+    /// 消息构造次数计数：用来证明"级别没过时 format! 根本没执行"。
+    static FORMATTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    struct Counted;
+    impl std::fmt::Display for Counted {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            FORMATTED.fetch_add(1, Ordering::SeqCst);
+            write!(f, "counted")
+        }
+    }
+
+    #[test]
+    fn below_threshold_message_is_never_built() {
+        // 单测进程不调用 log::init ⇒ LOG 未落地 ⇒ 只有 warn 以上才会走 stderr
+        assert!(!enabled(Level::Debug) && !enabled(Level::Info));
+        assert!(enabled(Level::Warn) && enabled(Level::Error));
+        log_debug!("{Counted}");
+        log_info!("{Counted}");
+        assert_eq!(
+            FORMATTED.load(Ordering::SeqCst),
+            0,
+            "低于阈值的诊断日志不该构造消息 —— 请求路径上每一次 format! 都是实打实的堆分配"
+        );
     }
 }

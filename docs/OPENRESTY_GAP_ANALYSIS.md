@@ -1,7 +1,11 @@
 # ONRouter vs OpenResty — Gap Analysis
 
-Updated: 2026-10-19 (v0.4.0, Windows host). This revision also folds in the
-cache/header-semantics round (`proxy_ignore_headers`, multi-value
+Updated: 2026-10-20 (v0.5.0, Windows host). This revision also folds in the
+front-proxy seam (`front_proxy` profiles + `front_proxy_auto_trust`, its vendor-side config-only
+example `conf/front_proxy_examples.conf`, and the measured cost of that seam), the
+`log_debug!`/`log_info!` level gate that stopped building a `format!` string for a line that was
+never going to be written, and the previous round's cache/header semantics
+(`proxy_ignore_headers`, multi-value
 `proxy_cache_bypass`/`proxy_no_cache`, `add_header` variable expansion,
 `$upstream_cache_status`) and the REWRITE-phase `set`/`if` subset. Previous
 revisions of this document were written before the `ngx_lua` async surface landed
@@ -191,7 +195,21 @@ The remaining gaps are concentrated in four areas:
   Evidence: `tools/front_proxy_e2e.py` 54/54 (six ports: rewrite proven through the access log and a `geo`
   variable, forged headers proven inert, `limit_req` splitting 8 faked clients on the egress vhost while both
   controls lump them, real `MISS→HIT` with exactly one origin request, one-shot advisories), 13 `front_proxy`
-  + 1 `router` unit tests.
+  + 1 `router` unit tests. Vendor knowledge stays data, not code: `grep -a -i -o` over the 0.5.0 release binary
+  finds 0 occurrences of `Cloudflare`/`Fastly`/`CloudFront`/`Akamai` and 0 of their header names (`CF-Ray`,
+  `True-Client-IP`, `CloudFront-Viewer-Address`, …), while the control words `front_proxy`/`auto_trust`
+  occur 48/10 times — the only baked-in header names are nginx's own (`x-real-ip` as the `real_ip_header`
+  default, `x-forwarded-for` in the header interning table and in `$proxy_add_x_forwarded_for`).
+  `conf/front_proxy_examples.conf` ships the copy-paste profiles for Cloudflare, CloudFront and a plain-XFF
+  self-built edge, each naming where to refresh that provider's ranges (ranges are a rolling announcement),
+  and that file is itself executed rather than eyeballed: `tools/front_proxy_examples_e2e.py` 24/24 — config
+  layer (`-t` accepts it and echoes all three profiles, the address chain in written order, 22/0/3 ranges, no
+  `auto_trust` advisory on a `detect`-only example) and runtime layer (a full Cloudflare header set labels
+  `cloudflare-edge` while `$remote_addr`, the access-log first field and both rewrite counters stay untouched
+  because the loopback peer is outside the ranges; the probe is AND-ed, so `CF-Connecting-IP` alone is not
+  recognised while `CF-Ray` alone is; CloudFront's `ip:port` shape labels `cloudfront-edge` and a profile with
+  0 ranges can never self-authorise; XFF alone labels the self-built profile; a request claimed by two
+  profiles goes to the first declared; per-profile counters do not cross accounts).
 - **REWRITE-phase conditionals**: `set $var <value…>` (request-scoped, interpolated, last write wins,
   may shadow a built-in) and `if ($v)` / `if (!$v)` / `=`, `!=`, `~`, `~*`, `!~`, `!~*` wrapping
   `rewrite`/`set`/`return`, executed in config order alongside `rewrite`. Unsupported forms (nested

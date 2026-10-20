@@ -576,11 +576,25 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   and the `-t` rejections) + 13 unit tests in `front_proxy.rs` and router test
   `front_proxy_config_validation`. **When you declare a real provider**, take its header names and `trust`
   ranges from its own published list at deploy time rather than from a table in this repo — the ranges are
-  a rolling announcement, and some of its headers are *not* trust-critical: `True-Client-IP` and
-  `CF-Connecting-IP`-style headers are only meaningful from that provider's ranges (which is exactly what
-  the gate enforces), `Fastly-Client-IP` is only added when absent, and `CloudFront` deletes the generic
-  `X-Forwarded-For`/`X-Real-IP` and uses `CloudFront-Viewer-Address` (`ip:port`) instead — so verify against
-  the vendor docs, and keep the ranges in the config file where `-t` can check them.
+  a rolling announcement, and some of its headers are *not* what they look like: `True-Client-IP` and
+  `CF-Connecting-IP` are only meaningful from that provider's ranges (which is exactly what the gate
+  enforces), Cloudflare documents `True-Client-IP` as Enterprise-plus-managed-transform and says the two
+  differ "besides the name" only, Cloudflare also overwrites a client-supplied value of these headers and
+  can strip visitor-IP headers entirely with the "Remove visitor IP headers" transform (then the profile
+  matches but never applies an address), Fastly only adds `Fastly-Client-IP` when absent, and CloudFront
+  **appends** the viewer IP to `X-Forwarded-For` (creating it when absent) while removing `X-Real-Ip`, so
+  XFF is a fallback there, not a first choice — its `CloudFront-Viewer-Address` (`ip:port`, non-ASCII
+  percent-encoded per RFC 3986) must be enabled in an origin request policy and cannot go in a cache
+  policy. A request without it simply does not match that profile, which is the intended "no evidence, no
+  claim". Verified against those three docs on 2026-10-20 and written up as copy-paste profiles in
+  `conf/front_proxy_examples.conf` (Cloudflare / CloudFront / a plain-XFF self-built edge, each with how to
+  refresh its ranges) — keep that in the config file where `-t` can check it, never in the binary. That file
+  is booted, not eyeballed: `tools/front_proxy_examples_e2e.py` (24 checks) runs the gateway on it and proves
+  both halves — `-t` echoes all three profiles with their chains and 22/0/3 range counts, and at runtime a
+  full Cloudflare-shaped header set is *labelled* but never *applied* from a loopback peer, the probe is
+  AND-ed, and per-profile counters stay in their own accounts. `grep -a -i -o` over the 0.5.0 release binary
+  finds 0 hits for any provider name or its headers, while the controls `front_proxy`/`auto_trust` hit 48/10
+  times.
 - Proxy response-header rewrite — the nginx `proxy_redirect` + `proxy_cookie_domain`/`proxy_cookie_path`
   (`resp_rewrite.rs`). These are config-time string rewrites applied to the upstream `Location`/`Refresh`
   and `Set-Cookie` response headers. `proxy_redirect <match> <replacement>` (repeatable) treats `match` as a
@@ -831,7 +845,15 @@ them as standalone runnable assertion scripts.
   ~10% jitter, enough to invent a 10% difference on a code path that runs zero instructions).
   Run it with `python bench_front_proxy.py --passes 5 --levels 1,32`; never at the same time as a
   build or a regression pass, and never concurrently with `tls_legacy_e2e.py`, which swaps the
-  release binary to a `native-tls` build.
+  release binary to a `native-tls` build. Measured on this host (2026-10-20, 5 passes, n=8000 at
+  c=1 / 38400 at c=32, `logs/bench_fp_run.log` then `logs/bench_fp_loggate.log`): read every cell as
+  *that row against its own `off` row*, because the floor row's per-cell round spread reached 36% and
+  cannot carry a claim. `detect` costs nothing measurable (−0.6% … +2.6%, inside jitter) — it returns
+  after labelling, before address parsing. `egress` — the only row that rewrites, and the only one that
+  emits the per-request `log_debug!` — cost −0.4% … −9.2% at c=1 and −1.6% … −3.9% at c=32 before that
+  diagnostic was gated, and −0.4% … −4.8% / −1.6% … −4.2% after the log macros started checking
+  `log::enabled(level)` before building their `format!` string. The rest of the egress cost is the
+  per-request `String`/`Vec` clones on the rewrite path, not the log line.
 - `docs/OPENRESTY_GAP_ANALYSIS.md` is the current capability/gap matrix with test evidence.
 - `docs/USR2_HOT_UPGRADE.md` explains why nginx-style USR2 needs a process-model change,
   gives two designs (SO_REUSEPORT handover / master+worker FD inheritance), and a Linux test plan.

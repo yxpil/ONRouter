@@ -21,7 +21,7 @@ FROM debian:bookworm-slim
 
 LABEL maintainer="yxpil"
 LABEL description="ONRouter: High-performance gateway server like Nginx, 100% in Rust"
-LABEL version="0.4.0"
+LABEL version="0.5.0"
 LABEL org.opencontainers.image.source="https://github.com/yxpil/ONRouter"
 LABEL org.opencontainers.image.description="ONRouter Gateway Server"
 
