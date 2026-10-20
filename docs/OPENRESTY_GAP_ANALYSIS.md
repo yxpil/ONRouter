@@ -1,6 +1,9 @@
 # ONRouter vs OpenResty — Gap Analysis
 
-Updated: 2026-10-20 (v0.5.0, Windows host). This revision also folds in the
+Updated: 2026-10-20 (v0.6.0, Windows host). This revision also folds in the business traffic splitting
+(`split_clients` ratios driving `proxy_pass http://$var`, `proxy_split_failover`, and the declared-target
+allowlist that closes the SSRF door that feature opened), the
+adaptive upstream selection tier (`least_time off|observe|on`, P2C over a time-decayed latency EWMA), the
 front-proxy seam (`front_proxy` profiles + `front_proxy_auto_trust`, its vendor-side config-only
 example `conf/front_proxy_examples.conf`, and the measured cost of that seam), the
 `log_debug!`/`log_info!` level gate that stopped building a `format!` string for a line that was
@@ -137,6 +140,90 @@ The remaining gaps are concentrated in four areas:
   `sub_filter`, real-IP, rate/conn limits (over-rate can wait in a bounded, per-key-depth-adaptive
   queue instead of 429 — see **Learning** below), basic auth, `stream{}` L4 proxy with
   `ssl_preread`, `resolver` async DNS.
+- **Adaptive upstream selection — `least_time off|observe|on`** (the nginx Plus `least_time` idea, with a
+  deliberately different estimator): the pick is P2C — draw two distinct nodes, take the lower
+  `(inflight/weight + 1) × EWMA(header time)`; argmin was rejected because it herds every request onto the
+  current winner and oscillates. The EWMA is **time-decayed** (`α = 1 − e^(−Δt/τ)`, τ = `least_time_window`,
+  default 5 s) so convergence is a wall-clock property independent of QPS. nginx smooths by *response count*
+  with a fixed coefficient instead — it is a Plus feature and its source is not in this repo, so the
+  comparison stops at that difference of kind and quotes no constant. Two rules make the
+  estimator survivable: only a response **header** samples latency (connect failures and timeouts never enter
+  the EWMA — their "duration" is the timeout threshold — and stay with `max_fails`/`fail_timeout`; the
+  WebSocket `upgrade()` path deliberately samples nothing), and an estimate older than 4×τ is forgotten,
+  because observation only happens when a node is *chosen*, so a stale slow estimate would otherwise starve a
+  backend that had recovered. An unmeasured node scores negative and is therefore always explored first,
+  which covers cold start and revival in one mechanism. The rollout contract is the point: `off` touches no
+  atomics and renders no metric series, `observe` must reproduce `off`'s selection sequence exactly and only
+  counts `would_differ`, `on` replaces the pick. `ip_hash` plus a non-`off` tier is a `-t` **error** (declared
+  but inert), a one-node pool a `-t` **warning** — both printed to stdout because `-t` exits before the async
+  error-log writer drains. `upstream {}` is not hot-replaced: a tier change needs a restart and the reload log
+  says so. Evidence: `tools/least_time_e2e.py` 43/43 (three backends at 5/200/400 ms — spaced that wide because
+  this host's `sleep()` jitter is ±20 ms, and a ratio threshold with no margin against the jitter is a coin
+  flip, not a gate: `off` = exact 8/8/8 with
+  no least_time series before *or* after a full run; `observe`'s sequence is identical to `off`'s with
+  `sampled=24 picked=0 would_differ>0`; `on` gives the fast node ≥55% and halves client p50; a mid-run
+  400 ms/5 ms role swap migrates traffic while the old memory still earns ≥1 pick; a dead node keeps
+  `ewma_seconds == 0` while every client is served), 8 new `upstream.rs` unit tests including the 21-pick
+  sequence equality for `observe`. Cost/benefit measured separately by `bench_least_time.py` (one binary, one
+  vhost, four pools differing only by tier, three backends whose only variable is a `sleep`): against `off`,
+  `observe`/`on` landed inside their own round-to-round spread at both c=1 and c=32 (+6.0%/+7.6% at c=32,
+  −9.3%/−8.6% at c=1 where `off` alone spread 49%) — so no cost claim is made in either direction, only that
+  it is nothing like the 7–22% the front-proxy egress seam costs; with backends at 0/10/40 ms the same run
+  gives p50 11.55 ms → 0.83 ms (−92.8%) and 55 → 233 req/s at c=1, 10.99 ms → 1.00 ms (−90.9%) and
+  1645 → 5753 req/s at c=32 (spreads 1–6%), while `observe` reproduces `off` there too (p50 within 0.05 ms).
+  Read alongside its caveats: p99 stays at the slow backend's ~41 ms because re-exploring a stale node is the
+  designed behaviour, `on` is not round-robin (three equally-fast nodes served 24 probes as 12/1/11 — hence
+  the `observe` tier), and the single-node pool is backend-process-capped so it is a shape reference only.
+- **Business traffic splitting — `split_clients` ratios driving `proxy_pass http://$var`** (the ratio, the
+  MurmurHash2 bucketing and the sticky-key template are nginx's own `split_clients`; the branch ledger and
+  the `proxy_split_failover` policy are ONRouter additions, and the enumeration rule is an ONRouter
+  *restriction*). A bucket value is the host part of `proxy_pass`, so one branch = one whole service/version
+  release and that release's pool keeps doing its own node selection — splitting is pool-level, which the
+  E2E measures by counting the two nodes *inside* the winning pool. The one boundary the design refuses to
+  cross: a cross-branch re-route happens only while **no node of that branch has been handed the request
+  yet** (unknown branch name, empty bucket value, or every node inside `fail_timeout`); a backend `5xx`
+  never re-routes and a TCP refusal after an address was chosen belongs to that branch, because otherwise a
+  single `POST` would be written into two business versions. `on` (default) bleeds to the next declared
+  branch and counts it, `off` returns the failure unchanged (grey releases, non-replayable writes),
+  `http://target` touches only the named branch, and `0%` declares a branch the ratio can never pick but
+  failover can — which is also what `-t` tells you to write when you point the fallback somewhere that is
+  not in the ratio. Branch targets must be enumerable: a declared `upstream` name or `host:port`, never a
+  hostname the gateway would have to guess through DNS. **Where ONRouter is stricter than nginx:** nginx
+  accepts any variable in the host position and forwards to whatever it expands to, so
+  `proxy_pass http://$http_x_target/` is an operator footgun that turns the gateway into a client-driven
+  connector. ONRouter still allows the whole-segment form — `map`/`set`/`geo` choosing between pools is a
+  real pattern — but the expanded value must be a target the config declares (`upstream` name, literal
+  `proxy_pass` host, `split_clients` branch, or `proxy_split_failover` target); anything else is refused
+  before connect, on TCP and `Upgrade` both, and a variable concatenated *inside* the host position is a
+  `-t` error rather than a runtime surprise. See S13 in `docs/SECURITY_AUDIT.md` for how this was found and
+  measured.
+  Evidence: `tools/proxy_split_e2e.py` 76/76 (per-key agreement with an independently ported hash, 1200-key
+  ratio reproduction, `targets_total` deltas equal to backend-side counts, `routed` delta equal to requests
+  sent, `off` bleeding nothing while the stable branch's counters stay put, explicit fallback never touching
+  its sibling branch, `0%` reached by exactly one bleed and by no ratio, empty bucket as "no node here"
+  under `on` and a plain 502 under `off`, a 500-only branch bleeding nothing, refused connection ≠ dead
+  branch, per-branch cache entries) + 4 new unit tests over all 10 000 bucket coordinates;
+  `tools/proxy_split_examples_e2e.py` 24/24 runs the operator-facing
+  `conf/proxy_split_examples.conf` (1%/5%/* ladder, 30% grey under `off`, `0%` hotfix, and a literal
+  `/admin` that pays nothing); `tools/proxy_split_business_e2e.py` 32/32 runs a *day of traffic on a real
+  site* instead of a directive checklist — `conf/proxy_split_business.conf` models a UGC homepage host where
+  240 logged-in users (`${cookie_uid}`) each fetch their own cached homepage, hit an uncached feed endpoint
+  and POST one comment with a globally unique id, against three version pools, plus a 2%/18%/rest release
+  ladder, a grey branch under `off`, a pool that is entirely down mid-scenario and a `$remote_addr`-keyed
+  counter-example. Its assertions come out of the origins' own ledgers: every comment id exists exactly once
+  across all pools, a user never sees two versions in one session, the 18% is the precise key set the
+  reference hash predicts (not a sampled tolerance), the grey branch's failures leave the stable write ledger
+  untouched with `bled` still 0, the dead pool's first request is that branch's own `502` (`routed` only) and
+  only from the second request does the same user get bled to the next branch, and 50 distinct users on the
+  `$remote_addr` key collapse into a single branch — that last one is what "behind a CDN this switch flips
+  the whole site" measures as. `$proxy_split` vs `$proxy_split_served` is the attribution pair — unequal
+  means a bleed, and a cache `HIT` has the first filled with the second empty because nothing reached a
+  node. `bench_proxy_split.py` (seven locations, branches deliberately pointed at the *same* two backends
+  plus a literal row that carries the two attribution headers so header cost is not counted as split cost)
+  found no resolvable per-request cost on either build and, on the literal rows, **zero** movement in both
+  split counters over 16 000-request windows; the release build (5 passes, err=0 everywhere) puts the whole
+  path at +2.2%/+4.1% against the no-split baseline at c=8/c=32 while those rows' own round-to-round spread
+  is 4%/7%, so the defensible statement is an upper bound (≲5%), not a measurement.
 - **Proxy cache**: in-memory named zones with capacity from
   `proxy_cache_path … keys_zone=<name>:<size>` (LRU eviction — or, with `proxy_cache_learning`,
   admission and the eviction victim decided by a TinyLFU frequency sketch; expiry cleanup
@@ -195,10 +282,10 @@ The remaining gaps are concentrated in four areas:
   Evidence: `tools/front_proxy_e2e.py` 54/54 (six ports: rewrite proven through the access log and a `geo`
   variable, forged headers proven inert, `limit_req` splitting 8 faked clients on the egress vhost while both
   controls lump them, real `MISS→HIT` with exactly one origin request, one-shot advisories), 13 `front_proxy`
-  + 1 `router` unit tests. Vendor knowledge stays data, not code: `grep -a -i -o` over the 0.5.0 release binary
+  + 1 `router` unit tests. Vendor knowledge stays data, not code: `grep -a -i -o` over the 0.6.0 release binary
   finds 0 occurrences of `Cloudflare`/`Fastly`/`CloudFront`/`Akamai` and 0 of their header names (`CF-Ray`,
   `True-Client-IP`, `CloudFront-Viewer-Address`, …), while the control words `front_proxy`/`auto_trust`
-  occur 48/10 times — the only baked-in header names are nginx's own (`x-real-ip` as the `real_ip_header`
+  occur 49/10 times — the only baked-in header names are nginx's own (`x-real-ip` as the `real_ip_header`
   default, `x-forwarded-for` in the header interning table and in `$proxy_add_x_forwarded_for`).
   `conf/front_proxy_examples.conf` ships the copy-paste profiles for Cloudflare, CloudFront and a plain-XFF
   self-built edge, each naming where to refresh that provider's ranges (ranges are a rolling announcement),
@@ -235,6 +322,11 @@ The remaining gaps are concentrated in four areas:
   `onrouter_queue_table_bytes`/`table_slots`/`depth{kind="min|max|learned"}`/`occupied`/`events_total`/
   `wait_ms_total`/`depth_adjust_total`, and `onrouter_vip_table_bytes`/`slots`/`score`/`clients`/
   `decay_ms`/`events_total{role="passed|queued|rejected|promoted|demoted"}`),
+  adaptive upstream selection — `onrouter_upstream_least_time_mode{upstream}` (0/1/2),
+  `onrouter_upstream_server_ewma_seconds{upstream,server}` and
+  `onrouter_upstream_least_time_total{upstream,role="sampled|picked|would_differ|cold"}`, all rendered
+  **only** for pools whose tier is not `off`, so `would_differ` rising while `picked` stays at 0 is the
+  machine-readable form of "observe 档只测量" (`upstream.rs`, `metrics.rs`),
   TLS handshake failures, limit_req/limit_conn rejections, dropped access-log lines
   (`metrics.rs`, `tools/metrics_e2e.py` 38/38, `tools/observability_e2e.py` 26/26).
 - Access log (combined) with `$request_time` and the
@@ -271,6 +363,12 @@ The remaining gaps are concentrated in four areas:
   `return 200 "ip=$remote_addr uri=$uri"` responds `ip=$remote_addr uri=$uri`, while
   nginx returns the values. `content_by_rust echo`/`status` *do* interpolate, and so
   do header/cache-key surfaces, which makes the inconsistency easy to miss.
+- `least_time` implements nginx Plus's `header` mode only — there is no `last_body` variant (the estimate is
+  the response-header time, so a backend that streams a slow body looks as fast as one that answers quickly),
+  and there is no `sticky cookie`/`route` binding to pair it with. The estimate is also local to this gateway
+  process and to the pool built at startup: reload does not rebuild `upstream {}`, so a tier change needs a
+  restart (the reload log line says so), and two gateway instances in front of the same backends each learn
+  their own numbers.
 - Intentional divergences kept on purpose (both are fail-safe choices, not gaps):
   `if (…) { return …; }` applies its `return` **after** the ACCESS phase — together with a
   bare `return` — so a conditional response can never preempt `allow`/`deny`/`auth_basic`
@@ -385,7 +483,7 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
 
 ## 4. Verification inventory
 
-- Unit tests: 386 passing (`cargo test --workspace`; 373 in onrouter-server +
+- Unit tests: 395 passing (`cargo test --workspace`; 382 in onrouter-server +
   13 in onrouter-config).
 - E2E suites (real traffic), this snapshot:
   - `lua_concurrency` 5/5, `thread` 24/24, `cosocket` 7/7, `subrequest` 18/18
@@ -439,27 +537,41 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
     `Cache-Status` and exactly one origin request, ours appended after an upstream `Cache-Status` entry,
     none emitted for an unverified peer, per-profile metric deltas, one line per profile after dozens of
     blocked requests, the startup banner, and the five `-t` rejections)
+  - `least_time` 43/43 (adaptive upstream selection over three real backends deliberately spaced 5/200/400 ms —
+    this host's `sleep()` jitter is ±20 ms, so the spacing *is* the measurement margin for every ratio assertion,
+    and the thresholds themselves were not relaxed: `off` keeps an
+    exact 8/8/8 round robin *and* renders no least_time series before or after a full traffic run, `observe`
+    reproduces that sequence unchanged while `sampled=24 / picked=0 / would_differ>0`, `on` sends ≥55% to the
+    fast node and cuts client p50 by more than the required factor two, a mid-run 400 ms/5 ms role swap migrates
+    the traffic through the time-decayed estimate, a dead node is counted as a failure while its EWMA stays 0,
+    and the `-t` layer
+    prints each tier's own description, rejects `ip_hash` + `least_time` and warns (rc 0) on a one-node pool)
   - `security_matrix` 36/36 (the twelve findings from `docs/SECURITY_AUDIT.md`, each
     probe asserting the pre-fix failure mode is gone: fail-closed `auth_basic` and
     `allow/deny`, streamed-body `client_body_timeout` → 408, raw undecoded Upgrade
     request-target, htpasswd change visibility, `sub_filter` memory ceiling, Lua
     runaway-loop preemption, Still ONLine refusing `Cache-Control: private` copies,
-    cold-tier `create_new` temp files, non-address limit keys, VIP slot collisions), `rce_matrix` 27/27 (Lua source/path injection,
-    `internal` location escape, `proxy_pass` SSRF against a canary listener,
+    cold-tier `create_new` temp files, non-address limit keys, VIP slot collisions), `rce_matrix` 32/32 (Lua source/path injection,
+    `internal` location escape, `proxy_pass` SSRF against a canary listener — including the 0.6.0 case where a
+    *variable* sits in the host position, so a header- or query-supplied value must still resolve to a target the
+    config wrote down,
     encoded-CRLF splitting), `static_stream` 19/19, `streaming_body` 7/7
-  - Full regression: 73 scripts (8 root scenario/compat/security/static/upstream
-    suites + every `tools/*_e2e.py` incl. TLS matrix, HTTP/2, HTTP/3, hot reload,
+  - Full regression: 78 scripts (8 root scenario/compat/security/static/upstream
+    suites + every one of the 70 `tools/*_e2e.py` incl. TLS matrix, HTTP/2, HTTP/3, hot reload,
     the cache/header-semantics gap suite, the `set`/`if` suite, cache, the DICT disk
-    cold tier, Still ONLine, the three learning suites, CDN/front-proxy awareness,
+    cold tier, Still ONLine, the three learning suites, CDN/front-proxy awareness and its
+    vendor-example companion, adaptive upstream selection,
     filters, auth, stream, resty, security-matrix, rce-matrix and API-compat) —
     `summaryH.txt` had one failure (`http3_e2e` 7/8: its 5-concurrent-stream check
     reported 4, a QUIC stream-opening timing flake on this host; the script passed
     8/8 re-run alone), and the complete re-runs after the final binary changes
     (`summaryI.txt`, `summaryJ.txt` after the cache-key lexer fix, `learningTrio.txt`
-    after the learning trio + its `-t` zone check landed, and `frontProxy.txt` after
-    CDN awareness + its 54-check suite landed) are **all green, nonzero=0** (69/69
-    then, 72/72, 73/73 now). Run them with
-    `python run_regression.py frontProxy.txt` (per-script logs and the exit-code
+    after the learning trio + its `-t` zone check landed, `frontProxy.txt` after
+    CDN awareness + its 54-check suite landed, `leastTime.txt` and then `leastTimeFinal.txt`
+    after `least_time` + its 43-check suite landed — the latter re-run against the
+    rebuilt release binary) are **all green, nonzero=0** (69/69
+    then, 72/72, 73/73, 75/75 now). Run them with
+    `python run_regression.py leastTimeFinal.txt` (per-script logs and the exit-code
     roll-up land in `logs/regression/`; `tls_legacy_e2e.py` swaps the release
     binary to a `native-tls` build and restores it, so never run two suites at
     once on this host).

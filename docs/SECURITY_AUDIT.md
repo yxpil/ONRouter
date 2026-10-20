@@ -8,7 +8,7 @@ is covered by a probe that fails on the pre-fix binary and passes on the post-fi
 Harness: `tools/security_matrix_e2e.py` (S1-S7 + S9-S12) and `tools/rce_matrix_e2e.py`
 (remote-execution surface) — one gateway process per probe (no cross-contamination),
 backends that report what they actually received.
-Current result: **36/36** and **27/27 PASS**.
+Current result: **36/36** and **32/32 PASS** (R3 grew from 6 to 11 checks when S13 was closed).
 Post-fix regression (2026-10-20, after S9-S12): `cargo test --workspace` **360/360** and
 the full suite — `python run_regression.py secFixRound.txt` → `TOTAL 72 scripts,
 nonzero=0` (`logs/regression/secFixRound.txt`). Round 1 recorded 281 unit tests and a
@@ -18,6 +18,13 @@ restores the default rustls build. The CDN-awareness round added `tools/front_pr
 (54/54, the forged-header/out-of-range peer cases above) and brought the suite to 73 scripts:
 `python run_regression.py frontProxy.txt` → `TOTAL 73 scripts, nonzero=0` with
 `cargo test --workspace` **386/386** (2026-10-20, `logs/regression/frontProxy.txt`).
+The splitting round added S13 (a `proxy_pass` variable in the host position could be steered at any
+target by the request) and brought the suite to 78 scripts: `python run_regression.py
+reg_060_20261020.txt` → `TOTAL 78 scripts, nonzero=0` with `cargo test --workspace` **409/409**
+(2026-10-20, `logs/regression/reg_060_20261020.txt`). The rule that round leaves behind is recorded
+in the S13 entry below and applies to every future grammar widening: a config that passes `-t` is
+not evidence of safety — the rejection has to be observed at runtime, in the error log, with a
+legal control route still working next to it.
 
 | # | Finding (pre-fix behaviour) | Class | Fix | Probe |
 |---|---|---|---|---|
@@ -34,6 +41,7 @@ restores the default rustls build. The CDN-awareness round added `tools/front_pr
 | S10 | The DICT cold tier's file names are **predictable**, and the writer followed them. An entry path is a pure function of the key (FNV-1a-64 → `<disk>/<h[0]>/<h[0..3]>/<hex>.bin`) and the temp name is `<hex>.<pid>.tmp`; `atomic_write` used `File::create`, which **truncates whatever already lives at that name** — including a hard link someone else pre-placed. Any local actor able to create a link inside the `disk=` root could therefore have the gateway (a process with broader write access) overwrite an arbitrary file with cache bytes on the next spill. Same shape on the read side: `File::open` follows links, and `scan_rebuild` descended into symlinked directories (`p.is_dir()`) — deleting every `*.tmp` it found there | Predictable temp file → arbitrary file overwrite; link-following read | `atomic_write` now uses `OpenOptions::create_new(true)`: the temp name must be created by *this* write. `AlreadyExists` — a crashed predecessor's leftover — is resolved with one `remove_file` + retry, and unlink never touches another name's content. `read_path_at` requires `symlink_metadata().is_file()`, and the scan walk only descends real directories and only collects real files | `s10_dict_tmp_link_overwrite` (pre-fix: `victim.txt` became a 942-byte cache entry starting `ORDK\x01…`; post-fix the victim is byte-identical and the entry still lands and reads back — unit tests `disk_cache::tests::atomic_write_never_writes_through_a_pre_existing_temp_name`, `scan_does_not_follow_a_link_out_of_the_cache_root`) |
 | S11 | `limit_req_zone $http_x_api_key zone=bykey:1m rate=10r/s;` passed `-t`, logged a **warning**, and then keyed the zone by `$remote_addr` anyway. The variable is never expanded on the request path, so the operator thinks they rate-limit per API token while the gateway limits per IP — a silent policy inversion sitting on a security control | Fail-open configuration (misleading success) | `Router::build` rejects it as a hard error (non-zero `-t`, refuses to start), naming the variable and what *is* supported; `Limits::parse_all` dropped its own weaker second opinion so the two cannot diverge again | `s11_limit_key_var_is_a_hard_error` (pre-fix `rc=0`) + `router::tests::non_address_limit_zone_key_is_a_hard_error`, `limit::tests::only_address_keys_are_supported` |
 | S12 | The VIP reputation table is direct-mapped (`tag % n` — 682 slots at the default 8 KiB) and a new tag **overwrote** the incumbent with `score = 0`. `tag = murmur_hash2(client address)` is public and computable offline, so one request from a chosen address erased a long-standing VIP's reputation: an unauthenticated "demote anyone" switch (that client loses the queue-depth ceiling and the cache-retention boost). Blast radius is quality of service only — reputation is never part of the allow/deny decision | Reputation poisoning / QoS degradation | `note()` now lets the **newcomer** lose the slot whenever the incumbent still scores after applying its silence decay; a fully decayed incumbent still gives the slot up, so the table cannot be fenced off by dead entries. Collisions are counted — `onrouter_vip_events_total{role="collision"}` — because a rising collision count is how an operator sees the table is too small. Separately: `set_real_ip_from` + `vip_learning` means part of the reputation key is client-asserted (`X-Forwarded-For`), so `-t` prints a warning naming the vhost and the two behaviours it can influence (still exits 0) | `s12_vip_slot_collision` (pre-fix: after one request from `198.18.3.128`, `onrouter_vip_clients` fell to 0; post-fix the VIP keeps its score and `-t` warns) + `vip::tests::a_collision_never_wipes_an_incumbent_vip`, `a_fully_decayed_incumbent_relinquishes_the_slot`, `router::tests::realip_plus_vip_learning_warns_about_the_trust_root` |
+| S13 | Business splitting (0.6.0) let `proxy_pass` take a variable in its host position, and the check only asked *"is this a `split_clients` target?"* — a variable from `set`/`map`/`geo`/the request itself passed `-t` with a warning and then **connected wherever the request said**: `proxy_pass http://$http_x_target/` with `X-Target: 127.0.0.1:<canary>` returned `200` with the canary's body, and so did `?host=` on `http://$arg_host/`. That is the exact surface the round-1 SSRF entry claimed was closed — it was closed by those shapes not parsing at all | SSRF (self-inflicted regression, found pre-release) | Two layers. (1) A variable concatenated *inside* the host position cannot enumerate candidates → hard `-t` error. (2) A whole-segment variable that is not `split_clients`-produced keeps its route (so `map $http_x_env $backend` still works) but its interpolated value must be a target the config declares — a `upstream` name, a literal `proxy_pass` host, a `split_clients` branch, a `proxy_split_failover` target — else no socket is opened; enforced in both `forward()` and `upgrade()`, logged as `undeclared proxy_pass target`. Literal and split routes get `None` for the set, so they pay no lookup | `tools/rce_matrix_e2e.py` R3 (now 32/32): header- and query-controlled host → 502 with canary accept count unchanged, declared-pool control group → 200 (proves the block is not blanket); refusal reason asserted in the error log, not inferred from a 502. Unit: `variable_host_outside_allowlist_never_connects` (accept-counting canary backend), `declared_targets_only_lists_what_the_config_writes_down`, `only_variable_host_routes_carry_the_allowlist` |
 
 ## Verified as *not* vulnerable (probed or read, no finding)
 
@@ -108,10 +116,24 @@ thing: **client input must never become script source, script path, or upstream 
   **no request-driven file write** (no `client_body_temp` — bodies stay in memory or stream),
   **no `X-Accel-Redirect`**, and upstream responses are not gzip-decoded by us, so there is no
   decompression-bomb sink either.
-- **SSRF**: `proxy_pass http://127.0.0.1:$arg_port/` and `proxy_pass http://$http_x_host:$arg_p/` never
-  open a socket to a client-chosen target (canary listener accept count stayed at `0`); the variable that
-  looks like an upstream is forwarded as a literal, and a raw absolute-form request line
-  (`GET http://127.0.0.1:PORT/abs`) is rejected with 404 rather than proxied.
+- **SSRF**: the client cannot decide where the gateway connects, and that property is now enforced in two
+  places, not just by absence of a feature. A variable concatenated *inside* the host position
+  (`proxy_pass http://127.0.0.1:$arg_port/x`, `http://$http_x_host:$arg_p/`) cannot enumerate its candidates,
+  so `-t` rejects the config outright. A whole-segment variable (`http://$backend`) stays legal — `set`/`map`/`geo`
+  picking a pool is a legitimate pattern — but whatever it interpolates to at request time must be a target the
+  config already wrote down (a declared `upstream` name, a literal `proxy_pass` host, a `split_clients` branch, or a
+  `proxy_split_failover` target); anything else is refused before a socket is opened, logged as
+  `undeclared proxy_pass target` in both the TCP and the `Upgrade` path. Measured, re-verified 2026-10-20 with a
+  canary listener: `X-Target: 127.0.0.1:<canary>` and `?host=127.0.0.1:<canary>` → **502, canary accept count 0**,
+  while a `map`/`set` pointing at a *declared* pool still returns 200 (control group, so the refusal is not
+  "variables never work" and the block is not a false negative). A raw absolute-form request line
+  (`GET http://127.0.0.1:PORT/abs`) is still rejected with 404 rather than proxied.
+  **History worth keeping**: adding variable support to the host position for business splitting (0.6.0) reopened
+  exactly this hole for ~one development cycle — before the gate landed, the same two probes returned **200 with the
+  canary's body**, and the suite's own `-t` assertion had been quietly relaxed to "variable routes pass with a
+  warning". `tools/rce_matrix_e2e.py` R3 caught it; the probe now asserts the *stricter* semantics (config-layer
+  refusal + runtime allowlist + declared-target control group), and `tools/proxy_split_e2e.py` no longer treats a
+  passing `-t` as proof of safety.
 - **CRLF**: `%0d%0a` in the path is answered by the gateway with **400** — stricter than nginx, which
   forwards the encoded sequence. `%20` and `%23` still pass through untouched, so this is not naive
   over-decoding. Header values set from `ngx.var.uri` / `ngx.var.arg_*` go through

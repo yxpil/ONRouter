@@ -87,14 +87,17 @@ pub fn idle_count(key: &str) -> usize {
     g.get(key).map(|q| q.len()).unwrap_or(0)
 }
 
-/// 清空整个池（主要供测试隔离）。
+/// 清空单个 key 的空闲队列（测试隔离用）。
+///
+/// 不用整池 `clear()`：三个单测并行跑在同一个进程里，A 用例开局清池会把 B 用例
+/// 刚放进去的连接一起抹掉，于是 `take()` 返回 None——那是测试串台，不是连接复用坏了。
 #[cfg(test)]
-pub fn clear() {
+pub fn purge(key: &str) {
     let mut g = match pool().lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    g.clear();
+    g.remove(key);
 }
 
 #[cfg(test)]
@@ -111,9 +114,9 @@ mod tests {
 
     #[tokio::test]
     async fn put_then_take_roundtrip_preserves_buf() {
-        clear();
-        let (client, _server) = localhost_pair().await;
         let key = "127.0.0.1:9".to_string();
+        purge(&key);
+        let (client, _server) = localhost_pair().await;
         put(key.clone(), client, vec![1, 2, 3], Duration::from_secs(60), 0);
         assert_eq!(idle_count(&key), 1);
         let (s, buf) = take(&key).expect("应复用刚放入的连接");
@@ -126,9 +129,9 @@ mod tests {
 
     #[tokio::test]
     async fn expired_entries_are_dropped() {
-        clear();
-        let (client, _server) = localhost_pair().await;
         let key = "127.0.0.1:8".to_string();
+        purge(&key);
+        let (client, _server) = localhost_pair().await;
         // 负 idle：立即到期。
         put(key.clone(), client, vec![7], Duration::ZERO, 0);
         // deadline = now + 0；take 时 now >= deadline → 判定过期丢弃。
@@ -138,8 +141,8 @@ mod tests {
 
     #[tokio::test]
     async fn pool_size_evicts_oldest_fifo() {
-        clear();
         let key = "127.0.0.1:7".to_string();
+        purge(&key);
         let mut conns = Vec::new();
         for _ in 0..4 {
             conns.push(localhost_pair().await.0);

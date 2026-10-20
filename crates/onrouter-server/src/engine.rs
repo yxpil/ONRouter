@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,6 +19,7 @@ use tokio::sync::mpsc;
 use onrouter_config::Directive;
 
 use crate::AppError;
+use crate::log_warn;
 
 /// 流式响应的帧：Head 只在最前面出现一次，之后都是 Data，End 表示脚本收尾、
 /// 响应体到此为止（不依赖发送端全部 drop，便于 log 阶段继续持有 ctx）。
@@ -146,6 +148,13 @@ pub struct RequestCtx {
     /// `$still_online`：本次响应是否由 Still ONLine 副本顶替（回放时为 `STALE`）。
     /// 没配副本区、或本次正常回源成功时是空串——与 `$upstream_cache_status` 同理。
     pub still_online: String,
+    /// `$proxy_split`：按比例**选中**的那一路（split_clients 落桶的结果）。
+    /// 没走变量分流时是空串。
+    pub proxy_split: String,
+    /// `$proxy_split_served`：**请求被交给**哪一路（在解析出后端节点时记账）。与 `$proxy_split`
+    /// 不同就说明发生了跨路改投（`proxy_split_failover`），业务归因要按这个字段；
+    /// 一个节点都没选中（整池在摘除期、目标不存在）时是空串。
+    pub proxy_split_served: String,
     /// `front_proxy` 命中的 profile 名；空串 = 没认出前置代理（CDN /  LB）。
     /// 识别本身不代表信任，信任看 `$front_proxy_verified`。
     pub front_proxy: String,
@@ -324,6 +333,8 @@ impl RequestCtx {
             balancer_recreate_request: false,
             upstream_addr: String::new(),
             upstream_status: 0,
+            proxy_split: String::new(),
+            proxy_split_served: String::new(),
             upstream_header_time: 0.0,
             ssl: None,
             start_time: unix_now(),
@@ -509,6 +520,8 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
         }
         "upstream_cache_status" => Some(ctx.cache_status.clone()),
         "still_online" => Some(ctx.still_online.clone()),
+        "proxy_split" => Some(ctx.proxy_split.clone()),
+        "proxy_split_served" => Some(ctx.proxy_split_served.clone()),
         "front_proxy" => Some(ctx.front_proxy.clone()),
         "front_proxy_country" => Some(ctx.front_proxy_country.clone()),
         "front_proxy_host" => Some(ctx.front_proxy_host.clone()),
@@ -555,6 +568,8 @@ const STATIC_VAR_NAMES: &[&str] = &[
     "upstream_response_time",
     "upstream_cache_status",
     "still_online",
+    "proxy_split",
+    "proxy_split_served",
     "front_proxy",
     "front_proxy_country",
     "front_proxy_host",
@@ -950,6 +965,171 @@ fn resolve_split(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
     let key = expand_split_key(ctx, &def.key, depth + 1);
     let id = split_id(&key);
     Some(pick_split_bucket(&def, id))
+}
+
+/// 按目标变量名查 split 定义（构建路由表时用来把 `proxy_pass http://$x` 接到比例上）。
+/// 必须在 `install_splits` 之后调用，否则看到的是上一份配置。
+pub fn split_def(dest: &str) -> Option<Arc<SplitDef>> {
+    split_store()
+        .read()
+        .unwrap()
+        .iter()
+        .find(|d| d.dest == dest)
+        .cloned()
+}
+
+/// 配置里每一条 split_clients 写过的落点值（每一路 + `*`），供路由表构建"能列出来的落点"集合。
+pub fn split_branch_values() -> Vec<String> {
+    let store = split_store().read().unwrap();
+    let mut out = Vec::new();
+    for d in store.iter() {
+        out.extend(d.buckets.iter().map(|b| b.result.clone()));
+        out.extend(d.star.clone());
+    }
+    out
+}
+
+// ---------- 分流落点统计（split_clients 的结果被 proxy_pass 当路由目标时） ----------
+
+/// 一次分流请求的四种结局之一。基数因此有上界，不会随流量长成无界标签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitRole {
+    /// 本意那一路当时有可选节点，请求交给了它（记在解析出落点的那一刻，
+    /// 不代表后端返回了 2xx —— 成败归 proxy_next_upstream 与访问日志管）
+    Routed,
+    /// 本意那一路没人可服务，按 `proxy_split_failover` 改投到了别的分支
+    Bled,
+    /// 某个分支被选中时**整池没有可选节点**（摘除期、主动探测判死、`down`、并发额度打满；
+    /// 按候选尝试计数，可以大于请求数）
+    Down,
+    /// 落桶结果是空串（分桶值写了空串或没有 `*` 兜底）
+    Empty,
+}
+
+impl SplitRole {
+    pub const ALL: [SplitRole; 4] = [
+        SplitRole::Routed,
+        SplitRole::Bled,
+        SplitRole::Down,
+        SplitRole::Empty,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            SplitRole::Routed => "routed",
+            SplitRole::Bled => "bled",
+            SplitRole::Down => "down",
+            SplitRole::Empty => "empty",
+        }
+    }
+    fn idx(self) -> usize {
+        self as usize
+    }
+}
+
+/// 一个 split 变量（按目标变量名归属）的分流账本。
+///
+/// 刻意挂在**进程级注册表**上而不是路由表上：路由表每次热重载都整份重建，
+/// 账本若跟着重建，运维在发布窗口里看到的曲线就会莫名归零。名字相同的
+/// 第二次注册返回同一个 `Arc`，因此重载不丢历史。
+#[derive(Debug)]
+pub struct SplitRouteStats {
+    pub dest: String,
+    /// 声明顺序的分支值，供指标与 `-t` 打印
+    pub branches: Vec<String>,
+    index: HashMap<String, usize>,
+    served: Vec<AtomicU64>,
+    roles: [AtomicU64; 4],
+}
+
+impl SplitRouteStats {
+    fn new(dest: &str, branches: &[String]) -> Self {
+        let index = branches
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.clone(), i))
+            .collect();
+        SplitRouteStats {
+            dest: dest.to_string(),
+            branches: branches.to_vec(),
+            index,
+            served: branches.iter().map(|_| AtomicU64::new(0)).collect(),
+            roles: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    /// 请求被交给这一路的计数（在解析出落点时记账，不看后端成败）
+    pub fn note_served(&self, branch: &str) {
+        if let Some(&i) = self.index.get(branch) {
+            self.served[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn note(&self, role: SplitRole) {
+        self.roles[role.idx()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn role(&self, role: SplitRole) -> u64 {
+        self.roles[role.idx()].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn served(&self, branch: &str) -> u64 {
+        self.index
+            .get(branch)
+            .map(|&i| self.served[i].load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+}
+
+static SPLIT_STATS: std::sync::OnceLock<
+    std::sync::RwLock<HashMap<String, Arc<SplitRouteStats>>>,
+> = std::sync::OnceLock::new();
+
+/// 登记上限：分流条目来自配置文件本身，这个数只是防止有人把它写成无界表。
+const MAX_SPLIT_ROUTES: usize = 64;
+/// 单个 split 的分支上限，同上。
+const MAX_SPLIT_BRANCHES: usize = 64;
+
+fn split_stats_store() -> &'static std::sync::RwLock<HashMap<String, Arc<SplitRouteStats>>> {
+    SPLIT_STATS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// 构建路由表时登记一条分流（幂等：同名返回既有账本）。
+/// 超限或分支为空时返回 None —— 分流照走，只是不再计数，并告警一次。
+pub fn register_split_route(dest: &str, branches: &[String]) -> Option<Arc<SplitRouteStats>> {
+    let mut store = split_stats_store().write().unwrap();
+    if let Some(existing) = store.get(dest) {
+        return Some(existing.clone());
+    }
+    if branches.len() > MAX_SPLIT_BRANCHES {
+        log_warn!(
+            "split_clients {dest} 分支数 {} 超过登记上限 {}，本次不再统计落点比例",
+            branches.len(),
+            MAX_SPLIT_BRANCHES
+        );
+        return None;
+    }
+    if store.len() >= MAX_SPLIT_ROUTES {
+        log_warn!(
+            "分流账本已满（{} 条），split_clients {dest} 不再统计落点比例",
+            MAX_SPLIT_ROUTES
+        );
+        return None;
+    }
+    let stats = Arc::new(SplitRouteStats::new(dest, branches));
+    store.insert(dest.to_string(), Arc::clone(&stats));
+    Some(stats)
+}
+
+/// 指标渲染与 E2E 读取用：按名字排序的完整快照。
+pub fn split_stats_snapshot() -> Vec<Arc<SplitRouteStats>> {
+    let mut v: Vec<_> = split_stats_store()
+        .read()
+        .unwrap()
+        .iter()
+        .map(|(_, s)| Arc::clone(s))
+        .collect();
+    v.sort_by(|a, b| a.dest.cmp(&b.dest));
+    v
 }
 
 // ---------- nginx `sub_filter`（响应体文本替换输出过滤器） ----------
@@ -1618,6 +1798,26 @@ mod tests {
     }
 
     #[test]
+    fn split_ledger_is_idempotent_and_bounded() {
+        // 同名第二次登记返回同一本账：热重载会重建整份路由表，账本若跟着重建，
+        // 运维在发布窗口里看到的落点曲线就会莫名归零。
+        let a = register_split_route("t_ledger", &["x".into(), "y".into()]).expect("应能登记");
+        let b = register_split_route("t_ledger", &["x".into(), "y".into()]).expect("应能登记");
+        assert!(Arc::ptr_eq(&a, &b), "重复登记必须复用同一本账");
+        a.note_served("x");
+        a.note(SplitRole::Routed);
+        assert_eq!(a.served("x"), 1);
+        assert_eq!(a.role(SplitRole::Routed), 1);
+        assert_eq!(a.served("nope"), 0, "未声明的分支不进账：指标标签的基数必须有上界");
+        // 分支数超过登记上限：分流照走，只是不再统计，绝不无界增长
+        let too_many: Vec<String> = (0..=MAX_SPLIT_BRANCHES).map(|i| format!("b{i}")).collect();
+        assert!(
+            register_split_route("t_ledger_big", &too_many).is_none(),
+            "超限的 split 必须拒绝登记而不是无限扩建账本"
+        );
+    }
+
+    #[test]
     fn pick_split_bucket_accumulates_and_star_catches_rest() {
         let def = SplitDef {
             dest: "v".into(),
@@ -1638,6 +1838,48 @@ mod tests {
         // 无 * 时落空返回空串
         let no_star = SplitDef { dest: "v".into(), key: String::new(), buckets: def.buckets.clone(), star: None };
         assert_eq!(pick_split_bucket(&no_star, 6000), "");
+    }
+
+    #[test]
+    fn zero_percent_branch_is_never_selected_by_the_ratio() {
+        // `0%` 那一路只当改投落点：无论它声明在前还是在后，10000 个桶坐标里一个都不属于它。
+        // 这条断言是 `proxy_split_failover http://<0% 分支>` 那个报错文案的前提 —— 文案让用户
+        // 把退路写成 0%，如果比例还能选中它，"只当落点"就是假话。
+        for (i, def) in [
+            SplitDef {
+                dest: "z".into(),
+                key: String::new(),
+                buckets: vec![
+                    SplitBucket { percent: 0.0, result: "fallback_only".into() },
+                    SplitBucket { percent: 70.0, result: "a".into() },
+                ],
+                star: Some("b".into()),
+            },
+            SplitDef {
+                dest: "z".into(),
+                key: String::new(),
+                buckets: vec![
+                    SplitBucket { percent: 70.0, result: "a".into() },
+                    SplitBucket { percent: 0.0, result: "fallback_only".into() },
+                ],
+                star: Some("b".into()),
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut hit_fallback_only = 0;
+            for id in 0..10000u32 {
+                if pick_split_bucket(def, id) == "fallback_only" {
+                    hit_fallback_only += 1;
+                }
+            }
+            assert_eq!(hit_fallback_only, 0, "第 {i} 份：0% 分支被比例选中了");
+            // 其余两路照旧各占其位：0% 不消耗任何桶坐标
+            assert_eq!(pick_split_bucket(def, 0), "a");
+            assert_eq!(pick_split_bucket(def, 6999), "a");
+            assert_eq!(pick_split_bucket(def, 7000), "b");
+        }
     }
 
     #[test]

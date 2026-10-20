@@ -920,6 +920,8 @@ async fn handle_request(
         balancer_recreate_request: false,
         upstream_addr: String::new(),
         upstream_status: 0,
+        proxy_split: String::new(),
+        proxy_split_served: String::new(),
         upstream_header_time: 0.0,
         ssl: None,
         start_time: unix_now(),
@@ -1421,6 +1423,8 @@ pub async fn run_capture(
         balancer_recreate_request: false,
         upstream_addr: String::new(),
         upstream_status: 0,
+        proxy_split: String::new(),
+        proxy_split_served: String::new(),
         upstream_header_time: 0.0,
         ssl: None,
         start_time: unix_now(),
@@ -1604,6 +1608,19 @@ async fn process(
 
     // ---- CONTENT ----
     if let Some(target) = &loc.proxy_pass {
+        // proxy_pass 主机位是变量（业务分流）时按请求插值。字面量目标恒走借用这条路：
+        // 一个字符都不扫、一次分配都不做，配了分流与否不该让别人的 proxy_pass 变贵。
+        let target: std::borrow::Cow<'_, str> = if target.contains('$') {
+            crate::proxy::interpolate_vars(target, ctx).into()
+        } else {
+            target.as_str().into()
+        };
+        // "比例选中了哪一路"在插值完成的那一刻就定了，所以分流也要写进 ctx：缓存命中时
+        // 请求根本没交给节点（`$proxy_split_served` 保持空串），但运营者仍要能看出这条
+        // 响应属于哪一路业务。没配分流的 location 一个字符都不扫。
+        if loc.route_split.is_some() {
+            ctx.proxy_split = crate::proxy::split_target(&target).0.to_string();
+        }
         // BALANCER：balancer_by_lua 在转发前运行，Lua 可经 ngx.balancer 选定上游节点/超时
         if run_phases(state, ctx, loc, Phase::Balancer, server).await {
             return error_response(ctx, server, Some(loc), 500).await;
@@ -1620,6 +1637,9 @@ async fn process(
             next_upstream_tries: loc.proxy_next_upstream_tries,
             next_upstream_timeout: loc.proxy_next_upstream_timeout,
             tls: &loc.proxy_tls,
+            split: loc.route_split.as_ref(),
+            split_failover: loc.split_failover.clone(),
+            var_targets: loc.var_targets.as_ref(),
         };
 
         // ---- proxy_cache：仅幂等方法 + 缓冲请求体时参与缓存（流式体无法回放）----
@@ -1633,7 +1653,7 @@ async fn process(
         let cache_target = if cacheable_method {
             caching_zone
                 .clone()
-                .map(|zone| (zone, build_cache_key(&loc.proxy_cache_key, ctx, target)))
+                .map(|zone| (zone, build_cache_key(&loc.proxy_cache_key, ctx, &target)))
         } else {
             None
         };
@@ -1754,7 +1774,7 @@ async fn process(
         // 流式上传转发到一半失败时后端已经收到过数据，回放副本只会掩盖问题。
         let so_target = match (&loc.still_online, &body) {
             (Some(zone), ProxyBody::Buffered(_)) if ctx.method.eq_ignore_ascii_case("GET") => {
-                Some((zone.clone(), build_cache_key(&loc.proxy_cache_key, ctx, target)))
+                Some((zone.clone(), build_cache_key(&loc.proxy_cache_key, ctx, &target)))
             }
             _ => None,
         };
@@ -1776,7 +1796,7 @@ async fn process(
 
         return match state
             .proxy
-            .forward(ctx, target, &loc.pattern, &opts, body)
+            .forward(ctx, &target, &loc.pattern, &opts, body)
             .await
         {
             Ok(upstream_resp) => {
@@ -3404,6 +3424,8 @@ async fn refresh_copy(state: &Arc<AppState>, job: &crate::still_online::RefreshJ
         balancer_recreate_request: false,
         upstream_addr: String::new(),
         upstream_status: 0,
+        proxy_split: String::new(),
+        proxy_split_served: String::new(),
         upstream_header_time: 0.0,
         ssl: None,
         start_time: unix_now(),
@@ -3746,6 +3768,8 @@ async fn handle_upgrade(
         balancer_recreate_request: false,
         upstream_addr: String::new(),
         upstream_status: 0,
+        proxy_split: String::new(),
+        proxy_split_served: String::new(),
         upstream_header_time: 0.0,
         ssl: None,
         start_time: unix_now(),
@@ -3775,8 +3799,15 @@ async fn handle_upgrade(
         Ok(l) => l,
         Err(resp) => return resp,
     };
-    let Some(proxy_pass) = location.proxy_pass.clone() else {
+    let Some(target) = &location.proxy_pass else {
         return error_page(StatusCode::BAD_REQUEST);
+    };
+    // Upgrade 与 forward 同语义：proxy_pass 主机位是变量时按请求插值，
+    // 业务分流同样作用于 WebSocket 隧道（字面量目标恒走借用，不额外分配）。
+    let proxy_pass: std::borrow::Cow<'_, str> = if target.contains('$') {
+        crate::proxy::interpolate_vars(target, &ctx).into()
+    } else {
+        target.as_str().into()
     };
 
     // Upgrade 与普通转发同语义：balancer_by_lua 先选点，set_timeouts 覆盖本跳超时
@@ -3801,6 +3832,9 @@ async fn handle_upgrade(
         next_upstream_tries: location.proxy_next_upstream_tries,
         next_upstream_timeout: location.proxy_next_upstream_timeout,
         tls: &location.proxy_tls,
+        split: location.route_split.as_ref(),
+        split_failover: location.split_failover.clone(),
+        var_targets: location.var_targets.as_ref(),
     };
 
     let tunnel = match state.proxy.upgrade(&mut ctx, &proxy_pass, &opts).await {

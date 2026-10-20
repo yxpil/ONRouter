@@ -18,7 +18,7 @@
 //! listen 8443 ssl default_server;    # 该端点的默认 vhost
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,6 +93,92 @@ impl LocationKind {
     }
 }
 
+/// 见 [`Router::target_variable`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetVar {
+    /// 目标写死（今天的路径，零额外成本）
+    Literal,
+    /// 主机位整段是一个变量：`http://$route` 或 `http://${route}`
+    Var(String),
+    /// 变量拼在主机位里（`http://a$x.b`）—— 不支持，`-t` 直接否决
+    Invalid,
+}
+
+/// `proxy_split_failover <on|off|http://目标>`：按比例选中的那一路**没有任何可服务的节点**时怎么办。
+///
+/// 只在"请求还没交给任何后端节点"这个时刻生效：一旦请求发给了某个节点，成败由
+/// `proxy_next_upstream` 与 `error_page` 负责，绝不跨路重投——否则一个 POST 会被
+/// 打到两个业务版本上写两次。这条边界是这套语义里最重要的安全约束。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitFailover {
+    /// 默认：按分桶声明顺序退到下一路（日志与指标里记成 `bled`，不静默）
+    On,
+    /// 不串台：这一路的失败原样回给客户端（灰度实验、写入不可回退的业务用这个）
+    Off,
+    /// 只退到运维显式写的那一路（其余分支一律不碰）
+    Target(String),
+}
+
+/// 一条"按比例选后端池"的分流：由 `proxy_pass http://$x` 与
+/// `split_clients <key> $x { 30% a; * b; }` 组合而来，比例、粘性键都在 split 里声明。
+#[derive(Debug, Clone)]
+pub struct RouteSplit {
+    /// 目标变量名（不含 `$`）
+    pub dest: String,
+    /// 键模板，仅供 `-t` 打印与诊断；真正展开在请求期
+    pub key: String,
+    /// 声明顺序的分支 `(权重%, 目标)`；目标就是 `http://<目标>` 的主机位
+    pub branches: Vec<(f64, String)>,
+    /// `*` 兜底桶的目标；None = 没有兜底，落空的桶值为空串
+    pub star: Option<String>,
+    /// 进程级落点账本；`None` 表示超出登记上限，分流照走但不统计
+    pub stats: Option<std::sync::Arc<crate::engine::SplitRouteStats>>,
+}
+
+impl RouteSplit {
+    /// 全部候选目标（声明顺序 + 兜底在最后），去掉空串。
+    pub fn all_targets(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .branches
+            .iter()
+            .map(|(_, t)| t.clone())
+            .chain(self.star.clone())
+            .filter(|t| !t.is_empty())
+            .collect();
+        out.dedup();
+        out
+    }
+
+    /// 从 `chosen` 开始改投的候选顺序：声明顺序里剔除本意那一路。
+    pub fn fallback_order(&self, chosen: &str) -> Vec<String> {
+        self.all_targets()
+            .into_iter()
+            .filter(|t| t != chosen)
+            .collect()
+    }
+
+    /// `-t` 与启动横幅的一行描述（沿用 least_time_desc / front_proxy 的做法）
+    pub fn desc(&self, failover: &SplitFailover, location: &str) -> String {
+        let parts: Vec<String> = self
+            .branches
+            .iter()
+            .map(|(p, t)| format!("{p}%->{t}"))
+            .chain(self.star.iter().map(|s| format!("*->{s}")))
+            .collect();
+        let policy = match failover {
+            SplitFailover::On => "改投下一路".to_string(),
+            SplitFailover::Off => "不串台（原样失败）".to_string(),
+            SplitFailover::Target(t) => format!("只改投 {t}"),
+        };
+        let key = &self.key;
+        format!(
+            "location '{location}'：按 ${} 分流 [{}]，粘性键 {key}，选中路全挂时{policy}",
+            self.dest,
+            parts.join(" ")
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Location {
     pub kind: LocationKind,
@@ -102,6 +188,15 @@ pub struct Location {
     pub rewrite_steps: Vec<RewriteStep>,
     pub ret: Option<ReturnAction>,
     pub proxy_pass: Option<String>,
+    /// `proxy_pass` 的主机位是变量时解析出的分流（见 [`RouteSplit`]）；字面量目标恒为 None
+    pub route_split: Option<RouteSplit>,
+    /// `proxy_split_failover`：选中路全挂时的策略。只有 `route_split` 非 None 才参与决策。
+    pub split_failover: SplitFailover,
+    /// 主机位是**非分流**变量（来自 `set`/`map`/`geo`，也可能直接来自请求）时，
+    /// 运行期允许真正去连的落点集合 = 配置里列得出来的那些。转发前逐个核对，
+    /// 不在集合里就不回源 —— 见 [`Router::declared_targets`]。
+    /// 字面量目标与 `split_clients` 分流恒为 None：它们各有各的校验，不该多这次查表。
+    pub var_targets: Option<Arc<HashSet<String>>>,
     pub proxy_set_headers: Vec<(String, String)>,
     pub proxy_read_timeout: std::time::Duration,
     pub proxy_connect_timeout: std::time::Duration,
@@ -299,6 +394,10 @@ pub struct Router {
     /// 顶层 `still_online_zone <名称> <容量>;` 换算出的每区**字节**预算。
     /// 副本存的是完整响应体，条数上限约束不了内存，所以这里按字节计。
     pub still_zones: HashMap<String, usize>,
+    /// 每一条 `proxy_pass http://$变量` 分流的自述（比例 + 粘性键 + 改投策略），
+    /// 给 `-t` 与启动横幅打印用，与 `least_time_desc` 同一套路。按内容去重：
+    /// 同一段 location 抄到多个 vhost 上不该刷屏。
+    pub split_routes: Vec<String>,
 }
 
 /// 一个 server 块里除 listen 之外的所有配置模板
@@ -1490,9 +1589,14 @@ impl Router {
                         c.name, c.line
                     ))
                 })?;
-                if percent <= 0.0 {
+                // 0% 是合法的，而且是有用的一种写法：这一路比例永远命中不到，只能由
+                // `proxy_split_failover http://<它>` 或默认档的改投到达 —— 想退到"比例之外"
+                // 的服务就得把它这样声明进来（改投目标必须是声明过的分支，见
+                // `check_split_branch_targets`）。负数仍然是配置错误。
+                if percent < 0.0 {
                     return Err(AppError::Other(format!(
-                        "split_clients {dest} 权重须为正数（第 {} 行）",
+                        "split_clients {dest} 权重不能是负数（第 {} 行）；0% 表示这一路只当改投落点、\
+                         不参与比例",
                         c.line
                     )));
                 }
@@ -1515,6 +1619,128 @@ impl Router {
             defs.push(SplitDef { dest, key, buckets, star });
         }
         Ok(defs)
+    }
+
+    /// `proxy_pass http://$split_var/path` 里主机位的形状：写死、整段是一个变量、还是混着写。
+    ///
+    /// 刻意只认"一个完整变量"这一种：`http://a$x.example.com` 这种拼出来的主机名
+    /// 既无法在 `-t` 里枚举候选目标，也无法判断改投该往哪退，属于看着能写、出事没法查的配置。
+    fn target_variable(pp: &str) -> TargetVar {
+        let rest = pp
+            .strip_prefix("http://")
+            .or_else(|| pp.strip_prefix("https://"))
+            .unwrap_or(pp);
+        let host = rest.split('/').next().unwrap_or(rest);
+        if !host.contains('$') {
+            return TargetVar::Literal;
+        }
+        // 花括号形式必须先判：`strip_prefix('$')` 会把 `${route}` 削成 `{route}`，
+        // 于是文档里写明的 `${route}` 在 -t 被当成拼串拒掉。
+        let name = if let Some(inner) = host
+            .strip_prefix("${")
+            .and_then(|s| s.strip_suffix('}'))
+        {
+            inner.to_string()
+        } else if let Some(n) = host.strip_prefix('$') {
+            n.to_string()
+        } else {
+            return TargetVar::Invalid;
+        };
+        // 变量名本身的形状：只接受 [A-Za-z0-9_]+，否则是拼串而不是整段替换
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return TargetVar::Invalid;
+        }
+        TargetVar::Var(name)
+    }
+
+    /// `-t` 核对分流落点：每一路必须是可枚举的主机位，显式改投目标必须是其中之一。
+    ///
+    /// 写成纯函数（不查全局 split 表）是为了单测能直接喂任意分支组合——`Router::build`
+    /// 会把 `split_clients` 装进全局表，而全局表被每次构建原子替换，并发单测里读不到稳定的表。
+    fn check_split_branch_targets(
+        name: &str,
+        targets: &[String],
+        failover: &SplitFailover,
+        line: usize,
+    ) -> Result<(), String> {
+        for t in targets {
+            if t.contains('/') || t.contains(' ') || t.contains('\t') || t.contains('$') {
+                return Err(format!(
+                    "proxy_pass http://${name}（第 {line} 行）的分流目标 '{t}' 不能放在主机位：\
+                     每一路必须是 upstream 池名或 host:port，不能含 / 、空格或变量"
+                ));
+            }
+        }
+        // 也想退到"split 之外"的服务时，把它作为 0% 的那一路写进 split_clients 即可。
+        if let SplitFailover::Target(t) = failover {
+            if !targets.iter().any(|x| x == t) {
+                return Err(format!(
+                    "proxy_split_failover http://{t} 指向的不是 split_clients ${name} \
+                     声明的某一路（可选：{}）。改投目标必须是其中之一，\
+                     要退到这套比例之外的服务，请把 {t} 作为 0% 的那一路写进 split_clients。",
+                    targets.join(" / ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 这份配置"列得出来的落点"：已声明的 `upstream` 池名、任何写死的 `proxy_pass` 主机位、
+    /// 每条 `split_clients` 的分支目标、以及 `proxy_split_failover http://…` 的改投目标。
+    ///
+    /// 它是主机位用**非分流变量**时的运行期白名单。那种变量既可能来自 `set`/`map`/`geo`
+    /// （操作者写死的），也可能直接来自请求（`$http_x_target`、`$arg_host`、`$cookie_route`）。
+    /// 不加这道闸门，客户端写什么网关就连什么 —— 一台能被任意指向的内网端口扫描器，
+    /// 也就是审计里 `proxy_pass http://127.0.0.1:$arg_port/` 那条"不会朝客户端选的目标开 socket"
+    /// 所依赖的前提。拦的是"连到配置里没出现过的地址"，不是"跟着请求换池"：
+    /// `map $http_x_env $backend` 指向已声明的池仍是合法写法，照旧放行。
+    fn declared_targets(config: &Config) -> HashSet<String> {
+        fn literal_host(v: &str) -> Option<String> {
+            if v.is_empty() || v.contains('$') {
+                return None;
+            }
+            let h = crate::proxy::split_target(v).0;
+            (!h.is_empty()).then(|| h.to_string())
+        }
+        fn walk(d: &Directive, out: &mut HashSet<String>) {
+            match d.name.as_str() {
+                "upstream" => {
+                    if let Some(n) = d.arg(0).filter(|s| !s.is_empty()) {
+                        out.insert(n.to_string());
+                    }
+                }
+                "proxy_pass" => {
+                    if let Some(h) = d.arg(0).and_then(literal_host) {
+                        out.insert(h);
+                    }
+                }
+                "proxy_split_failover" => {
+                    if let Some(t) = d
+                        .arg(0)
+                        .and_then(|f| f.strip_prefix("http://").or_else(|| f.strip_prefix("https://")))
+                    {
+                        if let Some(h) = literal_host(t) {
+                            out.insert(h);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for b in &d.block {
+                walk(b, out);
+            }
+        }
+        let mut out = HashSet::new();
+        for d in &config.root.block {
+            walk(d, &mut out);
+        }
+        // 必须在 install_splits 之后调用：分支值也是操作者写死在配置里的落点
+        for v in crate::engine::split_branch_values() {
+            if let Some(h) = literal_host(&v) {
+                out.insert(h);
+            }
+        }
+        out
     }
 
     fn build_with_listeners(
@@ -1565,6 +1791,10 @@ impl Router {
         // 顶层 `split_clients` 指令：按键模板哈希加权分流的派生变量表
         let splits = Self::parse_splits(config, &mut warnings)?;
         crate::engine::install_splits(splits);
+
+        // 主机位是**非分流**变量时的运行期落点白名单（见 declared_targets）。整份配置算一次，
+        // 所有 location 共享同一个 Arc；目标写死或走分流的 location 拿到的是 None，不多查一次表。
+        let var_targets = Arc::new(Self::declared_targets(config));
 
         let limits_declared: Vec<String> = config
             .root
@@ -1656,8 +1886,14 @@ impl Router {
                 ));
             }
 
-            let tmpl =
-                Self::build_template(d, base_dir, &limits_declared, &front_profiles, &mut warnings)?;
+            let tmpl = Self::build_template(
+                d,
+                base_dir,
+                &limits_declared,
+                &var_targets,
+                &front_profiles,
+                &mut warnings,
+            )?;
             if tmpl.front_proxy.enabled() {
                 front_proxy_used = true;
             }
@@ -1892,6 +2128,23 @@ impl Router {
             }
         }
 
+        // 每条分流在 -t 里自述一行。理由是这套语义里"运维写了什么比例"和"请求实际怎么分"
+        // 中间隔着一次哈希落桶与一次可能的改投，必须先把网关自己理解成的那张表打出来。
+        // 同一段 location 抄到多个 vhost 上只留一行（去重按内容，不含地址）。
+        let mut split_routes: Vec<String> = Vec::new();
+        for group in out_groups.values() {
+            for srv in &group.servers {
+                for loc in &srv.locations {
+                    if let Some(split) = &loc.route_split {
+                        let line = split.desc(&loc.split_failover, &loc.pattern);
+                        if !split_routes.contains(&line) {
+                            split_routes.push(line);
+                        }
+                    }
+                }
+            }
+        }
+
         let config_listeners = listeners;
         Ok((
             Router {
@@ -1901,6 +2154,7 @@ impl Router {
                 stream,
                 cache_zones,
                 still_zones,
+                split_routes,
             },
             config_listeners,
         ))
@@ -2142,6 +2396,7 @@ impl Router {
         d: &Directive,
         base_dir: &PathBuf,
         limits: &[String],
+        var_targets: &Arc<HashSet<String>>,
         front_profiles: &std::sync::Arc<Vec<std::sync::Arc<crate::front_proxy::FrontProfile>>>,
         warnings: &mut Vec<String>,
     ) -> Result<ServerTemplate, AppError> {
@@ -2539,7 +2794,9 @@ impl Router {
 
         for loc in d.block.iter().filter(|x| x.name == "location") {
             tmpl.locations
-                .push(Self::build_location(loc, base_dir, &tmpl, limits, warnings)?);
+                .push(Self::build_location(
+                    loc, base_dir, &tmpl, limits, var_targets, warnings,
+                )?);
         }
         Ok(tmpl)
     }
@@ -2549,6 +2806,7 @@ impl Router {
         base_dir: &PathBuf,
         tmpl: &ServerTemplate,
         limits: &[String],
+        var_targets: &Arc<HashSet<String>>,
         warnings: &mut Vec<String>,
     ) -> Result<Location, AppError> {
         let (modifier, pattern) = match (d.arg(0), d.arg(1)) {
@@ -2562,6 +2820,9 @@ impl Router {
             rewrite_steps: Vec::new(),
             ret: None,
             proxy_pass: None,
+            route_split: None,
+            split_failover: SplitFailover::On,
+            var_targets: None,
             proxy_set_headers: Vec::new(),
             proxy_read_timeout: tmpl.proxy_read_timeout,
             proxy_connect_timeout: tmpl.proxy_connect_timeout,
@@ -2611,7 +2872,7 @@ impl Router {
         };
         Self::warn_unknown(
             d,
-            &["rewrite", "set", "if", "return", "proxy_pass", "proxy_set_header", "proxy_read_timeout",
+            &["rewrite", "set", "if", "return", "proxy_pass", "proxy_split_failover", "proxy_set_header", "proxy_read_timeout",
                "proxy_connect_timeout", "proxy_send_timeout", "proxy_next_upstream",
                "proxy_next_upstream_tries", "proxy_next_upstream_timeout",
                "proxy_request_buffering",
@@ -2725,6 +2986,133 @@ impl Router {
         }
         if let Some(pp) = d.find("proxy_pass").and_then(|x| x.arg(0)) {
             loc.proxy_pass = Some(pp.to_string());
+        }
+        // `proxy_split_failover on|off|http://目标`：本意那一路全挂时的处置，默认 on（改投下一路）。
+        // 声明了但没有可枚举的分支（目标是字面量、或变量不是 split_clients 产的）就是"写了不生效"，
+        // 与 ip_hash+least_time 同规则：在 -t 硬失败，不留到运行期靠日志发现。
+        let mut split_failover_declared = false;
+        if let Some(f) = d.find("proxy_split_failover").and_then(|x| x.arg(0)) {
+            split_failover_declared = true;
+            loc.split_failover = match f {
+                "on" => SplitFailover::On,
+                "off" => SplitFailover::Off,
+                other => {
+                    let t = other
+                        .strip_prefix("http://")
+                        .or_else(|| other.strip_prefix("https://"))
+                        .unwrap_or(other);
+                    let host = t.split('/').next().unwrap_or(t);
+                    if host.is_empty() || host.contains('$') || t.contains(' ') {
+                        return Err(AppError::Other(format!(
+                            "proxy_split_failover '{other}'（第 {} 行）不是 on / off / http://<目标>；\
+                             改投目标必须是写死的服务名或 host:port，不能是变量（退到哪一路必须可静态核对）",
+                            d.line
+                        )));
+                    }
+                    SplitFailover::Target(host.to_string())
+                }
+            };
+        }
+        // 目标主机位是变量：把它接到 split_clients 的比例上，这就是"手动自定义业务分流"。
+        if let Some(pp) = loc.proxy_pass.clone() {
+            match Self::target_variable(&pp) {
+                TargetVar::Literal => {
+                    if split_failover_declared {
+                        return Err(AppError::Other(format!(
+                            "location '{}'（第 {} 行）：proxy_pass 目标是写死的 '{pp}'，没有按比例分流，\
+                             proxy_split_failover 一行都不会生效。要按业务比例分发请写 \
+                             proxy_pass http://$变量 + split_clients <键> $变量 {{ … }}",
+                            loc.pattern, d.line
+                        )));
+                    }
+                }
+                TargetVar::Invalid => {
+                    return Err(AppError::Other(format!(
+                        "proxy_pass '{pp}'（第 {} 行）把变量拼在了主机位中间：只支持整段一个变量 \
+                         （http://$route 或 http://${{route}}[/路径]）。分流的目标必须能逐个列出来，\
+                         否则 -t 核不了比例、出事也查不出退到了哪一路",
+                        d.line
+                    )));
+                }
+                TargetVar::Var(name) => {
+                    match crate::engine::split_def(&name) {
+                        Some(def) => {
+                            let branches: Vec<(f64, String)> = def
+                                .buckets
+                                .iter()
+                                .map(|b| (b.percent, b.result.clone()))
+                                .collect();
+                            let mut targets: Vec<String> = branches
+                                .iter()
+                                .map(|(_, t)| t.clone())
+                                .chain(def.star.clone())
+                                .filter(|t| !t.is_empty())
+                                .collect();
+                            targets.dedup();
+                            if targets.is_empty() {
+                                return Err(AppError::Other(format!(
+                                    "proxy_pass http://${name}（第 {} 行）指向的 split_clients 每一路目标都是空串，\
+                                     这个分流不可能转发到任何后端",
+                                    d.line
+                                )));
+                            }
+                            // 分桶值此刻站到了 proxy_pass 的主机位上，必须是个能枚举的落点：
+                            // 带 / 或空格会被当成 URI 的一部分，带 $ 则是"分流套分流"——都列不出候选，
+                            // 只能在 -t 拒掉，不能等到线上把请求发给一个不存在的主机名。
+                            Self::check_split_branch_targets(
+                                &name,
+                                &targets,
+                                &loc.split_failover,
+                                d.line,
+                            )
+                            .map_err(|e| {
+                                AppError::Other(format!("location '{}'：{e}", loc.pattern))
+                            })?;
+                            loc.route_split = Some(RouteSplit {
+                                dest: name.clone(),
+                                key: def.key.clone(),
+                                branches,
+                                star: def.star.clone(),
+                                stats: crate::engine::register_split_route(&name, &targets),
+                            });
+                            if d.block
+                                .iter()
+                                .filter(|x| x.name == "proxy_redirect")
+                                .any(|x| x.arg(0) == Some("default"))
+                            {
+                                warnings.push(format!(
+                                    "location '{}'：proxy_redirect default 无法从 http://${name} 推断改写规则\
+                                     （目标是变量），请改成显式 proxy_redirect <原文> <替换>",
+                                    loc.pattern
+                                ));
+                            }
+                        }
+                        None => {
+                            // 变量来自 set/map/geo/请求本身：目标照样跟着变量走，但没有声明好的分支列表可退。
+                            // 这里最危险的一面是"客户端决定网关连到哪里"（$http_x_target、$arg_host、
+                            // $cookie_route 都是请求可控的），所以挂上落点白名单：运行期解析出的目标
+                            // 必须是配置里列得出来的落点，否则不回源。
+                            loc.var_targets = Some(Arc::clone(var_targets));
+                            if split_failover_declared && loc.split_failover != SplitFailover::Off {
+                                return Err(AppError::Other(format!(
+                                    "location '{}'：proxy_pass http://${name}（第 {} 行）里的 ${name} 不是 \
+                                     split_clients 的目标，网关列不出候选分支，proxy_split_failover \
+                                     不可能生效。要么把 ${name} 改成某个 split_clients 的 $dest，\
+                                     要么写 proxy_split_failover off;",
+                                    loc.pattern, d.line
+                                )));
+                            }
+                            warnings.push(format!(
+                                "location '{}'：proxy_pass http://${name}（第 {} 行）的变量不是 split_clients \
+                                 产的，按比例分流不生效（目标随变量变，但选中的目标不可用时不会改投）；\
+                                 运行期只连配置里列得出来的落点（已声明的 upstream 池 / 写死的 proxy_pass \
+                                 主机 / split_clients 分支 / proxy_split_failover 目标），其余 502 不回源",
+                                loc.pattern, d.line
+                            ));
+                        }
+                    }
+                }
+            }
         }
         // proxy_redirect：off | default | <redirect> <replacement>（可重复）。
         // 有意偏离 nginx：未显式声明时不改写 Location（nginx 默认会隐式 default），
@@ -3242,6 +3630,51 @@ mod tests {
         Router::build(&cfg(s), &PathBuf::from(".")).unwrap()
     }
 
+    /// 主机位是**非分流**变量时的运行期落点白名单：只收配置里写下来的落点。
+    /// 多收一个就等于白给一个客户端可选的外连目标，少收一个就是把合法写法误杀。
+    /// （split_clients 的分支值来自进程级全局表，并发单测会互相看到对方装的 split，
+    /// 所以这里只核对"本配置列得出的部分"，以及没写过的落点一定不在集合里。）
+    #[test]
+    fn declared_targets_only_lists_what_the_config_writes_down() {
+        let set = Router::declared_targets(&cfg(
+            "upstream pool_a { server 127.0.0.1:18001; }
+             server { listen 127.0.0.1:18000;
+               location /lit { proxy_pass http://127.0.0.1:18002; }
+               location /named { proxy_pass http://pool_a/api; }
+               location /fb { proxy_pass http://$route; proxy_split_failover http://127.0.0.1:18003; }
+               location /mid { proxy_pass http://127.0.0.1:$arg_port/x; }
+             }",
+        ));
+        for want in ["pool_a", "127.0.0.1:18002", "127.0.0.1:18003"] {
+            assert!(set.contains(want), "{want} 是配置里写下来的落点，应在集合里：{set:?}");
+        }
+        // 池里的节点地址不是"落点"（那是池内部的事），没写过的地址更不能凭空出现在集合里
+        for absent in ["127.0.0.1:18001", "127.0.0.1:19999", "$arg_port"] {
+            assert!(!set.contains(absent), "{absent} 不该被当成落点：{set:?}");
+        }
+    }
+
+    /// 这套闸门只对"主机位是变量"的 location 付费：目标写死的那条连集合都不挂。
+    #[test]
+    fn only_variable_host_routes_carry_the_allowlist() {
+        let r = build(
+            "upstream pool_a { server 127.0.0.1:18001; }
+             server { listen 127.0.0.1:18000;
+               location /lit { proxy_pass http://pool_a; }
+               location /var { proxy_pass http://$backend; }
+             }",
+        );
+        assert!(
+            loc_at(&r, 18000, 0).var_targets.is_none(),
+            "字面量目标不该挂白名单"
+        );
+        let set = loc_at(&r, 18000, 1)
+            .var_targets
+            .clone()
+            .expect("主机位是变量的 location 必须带落点白名单");
+        assert!(set.contains("pool_a"), "{set:?}");
+    }
+
     /// S11：限流区的 key 写了运行期根本不展开的变量，配置"看着生效"、实际按 IP 限。
     /// 这类静默的按预期失败放行不许只留一行告警：`-t` 直接否决，且点名那个 key。
     #[test]
@@ -3731,6 +4164,137 @@ mod tests {
             server { listen 127.0.0.1:18194; location / { return 200 y; } }
         "#;
         assert!(Router::parse_splits(&cfg(bad), &mut Vec::new()).is_err());
+    }
+
+    /// `0%` 必须解析得过：`proxy_split_failover` 的报错文案让用户把比例之外的退路声明成
+    /// "0% 的那一路"，如果 `-t` 自己就拒绝 0%，那句指引就是把人往坑里带。负数照旧是错误。
+    #[test]
+    fn zero_percent_bucket_is_declared_but_negative_is_an_error() {
+        let mut warns = Vec::new();
+        let defs = Router::parse_splits(
+            &cfg(
+                r#"
+                split_clients "${http_x_key}" $r { 0% legacy; 70% a; * b; }
+                server { listen 127.0.0.1:18193; location / { return 200 ok; } }
+            "#,
+            ),
+            &mut warns,
+        )
+        .expect("0% 是合法的：只当改投落点");
+        assert_eq!(defs[0].buckets.len(), 2);
+        assert_eq!(defs[0].buckets[0].percent, 0.0);
+        assert_eq!(defs[0].buckets[0].result, "legacy");
+        // 0% 也算声明过的分支，所以显式改投到它合法（这条与文案配套）
+        Router::check_split_branch_targets(
+            "r",
+            &["legacy".into(), "a".into(), "b".into()],
+            &SplitFailover::Target("legacy".into()),
+            1,
+        )
+        .expect("改投到 0% 那一路应当在比例声明之内");
+
+        let e = Router::parse_splits(
+            &cfg(
+                r#"
+                split_clients "${http_x_key}" $n { -1% a; * b; }
+                server { listen 127.0.0.1:18193; location / { return 200 ok; } }
+            "#,
+            ),
+            &mut Vec::new(),
+        )
+        .expect_err("负权重是配置错误");
+        assert!(e.to_string().contains("负数"), "{e}");
+    }
+
+    /// 分流目标只有"整段一个变量"这一种形状能静态枚举。拼在主机位中间的变量、
+    /// 含变量的改投目标，都要在 `-t` 拒掉而不是留到线上。
+    #[test]
+    fn split_target_shapes_are_checked_at_config_time() {
+        for (pp, want) in [
+            ("http://backend", TargetVar::Literal),
+            ("http://127.0.0.1:8080/p", TargetVar::Literal),
+            ("https://$route", TargetVar::Var("route".into())),
+            ("http://$route", TargetVar::Var("route".into())),
+            ("http://${route}", TargetVar::Var("route".into())),
+            ("http://${route}/api/v1", TargetVar::Var("route".into())),
+            // 拼串：列不出候选，也无法判断改投往哪退
+            ("http://a$route.example.com", TargetVar::Invalid),
+            ("http://$route.example.com", TargetVar::Invalid),
+            ("http://$route-dash", TargetVar::Invalid),
+            ("http://${route", TargetVar::Invalid),
+            ("http://$", TargetVar::Invalid),
+        ] {
+            assert_eq!(Router::target_variable(pp), want, "{pp}");
+        }
+
+        // 主机位是拼出来的：列不出候选分支，直接否决
+        let e = Router::build(
+            &cfg("server { listen 127.0.0.1:18177; location / { proxy_pass http://a$route; } }"),
+            &PathBuf::from("."),
+        )
+        .expect_err("变量不能拼在主机位中间");
+        assert!(e.to_string().contains("主机位中间"), "{e}");
+
+        // 改投目标写成变量：退到哪一路必须可静态核对
+        let e = Router::build(
+            &cfg(
+                "server { listen 127.0.0.1:18179; location / { proxy_pass http://backend; \
+                 proxy_split_failover $fallback; } }",
+            ),
+            &PathBuf::from("."),
+        )
+        .expect_err("改投目标不能是变量");
+        let msg = e.to_string();
+        assert!(msg.contains("$fallback") && msg.contains("不能是变量"), "{msg}");
+
+        // 目标是写死的服务，却声明了改投策略：一行都不会生效，直接否决
+        let e = Router::build(
+            &cfg(
+                "server { listen 127.0.0.1:18178; location / { proxy_pass http://backend; \
+                 proxy_split_failover off; } }",
+            ),
+            &PathBuf::from("."),
+        )
+        .expect_err("字面量目标没有可改投的分支");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("proxy_split_failover") && msg.contains("不会生效"),
+            "{msg}"
+        );
+    }
+
+    /// 分桶值站到主机位上之后必须是可枚举落点；显式改投目标必须是声明过的某一路。
+    /// 这里直接调用纯函数：`Router::build` 会把 `split_clients` 装进全局表并按构建替换，
+    /// 并发单测里读不到稳定的表，用全局表做断言会抖。
+    #[test]
+    fn split_branch_targets_must_be_enumerable_hosts() {
+        let ok = ["v1".to_string(), "127.0.0.1:9000".to_string(), "canary".to_string()];
+        for failover in [
+            SplitFailover::On,
+            SplitFailover::Off,
+            SplitFailover::Target("canary".into()),
+        ] {
+            Router::check_split_branch_targets("v", &ok, &failover, 1)
+                .expect("池名与 host:port 都是合法落点");
+        }
+        // 主机位里不能带路径、空格、制表符或变量
+        for bad in ["v1/api", "v1 v2", "v1\tv2", "http://$inner"] {
+            let e = Router::check_split_branch_targets("v", &[bad.to_string()], &SplitFailover::On, 7)
+                .expect_err("'{bad}' 不是可枚举的主机位");
+            assert!(e.contains(bad) && e.contains("主机位"), "{e}");
+        }
+        // 显式改投目标必须在这套比例之内；要退到外面就把它写成 0% 的那一路
+        let e = Router::check_split_branch_targets(
+            "v",
+            &ok,
+            &SplitFailover::Target("stable".into()),
+            9,
+        )
+        .expect_err("stable 不在声明的分支里");
+        assert!(
+            e.contains("stable") && e.contains("0%") && e.contains("v1 / 127.0.0.1:9000 / canary"),
+            "{e}"
+        );
     }
 
     const TWO_HOSTS: &str = r#"

@@ -6,8 +6,10 @@
 # 覆盖：
 #   R1 客户端输入能否变成 Lua 源码或 Lua 文件路径（配置参数不做变量插值）
 #   R2 internal location 的可达性边界（直连/规范化变体 vs 网关自己的内部重定向）
-#   R3 动态上游：proxy_pass 里的 $arg_/$http_ 是否让客户端决定连到哪儿（SSRF），
-#      以及绝对形式请求目标（GET http://host:port/）会不会被原样转发或触发外连
+#   R3 动态上游：proxy_pass 主机位是变量时客户端能否把网关指向任意地址（SSRF）——
+#      配置层否决"变量拼在主机位中间"，运行层只允许命中"配置里列得出来的落点"白名单，
+#      并用合法对照组排除"一律不通"的假阴性；另外核对绝对形式请求目标
+#      （GET http://host:port/）不会被原样转发或触发外连
 #   R4 CRLF：编码后的 CR/LF 能否变成后端请求行里的第二个头，Lua 把 $uri 写进响应头
 #      能否做响应拆分（必须失败关闭）
 #   R5 Lua 能力面（事实记录）：debug 库不可达；os/io/load 可达 = 脚本级任意代码，
@@ -78,18 +80,32 @@ def wait_free(port, timeout=8.0):
     return False
 
 
+def conf_text(tmp, tag, body, head=""):
+    return (
+        f'error_log "{slash(os.path.join(tmp, f"err_{tag}.log"))}" warn;\n'
+        f'pid "{slash(os.path.join(tmp, "p.pid"))}";\n'
+        + head
+        + f"\nserver {{\n  listen 127.0.0.1:{PORT};\n  server_name rce.local;\n{body}\n}}\n"
+    )
+
+
+def config_test(tmp, tag, body, head=""):
+    """只跑 -t（不启进程），返回 (rc, 合并输出)。用于核对配置层的否决/告警。"""
+    path = os.path.join(tmp, f"t_{tag}.conf")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(conf_text(tmp, tag, body, head))
+    p = subprocess.run([find_binary(), "-t", "-c", path], cwd=ROOT, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
 class Gateway:
     """一条配置 = 一个进程，探针之间不互相污染。"""
 
     def __init__(self, tmp, tag, body, head=""):
         self.tmp = tmp
         self.err = os.path.join(tmp, f"err_{tag}.log")
-        conf = (
-            f'error_log "{slash(self.err)}" warn;\n'
-            f'pid "{slash(os.path.join(tmp, "p.pid"))}";\n'
-            + head
-            + f"\nserver {{\n  listen 127.0.0.1:{PORT};\n  server_name rce.local;\n{body}\n}}\n"
-        )
+        conf = conf_text(tmp, tag, body, head)
         path = os.path.join(tmp, f"{tag}.conf")
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(conf)
@@ -372,32 +388,68 @@ def r2_internal(tmp):
 # ---------------------------------------------------------------- R3
 
 def r3_ssrf(tmp, echo):
-    """客户端不能决定网关连到哪里；绝对形式请求目标也不能变成外连或转发信号。"""
+    """客户端不能决定网关连到哪里：主机位是变量时，落点只能是配置里列得出来的那些。
+
+    两层都要有证据：配置层把"列不出候选"的写法否决掉；运行层证明请求可控的整段变量
+    虽然配置合法（要留给 map/set 选池用），但解析出的落点不在白名单里就一个 socket 都不开
+    —— 而命中白名单的照样正常回源，否则这一节全是假阴性。
+    """
+    rc, out = config_test(tmp, "r3mid",
+                          '  location /p {\n    proxy_pass http://127.0.0.1:$arg_port/x;\n  }\n')
+    check("R3 端口由 $arg_ 决定（变量拼在主机位中间）在 -t 就被否决",
+          rc != 0 and "把变量拼在了主机位中间" in out, f"rc={rc} out={out[:160]!r}")
+
+    rc2, out2 = config_test(tmp, "r3mid2",
+                            '  location /h {\n    proxy_pass http://$http_x_canary_host:$arg_p/;\n  }\n')
+    check("R3 主机名与端口都来自请求的写法在 -t 就被否决",
+          rc2 != 0 and "把变量拼在了主机位中间" in out2, f"rc={rc2} out={out2[:160]!r}")
+
+    rc3, out3 = config_test(
+        tmp, "r3gate",
+        '  location /h {\n    proxy_pass http://$http_x_canary_host/;\n  }\n')
+    check("R3 整段请求头变量配置合法（不能顺手废掉 map/set 选池）但 -t 说清只认列得出的落点",
+          rc3 == 0 and "列得出来的落点" in out3, f"rc={rc3} out={out3[:200]!r}")
+
     gw = Gateway(
         tmp, "r3",
-        '  location /p {\n    proxy_pass http://127.0.0.1:$arg_port/x;\n  }\n'
-        '  location /h {\n    proxy_pass http://$http_x_canary_host:$arg_p/;\n  }\n'
+        '  location /h {\n    proxy_pass http://$http_x_canary_host/;\n  }\n'
+        '  location /a {\n    proxy_pass http://$arg_host/;\n  }\n'
+        '  location /v {\n    proxy_pass http://$route;\n  }\n'
         '  location /e {\n    proxy_pass http://127.0.0.1:18341;\n  }\n'
         '  location /ping { return 200 "pong"; }\n',
+        head="upstream safe { server 127.0.0.1:18341; }\n"
+             'map $http_x_env $route {\n  default safe;\n}\n',
     )
     try:
         assert gw.ready(), gw.dead
         base = echo.seen()
         before = CANARY.count()
-        st, _, body, _ = http_call(f"/p?port={CANARY_PORT}")
-        time.sleep(0.3)
-        check("R3 proxy_pass 的端口不由 $arg_ 决定（无 SSRF 原语）",
-              CANARY.count() == before, f"status={st} 金丝雀 +{CANARY.count()-before}")
 
-        st2, _, _, _ = http_call("/h", headers={"X-Canary-Host": "127.0.0.1"})
+        st, _, body, _ = http_call("/h", headers={"X-Canary-Host": f"127.0.0.1:{CANARY_PORT}"})
         time.sleep(0.3)
-        check("R3 上游主机名不由请求头决定",
-              CANARY.count() == before, f"status={st2} 金丝雀 +{CANARY.count()-before}")
+        check("R3 请求头决定主机位时不会朝金丝雀开 socket",
+              CANARY.count() == before and st == 502,
+              f"status={st} 金丝雀 +{CANARY.count()-before}")
 
-        st3, _, body3, _ = http_call("/e/probe-normal")
-        got = [l for l in echo.seen()[len(base):]]
+        st2, _, _, _ = http_call(f"/a?host=127.0.0.1:{CANARY_PORT}")
+        time.sleep(0.3)
+        check("R3 查询串决定主机位时同样不会朝金丝雀开 socket",
+              CANARY.count() == before and st2 == 502,
+              f"status={st2} 金丝雀 +{CANARY.count()-before}")
+
+        err_txt = gw.read_err()
+        check("R3 拒绝的理由写进 error log（不是碰巧 502）",
+              "undeclared proxy_pass target" in err_txt, err_txt[-200:])
+
+        st3, _, body3, _ = http_call("/v", headers={"X-Env": "anything"})
+        got_v = echo.seen()[len(base):]
+        check("R3 对照组：变量指向已声明的池照常回源（白名单不是一律不通）",
+              st3 == 200, f"st={st3} 后端看到={got_v[-1][:60]!r}")
+
+        st4, _, body4, _ = http_call("/e/probe-normal")
+        got = [l for l in echo.seen()[len(base):] if b"/probe-normal" in l]
         check("R3 固定上游照常代理（对照组不是假阴性）",
-              st3 == 200 and any(b"/probe-normal" in l for l in got), f"st={st3} 后端看到={got[:2]}")
+              st4 == 200 and got, f"st={st4} 后端看到={got[:1]}")
 
         raw = raw_request((f"GET http://127.0.0.1:{CANARY_PORT}/abs HTTP/1.1\r\n"
                            f"Host: rce.local\r\nConnection: close\r\n\r\n").encode())
@@ -415,8 +467,8 @@ def r3_ssrf(tmp, echo):
         check("R3 协议相对形式路径不会变成新的上游选择",
               CANARY.count() == before, f"resp={raw2[:60]!r}")
 
-        st4, _, body4, _ = http_call("/ping")
-        check("R3 网关全程存活", st4 == 200 and body4 == b"pong", f"st={st4}")
+        st5, _, body5, _ = http_call("/ping")
+        check("R3 网关全程存活", st5 == 200 and body5 == b"pong", f"st={st5}")
     finally:
         gw.stop()
 

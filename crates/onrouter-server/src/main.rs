@@ -287,7 +287,7 @@ fn main() {
 
     if args.test {
         std::process::exit(
-            match check(&router, &settings, &limits, &learning, &startup_warnings) {
+            match check(&router, &settings, &limits, &learning, &config, &startup_warnings) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("[onrouter] {e}");
@@ -342,6 +342,7 @@ fn check(
     settings: &Settings,
     limits: &limit::Limits,
     learning: &learning::Learning,
+    config: &Config,
     warnings: &[String],
 ) -> Result<(), String> {
     if router.listeners.is_empty() {
@@ -388,6 +389,26 @@ fn check(
     if !fps.is_empty() {
         println!("  前置代理识别 {}", front_proxy::describe(&fps));
     }
+    // upstream 段：以前只有真正启动时才解析，于是出现过"-t 通过、启动才炸"。
+    // 自适应选点的冲突（ip_hash + least_time、单节点池）必须在这一步就看得见。
+    let pool = UpstreamPool::parse_all(config).map_err(|e| e.to_string())?;
+    for w in &pool.warnings {
+        println!("  告警 {w}");
+    }
+    let mut names: Vec<&String> = pool.map.keys().collect();
+    names.sort();
+    for name in names {
+        if let Some(up) = pool.get(name) {
+            if let Some(line) = up.least_time_desc() {
+                println!("  {line}");
+            }
+        }
+    }
+    // 业务分流（proxy_pass http://$变量）逐条自述：声明的比例、粘性键、改投策略。
+    // 这行是"-t 通过不代表比例按你想的走"的那道补票：把网关读出来的那张表打出来。
+    for line in &router.split_routes {
+        println!("  {line}");
+    }
     if !warnings.is_empty() {
         // 逐条打印：这些行就是"配置里有指令没生效"，只给个数量等于没给
         println!("  告警 {} 条：", warnings.len());
@@ -412,6 +433,9 @@ async fn run(
 ) -> Result<(), AppError> {
     let conf_display = conf_path.display().to_string();
     let pool = UpstreamPool::parse_all(&config)?;
+    for w in &pool.warnings {
+        log_warn!("{w}");
+    }
     let pool = Arc::new(pool);
     let handlers = Arc::new(HandlerRegistry::with_builtins());
     let lua = LuaEngine::new(&config, &base_dir)?;
@@ -433,6 +457,8 @@ async fn run(
 
     let listener_specs = router.listeners.clone();
     let cert_files = crate::tls::cert_files(&router.listeners);
+    // 分流自述要在 router 移入 state 之后再打印，所以先把这几行留下
+    let split_lines = router.split_routes.clone();
     let stream_specs: Vec<Arc<router::StreamServer>> =
         router.stream.clone().into_iter().map(Arc::new).collect();
     if listener_specs.is_empty() && stream_specs.is_empty() {
@@ -603,6 +629,27 @@ async fn run(
         state.lua.vm_count(),
         pool.map.keys().collect::<Vec<_>>()
     );
+    // 自适应选点只在开了 observe/on 时出声；启动就把档位和账目指标名写进日志，
+    // 运营者不必事后猜"这个池到底有没有在测"。
+    {
+        let mut names: Vec<&String> = pool.map.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(up) = pool.get(name) {
+                if let Some(line) = up.least_time_desc() {
+                    log_info!("{line}；账目见 /metrics 的 onrouter_upstream_least_time_total 与 onrouter_upstream_server_ewma_seconds");
+                }
+            }
+        }
+    }
+    // 业务分流在启动横幅里自述一次：这配置把哪条 location 按什么比例分成哪几路、
+    // 选中路全挂时怎么办。计数指标名一起写出来，运营者不用事后猜"到底有没有在分"。
+    for line in &split_lines {
+        log_info!(
+            "{line}；落点比例见 /metrics 的 onrouter_proxy_split_targets_total，\
+             结局计数见 onrouter_proxy_split_total"
+        );
+    }
     let so_rows = still_online.zone_rows();
     if !so_rows.is_empty() {
         log_info!(
@@ -842,6 +889,18 @@ fn do_reload(
                 }
                 for note in state.limits.apply_vip(&live) {
                     log_warn!("热重载信誉: {note}");
+                }
+                // upstream 池（连同 least_time 的 EWMA）挂在启动时构建的 Arc 上，热重载不替换它。
+                // 这里照样按新配置打一行档位并说明"要重启"，否则运维会以为 SIGHUP 就切了档。
+                if let Ok(p) = UpstreamPool::parse_all(&cfg) {
+                    for w in &p.warnings {
+                        log_warn!("热重载告警: {w}");
+                    }
+                    for up in p.map.values() {
+                        if let Some(line) = up.least_time_desc() {
+                            log_info!("热重载 {line}（upstream 池不热替换，档位改动要重启才生效）");
+                        }
+                    }
                 }
                 // 证书 / ssl_protocols / ssl_certificate_by_lua 脚本按新配置原地刷新；
                 // 监听 socket 不动，新连接下一次握手即用新证书

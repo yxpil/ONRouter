@@ -35,7 +35,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_service::Service as _;
 
 use crate::engine::RequestCtx;
+use crate::engine::SplitRole;
 use crate::proxy_tls::{ProxyConnector, ProxyStream, TlsPolicy};
+use crate::router::SplitFailover;
 use crate::upstream::{KeepaliveOpts, UpstreamGuard, UpstreamPool};
 use crate::{log_warn, log_info};
 
@@ -275,6 +277,68 @@ pub struct ProxyOpts<'a> {
     pub next_upstream_timeout: Duration,
     /// `proxy_ssl_*` 解析出的 https/wss 后端 TLS 策略
     pub tls: &'a TlsPolicy,
+    /// `proxy_pass http://$变量` 分流（构建期已解析）；None = 目标写死
+    pub split: Option<&'a crate::router::RouteSplit>,
+    /// `proxy_split_failover`：本意那一路全挂时改投还是原样失败
+    pub split_failover: SplitFailover,
+    /// 主机位是**非分流**变量（`set`/`map`/`geo`/请求可控变量）时，允许真正去连的落点集合。
+    /// None = 目标写死或由 `split_clients` 枚举，这一层不查表。见 `Router::declared_targets`。
+    pub var_targets: Option<&'a Arc<std::collections::HashSet<String>>>,
+}
+
+/// 分流改投的候选顺序：本意那一路永远排第一，后面按 `proxy_split_failover` 决定留不留退路。
+///
+/// 候选只在"请求还没交给任何后端节点"这个时刻逐个尝试 —— 这是这套语义的安全边界：
+/// 一旦请求发给了某个节点，成败就归 `proxy_next_upstream` 与 `error_page` 管，绝不跨路
+/// 重投，否则一个 POST 会被写进两个业务版本。没有分流时只有一个候选，与目标写死的
+/// 今天行为逐字一致。
+fn split_candidates(
+    chosen: &str,
+    split: Option<&crate::router::RouteSplit>,
+    failover: &SplitFailover,
+) -> Vec<String> {
+    let Some(sp) = split else {
+        return vec![chosen.to_string()];
+    };
+    let mut out = vec![chosen.to_string()];
+    match failover {
+        SplitFailover::Off => {}
+        SplitFailover::On => out.extend(sp.fallback_order(chosen)),
+        SplitFailover::Target(t) => out.push(t.clone()),
+    }
+    out
+}
+
+/// 落点候选是否"自带落点"：IP 字面量，或写了显式端口。
+/// 裸名字（`v2`）不算 —— 它要么是具名 upstream 池，要么就该报错，绝不能悄悄交给 DNS 猜：
+/// 一条通配 A 记录就能把这一路的流量变成另一路的，而分流的落点必须是配置能逐个枚举出来的。
+pub(crate) fn is_direct_host(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>().is_ok() || s.contains(':')
+}
+
+/// `http(s)://<主机位>[/路径]` 拆成（主机位, 路径）。
+///
+/// "这一路叫什么"就是主机位那一段：转发侧拿它选池，缓存侧拿它写 `$proxy_split`。
+/// 两侧共用这一个拆法，同一条分流不可能被理解成两个落点。
+pub(crate) fn split_target(target: &str) -> (&str, Option<&str>) {
+    let rest = target
+        .strip_prefix("https://")
+        .or_else(|| target.strip_prefix("http://"))
+        .unwrap_or(target);
+    match rest.split_once('/') {
+        Some((h, p)) => (h, Some(p)),
+        None => (rest, None),
+    }
+}
+
+/// 一个落点候选解析出的结果：可连接的后端地址 + 它所属的池（组内换节点重试用）。
+struct BackendPick {
+    backend: String,
+    guard: Option<UpstreamGuard>,
+    keepalive: KeepaliveOpts,
+    max_attempts: usize,
+    tried: Vec<usize>,
+    pool: Option<String>,
 }
 
 /// 每个监听进程一个共享连接池客户端；连接池按 (connect 超时, keepalive 参数, TLS 策略指纹) 分组
@@ -298,6 +362,62 @@ impl ProxyEngine {
     pub fn with_resolver(mut self, resolver: Arc<crate::dns::DnsResolver>) -> Self {
         self.resolver = Some(resolver);
         self
+    }
+
+    /// 把一个落点候选换成可连接的后端：具名 upstream 池优先（负载均衡 + 被动健康检查），
+    /// 其次 host:port / IP 直连。
+    ///
+    /// `strict` = 这个候选来自分流。严格模式下裸名字查不到池就是错误（`no split branch`），
+    /// 不交给 DNS 猜；目标写死的老路径 strict=false，行为与今天完全一致。
+    fn pick_backend(
+        &self,
+        cand: &str,
+        remote: &str,
+        strict: bool,
+    ) -> Result<BackendPick, String> {
+        if cand.is_empty() {
+            return Err("empty split branch（分桶选中的目标是空串）".to_string());
+        }
+        if let Some(up) = self.pool.get(cand) {
+            // 分流的判据比 acquire 更严：整池都在 fail_timeout 摘除期内就算"这一路没人可服务"，
+            // 允许按 proxy_split_failover 改投（普通 proxy_pass 不走这里，行为不变）
+            if strict && !up.split_has_live_server() {
+                return Err(format!("no live upstreams: {cand}（全部节点在摘除期内）"));
+            }
+            let keepalive = up.keepalive;
+            let max_attempts = up.server_count().max(1).min(8);
+            return match up.acquire(remote, &[]) {
+                Some(g) => {
+                    let tried = vec![g.idx()];
+                    let addr = (*g).clone();
+                    Ok(BackendPick {
+                        backend: addr,
+                        guard: Some(g),
+                        keepalive,
+                        max_attempts,
+                        tried,
+                        pool: Some(cand.to_string()),
+                    })
+                }
+                // 对齐 nginx：全组没有可选节点时是 502 + "no live upstreams"，
+                // 不是把请求硬塞给已经摘除的节点
+                None => Err(format!("no live upstreams: {cand}")),
+            };
+        }
+        if strict && !is_direct_host(cand) {
+            return Err(format!(
+                "no split branch: {cand}（既不是已声明的 upstream 池，也没写显式端口；\
+                 分流的目标必须是池名或 host:port，不能靠 DNS 猜）"
+            ));
+        }
+        Ok(BackendPick {
+            backend: cand.to_string(),
+            guard: None,
+            keepalive: KeepaliveOpts::default(),
+            max_attempts: 2,
+            tried: Vec::new(),
+            pool: None,
+        })
     }
 
     /// 若挂了 resolver 且目标主机是域名（非 IP 字面量），把它解析成 "IP:port" 作为连接目标，
@@ -373,42 +493,105 @@ impl ProxyEngine {
         let is_https = target.starts_with("https://");
         // 解析目标：http(s)://host[:port][/path]
         // 带路径时替换 location 前缀（对标 nginx proxy_pass 的 URI 语义）
-        let rest = target
-            .strip_prefix("https://")
-            .or_else(|| target.strip_prefix("http://"))
-            .unwrap_or(target);
-        let (host_part, uri_part) = match rest.split_once('/') {
-            Some((h, p)) => (h.to_string(), Some(format!("/{p}"))),
-            None => (rest.to_string(), None),
+        let (host, path) = split_target(target);
+        let host_part = host.to_string();
+        let uri_part = path.map(|p| format!("/{p}"));
+        // 主机位是**非分流**变量时：客户端不能决定网关连到哪里。插值出来的落点必须是
+        // 配置里列得出来的那批（构建期算好，所有 location 共享一份），否则一个 socket 都不开。
+        // 没挂白名单的两类路径 —— 目标写死、目标由 split_clients 枚举 —— 连这次查表都不做。
+        if let (None, Some(allow)) = (opts.split, opts.var_targets) {
+            if !allow.contains(host_part.as_str()) {
+                return Err(format!(
+                    "undeclared proxy_pass target: {host_part}（主机位是变量，但 '{host_part}' 不是 \
+                     配置里列得出来的落点：已声明的 upstream 池 / 写死的 proxy_pass 主机 / \
+                     split_clients 分支 / proxy_split_failover 目标。请求已拒绝，未回源）"
+                ));
+            }
+        }
+        // 分流归属：balancer_by_lua 显式选点时完全不介入（选节点归 Lua 管）。
+        let routing = opts
+            .split
+            .filter(|_| ctx.balancer_peer.is_none())
+            .map(|sp| (sp, host_part.clone()));
+        let chosen: Option<&str> = routing.as_ref().map(|(_, c)| c.as_str());
+        // 落点账本（分流才有；登记超限时是 None —— 分流照走，只是不统计）
+        let stats = routing.as_ref().and_then(|(sp, _)| sp.stats.clone());
+        if let Some(c) = chosen {
+            ctx.proxy_split = c.to_string();
+            if c.is_empty() {
+                if let Some(st) = &stats {
+                    st.note(SplitRole::Empty);
+                }
+            }
+        }
+        let mut pick: Option<BackendPick> = None;
+        let mut pick_err = String::new();
+        if let Some((bh, bp)) = ctx.balancer_peer.clone() {
+            pick = Some(BackendPick {
+                backend: format!("{bh}:{bp}"),
+                guard: None,
+                keepalive: KeepaliveOpts::default(),
+                max_attempts: 1,
+                tried: Vec::new(),
+                pool: None,
+            });
+        } else {
+            // 逐个候选试到"能给出一个后端地址"为止 —— 跨路改投只发生在这个时刻。
+            let candidates = split_candidates(&host_part, opts.split, &opts.split_failover);
+            for cand in candidates.iter() {
+                let outcome = match self.pick_backend(cand, &ctx.remote_addr, chosen.is_some()) {
+                    // 分流分支的域名先探一次解析：探不通 = 这一路现在没人可服务，按策略改投，
+                    // 而不是把 502 直接砸回客户端。没配 resolver 时不探（域名交给系统解析，
+                    // 失败即 502 且不改投）；https 也不探（SNI/证书校验必须保留 DNS 名）。
+                    Ok(p) if chosen.is_some() && !is_https && self.resolver.is_some() => {
+                        match self.connect_target(&p.backend).await {
+                            Ok(_) => Ok(p),
+                            Err(e) => Err(format!("unresolvable '{cand}': {e}")),
+                        }
+                    }
+                    other => other,
+                };
+                match outcome {
+                    Ok(p) => {
+                        ctx.proxy_split_served = cand.clone();
+                        if let Some(st) = &stats {
+                            st.note_served(cand);
+                            st.note(if Some(cand.as_str()) == chosen {
+                                SplitRole::Routed
+                            } else {
+                                SplitRole::Bled
+                            });
+                        }
+                        pick = Some(p);
+                        break;
+                    }
+                    Err(e) => {
+                        if let Some(st) = &stats {
+                            st.note(SplitRole::Down);
+                        }
+                        if candidates.len() > 1 {
+                            log_warn!("分流改投：'{cand}' 无人可服务（{e}），按 proxy_split_failover 试下一路");
+                        }
+                        // 回给客户端的那条留本意那一路的错误：运维要查的是"分到的那一路为什么没人"
+                        if pick_err.is_empty() {
+                            pick_err = e;
+                        }
+                    }
+                }
+            }
+        }
+        let Some(p) = pick else {
+            return Err(pick_err);
         };
         // upstream 负载均衡：guard 存活期间连接计数 +1，并用于健康检查上报
-        let mut guard_holder: Option<UpstreamGuard> = None;
-        let mut tried: Vec<usize> = Vec::new();
-        let mut max_attempts = 2;
-        // 命具 named upstream 时套用其 keepalive 调优；直连目标走默认（hyper 池默认）。
-        let mut keepalive = KeepaliveOpts::default();
-        let backend = if let Some((bh, bp)) = ctx.balancer_peer.clone() {
-            // balancer_by_lua 显式选定节点：绕开 upstream 负载均衡，直连该 host:port。
-            // 单跳转发（Lua 已在对端选择逻辑里自行处理节点，不在这里做组内 failover）。
-            max_attempts = 1;
-            format!("{bh}:{bp}")
-        } else if let Some(up) = self.pool.get(&host_part) {
-            max_attempts = up.server_count().max(1).min(8);
-            keepalive = up.keepalive;
-            match up.acquire(&ctx.remote_addr, &tried) {
-                Some(g) => {
-                    tried.push(g.idx());
-                    let addr = (*g).clone();
-                    guard_holder = Some(g);
-                    addr
-                }
-                // 对齐 nginx：全组没有可选节点时是 502 + "no live upstreams"，
-                // 不是把请求硬塞给已经摘除的节点
-                None => return Err(format!("no live upstreams: {host_part}")),
-            }
-        } else {
-            host_part.clone()
-        };
+        let mut guard_holder = p.guard;
+        let mut backend = p.backend;
+        // 命中 named upstream 时套用其 keepalive 调优；直连目标走默认（hyper 池默认）。
+        let keepalive = p.keepalive;
+        let mut max_attempts = p.max_attempts;
+        let mut tried = p.tried;
+        // 组内换节点重试只在本意那一路的池里换，绝不跨到别的业务版本
+        let pool_name = p.pool;
         // 健康上报：模块级函数避免闭包借用与 async 冲突
         fn note(guard_holder: &Option<UpstreamGuard>, ok: bool) {
             if let Some(g) = guard_holder {
@@ -515,7 +698,6 @@ impl ProxyEngine {
         let retry_deadline = (!opts.next_upstream_timeout.is_zero())
             .then(|| std::time::Instant::now() + opts.next_upstream_timeout);
 
-        let mut backend = backend;
         // balancer_by_lua set_timeouts 覆盖 location 的连接/写/读超时
         let eff_connect = ctx
             .balancer_timeouts
@@ -535,7 +717,7 @@ impl ProxyEngine {
                 if retry_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                     break;
                 }
-                if let Some(up) = self.pool.get(&host_part) {
+                if let Some(up) = pool_name.as_ref().and_then(|n| self.pool.get(n)) {
                     match up.acquire(&ctx.remote_addr, &tried) {
                         Some(g) => {
                             tried.push(g.idx());
@@ -546,7 +728,10 @@ impl ProxyEngine {
                         None => break,
                     }
                 }
-                log_warn!("upstream {host_part} 换节点重试: {backend}");
+                log_warn!(
+                    "upstream {} 换节点重试: {backend}",
+                    pool_name.as_deref().unwrap_or(&host_part)
+                );
             }
             // https 后端保留主机名（SNI/证书校验需要 DNS 名），不做 resolver→IP 改写；
             // http 后端若配了 resolver 则把域名换成 IP 以跳过阻塞式 getaddrinfo。
@@ -619,7 +804,12 @@ impl ProxyEngine {
                     // 响应头已到：guard 随响应体继续存活，读完/失败后才结算
                     let (parts, incoming) = r.into_parts();
                     ctx.upstream_status = parts.status.as_u16();
-                    ctx.upstream_header_time = t0.elapsed().as_secs_f64();
+                    let header_dt = t0.elapsed().as_secs_f64();
+                    ctx.upstream_header_time = header_dt;
+                    // 自适应选点的唯一样本来源：成功拿到响应头的请求才入账（口径同 nginx least_time header）
+                    if let Some(g) = &guard_holder {
+                        g.note_latency(header_dt);
+                    }
                     return Ok(Response::from_parts(
                         parts,
                         UpstreamBody::new(incoming, eff_read, guard_holder.take(), backend.clone()),
@@ -882,21 +1072,94 @@ impl ProxyEngine {
             Some((h, p)) => (h.to_string(), Some(format!("/{p}"))),
             None => (rest.to_string(), None),
         };
-        // balancer_by_lua 选点优先；否则 upstream 名走负载均衡 + 被动健康检查，最后按 host:port 直连
-        let mut guard_holder: Option<UpstreamGuard> = None;
-        let backend_addr = if let Some((bh, bp)) = ctx.balancer_peer.clone() {
-            format!("{bh}:{bp}")
-        } else if let Some(up) = self.pool.get(&host_part) {
-            match up.acquire(&ctx.remote_addr, &[]) {
-                Some(g) => {
-                    let addr = (*g).clone();
-                    guard_holder = Some(g);
-                    addr
-                }
-                None => return Err(format!("no live upstreams: {host_part}")),
+        // 与 forward() 同一道闸门：Upgrade 也是"网关朝一个落点开 socket"，
+        // 客户端能控制主机位变量时照样只允许配置里列得出来的落点。
+        if let (None, Some(allow)) = (opts.split, opts.var_targets) {
+            if !allow.contains(host_part.as_str()) {
+                return Err(format!(
+                    "undeclared proxy_pass target: {host_part}（主机位是变量，但 '{host_part}' 不是 \
+                     配置里列得出来的落点：已声明的 upstream 池 / 写死的 proxy_pass 主机 / \
+                     split_clients 分支 / proxy_split_failover 目标。请求已拒绝，未回源）"
+                ));
             }
-        } else {
-            host_part.clone()
+        }
+        // balancer_by_lua 选点优先；否则逐个分流候选试到"能给出一个后端地址"为止，
+        // 最后按 host:port 直连。跨路改投同样只发生在"还没把 Upgrade 发给任何节点"的时刻。
+        let mut guard_holder: Option<UpstreamGuard> = None;
+        let routing = opts
+            .split
+            .filter(|_| ctx.balancer_peer.is_none())
+            .map(|sp| (sp, host_part.clone()));
+        let chosen: Option<&str> = routing.as_ref().map(|(_, c)| c.as_str());
+        let stats = routing
+            .as_ref()
+            .and_then(|(sp, _)| sp.stats.clone());
+        if let Some(c) = chosen {
+            ctx.proxy_split = c.to_string();
+            if c.is_empty() {
+                if let Some(st) = &stats {
+                    st.note(SplitRole::Empty);
+                }
+            }
+        }
+        let backend_addr = match ctx.balancer_peer.clone() {
+            Some((bh, bp)) => format!("{bh}:{bp}"),
+            None => {
+                let candidates = split_candidates(&host_part, opts.split, &opts.split_failover);
+                let mut hit: Option<BackendPick> = None;
+                let mut err = String::new();
+                for cand in candidates.iter() {
+                    let p = match self
+                        .pick_backend(cand, &ctx.remote_addr, chosen.is_some())
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            if let Some(st) = &stats {
+                                st.note(SplitRole::Down);
+                            }
+                            if candidates.len() > 1 {
+                                log_warn!("WebSocket 分流改投：'{cand}' 无人可服务（{e}），按 proxy_split_failover 试下一路");
+                            }
+                            if err.is_empty() {
+                                err = e;
+                            }
+                            continue;
+                        }
+                    };
+                    // 与 forward 同口径：分流分支的域名解析不出来 = 这一路没人可服务，按策略改投。
+                    if chosen.is_some() && !is_tls && self.resolver.is_some() {
+                        if let Err(e) = self.connect_target(&p.backend).await {
+                            let e = format!("unresolvable '{cand}': {e}");
+                            if let Some(st) = &stats {
+                                st.note(SplitRole::Down);
+                            }
+                            if candidates.len() > 1 {
+                                log_warn!("WebSocket 分流改投：{e}");
+                            }
+                            if err.is_empty() {
+                                err = e;
+                            }
+                            continue;
+                        }
+                    }
+                    ctx.proxy_split_served = cand.clone();
+                    if let Some(st) = &stats {
+                        st.note_served(cand);
+                        st.note(if Some(cand.as_str()) == chosen {
+                            SplitRole::Routed
+                        } else {
+                            SplitRole::Bled
+                        });
+                    }
+                    hit = Some(p);
+                    break;
+                }
+                let Some(p) = hit else {
+                    return Err(err);
+                };
+                guard_holder = p.guard;
+                p.backend
+            }
         };
         // 访问日志的 $upstream_addr：即使在后续建连/握手阶段失败也要留下尝试目标
         ctx.upstream_addr = backend_addr.clone();
@@ -1126,6 +1389,8 @@ mod tests {
             balancer_recreate_request: false,
             upstream_addr: String::new(),
             upstream_status: 0,
+            proxy_split: String::new(),
+            proxy_split_served: String::new(),
             upstream_header_time: 0.0,
             ssl: None,
             start_time: 0.0,
@@ -1346,6 +1611,9 @@ mod tests {
             },
             next_upstream: &[],
             next_upstream_tries: 0,
+            split: None,
+            split_failover: SplitFailover::On,
+            var_targets: None,
             next_upstream_timeout: Duration::ZERO,
             tls: &tls,
         };
@@ -1376,6 +1644,9 @@ mod tests {
             },
             next_upstream: &[],
             next_upstream_tries: 0,
+            split: None,
+            split_failover: SplitFailover::On,
+            var_targets: None,
             next_upstream_timeout: Duration::ZERO,
             tls: &tls,
         };
@@ -1385,6 +1656,40 @@ mod tests {
         assert!(r.is_err(), "无监听端口应转发失败");
         assert_eq!(c.upstream_addr, "127.0.0.1:1");
         assert_eq!(c.upstream_status, 0);
+    }
+
+    /// 主机位是**非分流**变量时，白名单外的落点连一次 socket 都不许开 —— 客户端可控的
+    /// 变量（`$http_x_target` / `$arg_host` / `$cookie_route`）不能把网关变成任意地址的连接器。
+    /// 带对照组：同一个引擎、同一份 opts，挂进集合的落点照常回源 —— 否则"没连上"
+    /// 可能只是测试自己写错了，而不是闸门生效。
+    #[tokio::test]
+    async fn variable_host_outside_allowlist_never_connects() {
+        let reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (canary, canary_hits) = counted_backend(reply).await;
+        let (declared, declared_hits) = counted_backend(reply).await;
+        let e = ProxyEngine::new(Arc::new(UpstreamPool::default()));
+        let tls = TlsPolicy::default();
+        let allow = Arc::new(
+            [declared.clone()].
+                into_iter()
+                .collect::<std::collections::HashSet<String>>(),
+        );
+        let mut opts = test_opts(&tls, None, SplitFailover::On);
+        opts.var_targets = Some(&allow);
+
+        let err = e
+            .forward(&mut ctx(), &format!("http://{canary}"), "/x", &opts, ProxyBody::Buffered(None))
+            .await
+            .unwrap_err();
+        assert!(err.contains("undeclared proxy_pass target"), "{err}");
+        assert_eq!(canary_hits.load(Relaxed), 0, "白名单外的落点一次连接都不该发起");
+
+        let mut c2 = ctx();
+        let ok = e
+            .forward(&mut c2, &format!("http://{declared}"), "/x", &opts, ProxyBody::Buffered(None))
+            .await;
+        assert!(ok.is_ok(), "挂进集合的落点不该被拦：{:?}", ok.err());
+        assert_eq!(declared_hits.load(Relaxed), 1);
     }
 
     #[test]
@@ -1400,5 +1705,236 @@ mod tests {
         assert!(on.build_client_config().unwrap_err().contains("proxy_ssl_trusted_certificate"));
         // 不同策略的指纹必须不同，避免连接池串味
         assert_ne!(off.fingerprint(), on.fingerprint());
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    /// 固定应答的假后端 + 命中计数：分流不能只看返回码，必须证明请求有没有真的落到这一路
+    async fn counted_backend(reply: &'static str) -> (String, Arc<AtomicUsize>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf).await;
+                h.fetch_add(1, Relaxed);
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        (addr, hits)
+    }
+
+    /// 曾经监听、已经关掉的端口：connect 直接被拒
+    async fn dead_port() -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap().to_string();
+        drop(l);
+        a
+    }
+
+    fn pool_of(spec: &str) -> Arc<UpstreamPool> {
+        Arc::new(
+            UpstreamPool::parse_all(&onrouter_config::Config::parse(spec).expect("配置应能解析"))
+                .expect("upstream 应能构建"),
+        )
+    }
+
+    fn route(dest: &str, branches: &[&str]) -> crate::router::RouteSplit {
+        let targets: Vec<String> = branches.iter().map(|s| s.to_string()).collect();
+        crate::router::RouteSplit {
+            dest: dest.to_string(),
+            key: "\"${remote_addr}\"".to_string(),
+            branches: targets
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (if i == 0 { 100.0 } else { 0.0 }, t.clone()))
+                .collect(),
+            star: None,
+            stats: crate::engine::register_split_route(dest, &targets),
+        }
+    }
+
+    #[test]
+    fn split_candidate_order_follows_failover_policy() {
+        let sp = route("t_cand", &["v1", "v2", "v3"]);
+        // 默认 on：本意那一路排第一，其余按声明顺序补上来
+        assert_eq!(
+            split_candidates("v2", Some(&sp), &SplitFailover::On),
+            vec!["v2", "v1", "v3"]
+        );
+        // off：只有一个候选，绝不改投
+        assert_eq!(
+            split_candidates("v2", Some(&sp), &SplitFailover::Off),
+            vec!["v2"]
+        );
+        // 显式目标：只有它，其余分支一律不碰
+        assert_eq!(
+            split_candidates("v2", Some(&sp), &SplitFailover::Target("v3".into())),
+            vec!["v2", "v3"]
+        );
+        // 没有分流（目标写死）：一个候选，与今天的行为逐字一致
+        assert_eq!(split_candidates("backend", None, &SplitFailover::On), vec!["backend"]);
+    }
+
+    #[test]
+    fn split_branch_must_be_enumerable_never_guessed_from_dns() {
+        let e = ProxyEngine::new(Arc::new(UpstreamPool::default()));
+        // 严格模式（分流分支）：裸名字查不到池就是错误，绝不悄悄交给 DNS
+        let err = match e.pick_backend("v9", "10.0.0.9", true) {
+            Err(e) => e,
+            Ok(_) => panic!("裸名字的分支不该被交给 DNS 猜"),
+        };
+        assert!(err.contains("no split branch"), "实际: {err}");
+        assert!(e.pick_backend("v9", "10.0.0.9", false).is_ok(), "目标写死时保持今天的直连语义");
+        // 自带落点的写法在严格模式下照样允许
+        assert!(e.pick_backend("127.0.0.1:8080", "10.0.0.9", true).is_ok());
+        assert!(e.pick_backend("10.0.0.5", "10.0.0.9", true).is_ok(), "IP 字面量不经 DNS");
+        let empty = match e.pick_backend("", "10.0.0.9", true) {
+            Err(e) => e,
+            Ok(_) => panic!("空分支不可能有落点"),
+        };
+        assert!(empty.contains("empty"), "实际: {empty}");
+        // 具名池命中：返回池里的节点并带上池名（组内换节点重试用）
+        let up = pool_of("upstream gray { server 127.0.0.1:8081; server 127.0.0.1:8082; }");
+        let e2 = ProxyEngine::new(up);
+        let p = match e2.pick_backend("gray", "10.0.0.9", true) {
+            Ok(p) => p,
+            Err(e) => panic!("池内应有节点: {e}"),
+        };
+        assert!(["127.0.0.1:8081", "127.0.0.1:8082"].contains(&p.backend.as_str()));
+        assert_eq!(p.pool.as_deref(), Some("gray"));
+        assert_eq!(p.tried.len(), 1, "首个节点要计入 tried，否则换节点会重复选同一台");
+    }
+
+    #[tokio::test]
+    async fn bleeding_only_happens_when_the_chosen_branch_has_no_backend() {
+        let (b_addr, b_hits) = counted_backend("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let dead = dead_port().await;
+        let pool = pool_of(&format!(
+            "upstream a {{ server {dead}; }} upstream b {{ server {b_addr}; }}"
+        ));
+        let e = ProxyEngine::new(pool);
+        let sp = route("t_bleed", &["a", "b"]);
+        let stats = sp.stats.clone().expect("账本应已登记");
+        let tls = TlsPolicy::default();
+        let opts = test_opts(&tls, Some(&sp), SplitFailover::On);
+        // 第一次：a 池里还有"可选节点"，请求发出去后被拒 —— 这不是改投时刻，原样失败
+        let mut c1 = ctx();
+        let r1 = e
+            .forward(&mut c1, "http://a", "/api", &opts, ProxyBody::Buffered(None))
+            .await;
+        assert!(r1.is_err(), "本意那路拒接时应原样失败");
+        assert_eq!(c1.proxy_split, "a");
+        // 请求已经交给了 a 的节点（只是那台拒接）：这不算改投，served 记 a
+        assert_eq!(c1.proxy_split_served, "a");
+        assert_eq!(b_hits.load(Relaxed), 0, "a 还有节点时绝不能落到 b");
+        assert_eq!(stats.served("a"), 1);
+        assert_eq!(stats.role(SplitRole::Routed), 1);
+        assert_eq!(stats.role(SplitRole::Bled), 0);
+        assert_eq!(stats.role(SplitRole::Down), 0, "a 当时还有可选节点，不是'没人可服务'");
+        // 第二次：被动健康检查已把 a 摘除 —— 这才是"这一路没人可服务"，允许改投
+        let mut c2 = ctx();
+        let r2 = e
+            .forward(&mut c2, "http://a", "/api", &opts, ProxyBody::Buffered(None))
+            .await;
+        assert!(r2.is_ok(), "a 全摘后应按 proxy_split_failover 改投到 b");
+        assert_eq!(c2.proxy_split, "a", "$proxy_split 记的是按比例选中的那一路");
+        assert_eq!(c2.proxy_split_served, "b", "实际服务的是改投后的那一路，两者不同才说明串过台");
+        assert_eq!(b_hits.load(Relaxed), 1);
+        assert_eq!(stats.served("b"), 1);
+        assert_eq!(stats.role(SplitRole::Down), 1);
+        assert_eq!(stats.role(SplitRole::Bled), 1);
+        assert_eq!(stats.role(SplitRole::Routed), 1, "改投那次记 bled，不重复记 routed");
+    }
+
+    #[tokio::test]
+    async fn failover_off_keeps_the_failure_in_its_own_branch() {
+        let (b_addr, b_hits) = counted_backend("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let dead = dead_port().await;
+        let pool = pool_of(&format!(
+            "upstream a {{ server {dead}; }} upstream b {{ server {b_addr}; }}"
+        ));
+        let e = ProxyEngine::new(pool);
+        let sp = route("t_off", &["a", "b"]);
+        let stats = sp.stats.clone().expect("账本应已登记");
+        let tls = TlsPolicy::default();
+        let opts = test_opts(&tls, Some(&sp), SplitFailover::Off);
+        // 先让 a 的节点拒接一次，把它摘除
+        let mut c0 = ctx();
+        assert!(e
+            .forward(&mut c0, "http://a", "/api", &opts, ProxyBody::Buffered(None))
+            .await
+            .is_err());
+        assert_eq!(c0.proxy_split_served, "a", "请求确实交给了 a 的节点，只是那台拒接");
+        // 摘除之后再请求：off 模式下"这一路没人可服务"也不改投，原样失败
+        for _ in 0..2 {
+            let mut c = ctx();
+            let r = e
+                .forward(&mut c, "http://a", "/api", &opts, ProxyBody::Buffered(None))
+                .await;
+            assert!(r.is_err(), "不串台：这一路的失败原样回给客户端");
+            assert_eq!(c.proxy_split, "a");
+            assert_eq!(c.proxy_split_served, "", "一个节点都没交给，就不该有'实际服务的那一路'");
+        }
+        assert_eq!(b_hits.load(Relaxed), 0, "off 模式下 b 一次都不该被碰到");
+        assert_eq!(stats.role(SplitRole::Bled), 0);
+        assert_eq!(stats.served("b"), 0);
+        assert!(
+            stats.role(SplitRole::Down) >= 1,
+            "摘除后的那一路要留下'没人可服务'的账"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_5xx_response_never_re_routes_to_another_branch() {
+        // 这条是整套语义的安全边界：后端已经收到过请求，成败归 proxy_next_upstream / error_page，
+        // 绝不能跨路重投 —— 否则一个 POST 会被写进两个业务版本。
+        let (a_addr, a_hits) =
+            counted_backend("HTTP/1.0 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n").await;
+        let (b_addr, b_hits) = counted_backend("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let pool = pool_of(&format!(
+            "upstream a {{ server {a_addr}; }} upstream b {{ server {b_addr}; }}"
+        ));
+        let e = ProxyEngine::new(pool);
+        let sp = route("t_5xx", &["a", "b"]);
+        let stats = sp.stats.clone().expect("账本应已登记");
+        let tls = TlsPolicy::default();
+        let opts = test_opts(&tls, Some(&sp), SplitFailover::On);
+        let mut c = ctx();
+        let r = e
+            .forward(&mut c, "http://a", "/api", &opts, ProxyBody::Buffered(None))
+            .await
+            .expect("5xx 是后端的答复，不是没人可服务");
+        assert_eq!(r.status().as_u16(), 500);
+        assert_eq!(c.proxy_split, "a");
+        assert_eq!(c.proxy_split_served, "a");
+        assert_eq!(a_hits.load(Relaxed), 1);
+        assert_eq!(b_hits.load(Relaxed), 0, "后端 5xx 绝不能改投到别的业务版本");
+        assert_eq!(stats.role(SplitRole::Bled), 0);
+        assert_eq!(stats.role(SplitRole::Routed), 1);
+    }
+
+    fn test_opts<'a>(
+        tls: &'a TlsPolicy,
+        split: Option<&'a crate::router::RouteSplit>,
+        failover: SplitFailover,
+    ) -> ProxyOpts<'a> {
+        ProxyOpts {
+            set_headers: &[],
+            timeouts: ProxyTimeouts {
+                connect: Duration::from_millis(300),
+                send: Duration::from_millis(300),
+                read: Duration::from_millis(300),
+            },
+            next_upstream: &[],
+            next_upstream_tries: 0,
+            next_upstream_timeout: Duration::ZERO,
+            tls,
+            split,
+            split_failover: failover,
+            var_targets: None,
+        }
     }
 }

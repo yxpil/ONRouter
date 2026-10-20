@@ -505,6 +505,79 @@ impl Metrics {
                     ));
                 }
             }
+            // 自适应选点（least_time）：只给真的开了 observe/on 的 upstream 出账目，
+            // 默认 off 时一行都不多——指标行数也是"功能关掉就没有代价"的证据之一。
+            let lt_on: Vec<_> = ups
+                .iter()
+                .filter(|u| !matches!(u.least_time, crate::upstream::LeastTime::Off))
+                .collect();
+            if !lt_on.is_empty() {
+                s.push_str("# HELP onrouter_upstream_least_time_mode Adaptive upstream selection tier (0=off 1=observe 2=on).\n");
+                s.push_str("# TYPE onrouter_upstream_least_time_mode gauge\n");
+                s.push_str("# HELP onrouter_upstream_server_ewma_seconds Latest time-decayed EWMA of the upstream header time observed by the gateway; 0 = never sampled. A stale value is re-probed rather than trusted (see least_time_total role=\"cold\").\n");
+                s.push_str("# TYPE onrouter_upstream_server_ewma_seconds gauge\n");
+                s.push_str("# HELP onrouter_upstream_least_time_total Adaptive selection accounting: sampled=latency samples taken, picked=choices made by the score, would_differ=observe-only (would have picked elsewhere), cold=exploratory pick of a server whose latency is unknown (never sampled, or estimate older than 4x least_time_window).\n");
+                s.push_str("# TYPE onrouter_upstream_least_time_total counter\n");
+                for up in lt_on {
+                    let mode = match up.least_time {
+                        crate::upstream::LeastTime::Off => 0,
+                        crate::upstream::LeastTime::Observe => 1,
+                        crate::upstream::LeastTime::On => 2,
+                    };
+                    s.push_str(&format!(
+                        "onrouter_upstream_least_time_mode{{upstream=\"{}\"}} {mode}\n",
+                        label(&up.name)
+                    ));
+                    for srv in &up.servers {
+                        s.push_str(&format!(
+                            "onrouter_upstream_server_ewma_seconds{{upstream=\"{}\",server=\"{}\"}} {:.6}\n",
+                            label(&up.name),
+                            label(&srv.addr),
+                            srv.ewma_seconds()
+                        ));
+                    }
+                    let (sampled, picked, would_differ, cold) = up.least_time_counters();
+                    for (role, v) in [
+                        ("sampled", sampled),
+                        ("picked", picked),
+                        ("would_differ", would_differ),
+                        ("cold", cold),
+                    ] {
+                        s.push_str(&format!(
+                            "onrouter_upstream_least_time_total{{upstream=\"{}\",role=\"{role}\"}} {v}\n",
+                            label(&up.name)
+                        ));
+                    }
+                }
+            }
+        }
+        // 业务分流（proxy_pass http://$变量）：targets 是"这一路实际服务了多少请求"，
+        // 拿它除以总数就是运维要核对的那张比例表；total 的 role 说明每一路是怎么被处置的。
+        // 没配分流时这里一行都不出（账本按 split 名建立，只有分流真的被解析过才有条目）。
+        let splits = crate::engine::split_stats_snapshot();
+        if !splits.is_empty() {
+            s.push_str("# HELP onrouter_proxy_split_targets_total Requests forwarded to each declared branch of a split route (counted when the gateway hands the request to a node of that branch, before the outcome is known; divide by the branch total to check the observed ratio against the declared one).\n");
+            s.push_str("# TYPE onrouter_proxy_split_targets_total counter\n");
+            s.push_str("# HELP onrouter_proxy_split_total Split outcome accounting: routed=forwarded to the branch the ratio chose, bled=forwarded to another branch after proxy_split_failover, down=a chosen branch had no selectable node at resolution time (counted per candidate attempt, can exceed the request count), empty=the bucket resolved to an empty target. A backend 5xx never re-routes, so it changes none of these.\n");
+            s.push_str("# TYPE onrouter_proxy_split_total counter\n");
+            for st in splits {
+                for branch in &st.branches {
+                    s.push_str(&format!(
+                        "onrouter_proxy_split_targets_total{{split=\"{}\",target=\"{}\"}} {}\n",
+                        label(&st.dest),
+                        label(branch),
+                        st.served(branch)
+                    ));
+                }
+                for role in crate::engine::SplitRole::ALL {
+                    s.push_str(&format!(
+                        "onrouter_proxy_split_total{{split=\"{}\",role=\"{}\"}} {}\n",
+                        label(&st.dest),
+                        role.label(),
+                        st.role(role)
+                    ));
+                }
+            }
         }
         s.push_str("# HELP onrouter_lua_phase_inline_total Lua phases that ran their first segment inline in the request task.\n");
         s.push_str("# TYPE onrouter_lua_phase_inline_total counter\n");
