@@ -157,6 +157,32 @@ pub struct ProxyCache {
 }
 
 impl ProxyCache {
+    /// Governor deep-sleep pass: evict up to `max` LRU-oldest entries per zone and
+    /// return `(evicted, bytes)` so the governor can account them.
+    ///
+    /// Author: yxpil
+    ///
+    /// proxy_cache deliberately has no disk tier: an evicted response is
+    /// reconstructed from the origin on the next request, which is the design, not
+    /// data loss. The pure LRU front is the right victim order here — sleep means
+    /// nobody is asking for these keys, and a TinyLFU scan adds nothing over it.
+    pub fn governor_evict_pass(&self, max_per_zone: usize) -> (usize, u64) {
+        let mut zones = self.zones.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0usize;
+        let mut bytes = 0u64;
+        for z in zones.values_mut() {
+            for _ in 0..max_per_zone {
+                // BTreeMap iterates by tick order: first entry = least recently used.
+                let Some(key) = z.lru.values().next().cloned() else { break };
+                if let Some(slot) = z.remove(&key) {
+                    n += 1;
+                    bytes += (slot.resp.body.len() + key.len()) as u64;
+                }
+            }
+        }
+        (n, bytes)
+    }
+
     #[cfg(test)]
     fn new() -> Arc<Self> {
         Self::with_capacities(HashMap::new(), Arc::new(crate::learning::Learning::default()))

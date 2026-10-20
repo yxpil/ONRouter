@@ -93,6 +93,16 @@ pub fn register_schedule(s: &Arc<crate::schedule::Scheduler>) {
     let _ = SCHEDULE.set(Arc::clone(s));
 }
 
+/// Cache governor singleton: one instance per process, hot reload swaps its
+/// configuration in place. Registered once, exactly like the scheduler.
+///
+/// Author: yxpil
+static GOVERNOR: OnceLock<Arc<crate::governor::Governor>> = OnceLock::new();
+
+pub fn register_governor(g: &Arc<crate::governor::Governor>) {
+    let _ = GOVERNOR.set(Arc::clone(g));
+}
+
 /// 取得全局指标单例（首次调用时按 capacity 初始化容量与启动时刻）。
 pub fn global(worker_connections: usize) -> &'static Metrics {
     let m = METRICS.get_or_init(Metrics::default);
@@ -498,6 +508,71 @@ impl Metrics {
                 s.push_str(&format!(
                     "onrouter_schedule_gate_miss_total {}\n",
                     sch.misses()
+                ));
+            }
+        }
+        if let Some(gv) = GOVERNOR.get() {
+            if gv.enabled() {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                s.push_str("# HELP onrouter_governor_phase Current cache-layer phase: 0=sleep (background cadence stretched; deep tier also demotes) 1=normal 2=boost (full cadence + cold-tier pre-warm).\n");
+                s.push_str("# TYPE onrouter_governor_phase gauge\n");
+                s.push_str(&format!(
+                    "onrouter_governor_phase {}\n",
+                    gv.phase() as u8
+                ));
+                s.push_str("# HELP onrouter_governor_rps Smoothed requests-per-second estimate over the trailing window (the input the phase machine reads).\n");
+                s.push_str("# TYPE onrouter_governor_rps gauge\n");
+                s.push_str(&format!("onrouter_governor_rps {}\n", gv.rps(secs)));
+                s.push_str("# HELP onrouter_governor_rps_peak Highest rps estimate observed since process start.\n");
+                s.push_str("# TYPE onrouter_governor_rps_peak gauge\n");
+                s.push_str(&format!("onrouter_governor_rps_peak {}\n", gv.peak_rps()));
+                s.push_str("# HELP onrouter_governor_profile_coverage Minutes of the day the learned profile has observed at least once (0..=1440). A prediction is only as honest as this number.\n");
+                s.push_str("# TYPE onrouter_governor_profile_coverage gauge\n");
+                s.push_str(&format!(
+                    "onrouter_governor_profile_coverage {}\n",
+                    gv.profile_coverage()
+                ));
+                s.push_str("# HELP onrouter_governor_switches_total Phase transitions. Labels name the direction and the cause (load = thresholds crossed, predicted = the minute-of-day profile switched early).\n");
+                s.push_str("# TYPE onrouter_governor_switches_total counter\n");
+                s.push_str(&format!(
+                    "onrouter_governor_switches_total{{cause=\"load\"}} {}\n",
+                    gv.counters.switches.load(Ordering::Relaxed)
+                        - gv.counters.predicted.load(Ordering::Relaxed)
+                ));
+                s.push_str(&format!(
+                    "onrouter_governor_switches_total{{cause=\"predicted\"}} {}\n",
+                    gv.counters.predicted.load(Ordering::Relaxed)
+                ));
+                s.push_str("# HELP onrouter_governor_demoted_total Entries the deep-sleep pass demoted out of memory (dict zones: spilled to the cold tier and still readable; proxy_cache zones: evicted, refetched from the origin on demand).\n");
+                s.push_str("# TYPE onrouter_governor_demoted_total counter\n");
+                s.push_str(&format!(
+                    "onrouter_governor_demoted_total {}\n",
+                    gv.counters.demoted.load(Ordering::Relaxed)
+                ));
+                s.push_str(&format!(
+                    "onrouter_governor_demoted_bytes_total {}\n",
+                    gv.counters.demoted_bytes.load(Ordering::Relaxed)
+                ));
+                s.push_str("# HELP onrouter_governor_prewarmed_total Cold-tier keys brought back into memory when boost arrived.\n");
+                s.push_str("# TYPE onrouter_governor_prewarmed_total counter\n");
+                s.push_str(&format!(
+                    "onrouter_governor_prewarmed_total {}\n",
+                    gv.counters.prewarmed.load(Ordering::Relaxed)
+                ));
+                s.push_str("# HELP onrouter_governor_sweeps_skipped_total Background cold-tier directory sweeps the sleep phase skipped outright (the light-tier saving, counted so it is never silent).\n");
+                s.push_str("# TYPE onrouter_governor_sweeps_skipped_total counter\n");
+                s.push_str(&format!(
+                    "onrouter_governor_sweeps_skipped_total {}\n",
+                    gv.counters.sweeps_skipped.load(Ordering::Relaxed)
+                ));
+                s.push_str("# HELP onrouter_governor_boost_ticks 500ms ticks spent at boost phase — the denominator proving boost actually ran.\n");
+                s.push_str("# TYPE onrouter_governor_boost_ticks_total counter\n");
+                s.push_str(&format!(
+                    "onrouter_governor_boost_ticks_total {}\n",
+                    gv.counters.boost_ticks.load(Ordering::Relaxed)
                 ));
             }
         }

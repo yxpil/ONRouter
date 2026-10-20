@@ -26,6 +26,7 @@ mod dns;
 mod disk_cache;
 mod engine;
 mod front_proxy;
+mod governor;
 mod learning;
 mod limit;
 mod log;
@@ -50,6 +51,7 @@ mod upstream;
 mod vip;
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -286,6 +288,27 @@ fn main() {
         log_info!("{line}");
     }
 
+    // Cache governor: sleep/boost phases driven by observed traffic. Parse failure aborts
+    // startup the way the schedule table does — a governor that half-read its thresholds
+    // would flap the cache layer instead of serving it.
+    let governor = Arc::new(match governor::parse_governor(&config) {
+        Ok((c, ws)) => {
+            for w in ws {
+                log_warn!("{w}");
+                startup_warnings.push(w);
+            }
+            governor::Governor::new(c)
+        }
+        Err(e) => {
+            log_error!("invalid cache_governor configuration: {e}");
+            eprintln!("[onrouter] invalid cache_governor configuration: {e}");
+            std::process::exit(1);
+        }
+    });
+    if governor.enabled() {
+        log_info!("{}", governor.describe());
+    }
+
     let router = match Router::build(&config, &base_dir) {
         Ok(r) => r,
         Err(e) => {
@@ -333,6 +356,7 @@ fn main() {
         limits,
         Arc::clone(&learning),
         schedule,
+        governor,
         base_dir,
         conf_path,
         workers,
@@ -416,6 +440,29 @@ fn check(
     for line in schedule.describe(schedule::now_ms()) {
         println!("  {line}");
     }
+    // Cache governor: -t lays out the parsed phase machine. It also flags the one
+    // configuration that silently cannot do what it says -- deep sleep requested
+    // with no `disk=` zone for the demotion pass to write into.
+    match governor::parse_governor(config) {
+        Ok((c, warns)) => {
+            for w in warns {
+                println!("  Warning {w}");
+            }
+            if c.enabled() {
+                println!("  {}", governor::describe_conf(&c));
+                if c.mode == governor::GovernorMode::Auto
+                    && c.tier == governor::SleepTier::Deep
+                    && shared_dict::config_disk_zone_count(config) == 0
+                {
+                    println!(
+                        "  Warning cache_governor_tier deep but no lua_shared_dict declares disk=: \
+                         deep sleep has nothing to demote and only the light actions will run"
+                    );
+                }
+            }
+        }
+        Err(e) => return Err(e),
+    }
     // upstream 段：以前只有真正启动时才解析，于是出现过"-t 通过、启动才炸"。
     // 自适应选点的冲突（ip_hash + least_time、单节点池）必须在这一步就看得见。
     let pool = UpstreamPool::parse_all(config).map_err(|e| e.to_string())?;
@@ -454,6 +501,7 @@ async fn run(
     limits: Arc<limit::Limits>,
     learning: Arc<learning::Learning>,
     schedule: Arc<schedule::Scheduler>,
+    governor: Arc<governor::Governor>,
     base_dir: PathBuf,
     conf_path: PathBuf,
     workers: usize,
@@ -504,6 +552,7 @@ async fn run(
         settings: settings.clone(),
         limits: Arc::clone(&limits),
         schedule: Arc::clone(&schedule),
+        governor: Arc::clone(&governor),
         permits: server::permits_for(&settings),
         tls_registry: crate::tls::TlsRegistry::new(),
         cert_files: std::sync::RwLock::new(cert_files),
@@ -526,6 +575,8 @@ async fn run(
     // window must show up on /metrics, otherwise "the gate is working" and "this route has no gate at all"
     // look exactly alike.
     crate::metrics::register_schedule(&schedule);
+    // Cache governor: same registration discipline — one instance, reload swaps config in place
+    crate::metrics::register_governor(&governor);
 
     // 先全部绑定再开始服务：端口冲突要在启动阶段就失败，而不是半启动状态
     let mut bound = Vec::with_capacity(listener_specs.len());
@@ -569,24 +620,27 @@ async fn run(
     }
 
     // 后台维护：清理限流状态表里的闲置 key（防状态表随客户端数量膨胀）、
-    // 清扫 DICT 冷层（过期/`inactive` 回收 + 容量逐出 + 账目自愈）
+    // 清扫 DICT 冷层（过期/`inactive` 回收 + 容量逐出 + 账目自愈）。
+    // 节拍跟缓存治理器的相位走：sleep 把这一轮拉长十倍（轻档休眠的全部收益），
+    // 并按 `should_skip_sweep` 整轮跳过昂贵的冷层目录扫描——跳过必计数，绝不静默。
     let maintain = {
         let limits = Arc::clone(&limits);
         let access_log = Arc::clone(&state.access_log);
+        let governor = Arc::clone(&governor);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(60));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut reported = 0u64;
             loop {
-                ticker.tick().await;
+                tokio::time::sleep(governor.sweep_interval()).await;
                 let n = limits.purge_idle_all(10 * 60 * 1000);
                 if n > 0 {
                     log_debug!("清理限流状态表 {n} 个闲置 key");
                 }
                 // 清扫要走文件系统，放到阻塞线程池，别占着 worker
-                match tokio::task::spawn_blocking(disk_cache::sweep_all).await {
-                    Ok(0) | Err(_) => {}
-                    Ok(n) => log_debug!("磁盘冷层清扫回收 {n} 个条目"),
+                if !governor.should_skip_sweep() {
+                    match tokio::task::spawn_blocking(disk_cache::sweep_all).await {
+                        Ok(0) | Err(_) => {}
+                        Ok(n) => log_debug!("磁盘冷层清扫回收 {n} 个条目"),
+                    }
                 }
                 let d = access_log.dropped_count();
                 if d > reported {
@@ -596,6 +650,14 @@ async fn run(
             }
         })
     };
+
+    // Cache governor task: advances the phase machine on a 500ms tick and executes
+    // the side effects a phase entry owns. Spawned only when the feature is on —
+    // with `cache_governor off` (the default) neither this task nor the request
+    // hook exists. A later `off -> observe/auto` hot reload starts it lazily.
+    if governor.enabled() {
+        spawn_governor_task(Arc::clone(&governor), Arc::clone(&state.proxy_cache));
+    }
 
     // 主动健康检查：配了 health_check 的 upstream 各起一个后台探测任务
     let health = pool.spawn_health_checks(rx.clone());
@@ -813,6 +875,88 @@ fn spawn_signal_handlers(
     }
 }
 
+/// Cache governor runner: a 500ms tick that advances the phase machine and
+/// executes the side effect each phase entry owns.
+///
+/// Author: yxpil
+///
+/// Exactly one task may own the phase machine (`mark_task_started`). It is
+/// spawned at startup only when the feature is on — the default `off` leaves no
+/// resident task at all — and lazily on an `off -> observe/auto` hot reload.
+/// Turning it off via reload keeps the task alive but idle: `advance` answers
+/// `None` in off mode, so nothing is measured, decided or acted on.
+fn spawn_governor_task(
+    g: Arc<governor::Governor>,
+    pc: Arc<proxy_cache::ProxyCache>,
+) {
+    if !g.mark_task_started() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some((from, to, cause, action)) =
+                g.advance(schedule::now_ms() as u64)
+            else {
+                continue;
+            };
+            let cause_txt = match cause {
+                governor::Cause::Load => "load",
+                governor::Cause::Predicted => "predicted",
+            };
+            log_info!(
+                "governor: phase {} -> {} ({cause_txt}); routes and cadence follow immediately",
+                from.as_str(),
+                to.as_str()
+            );
+            match action {
+                governor::Action::EnterSleep => {
+                    let deep = g.conf.read().unwrap_or_else(|e| e.into_inner()).tier
+                        == governor::SleepTier::Deep;
+                    if deep {
+                        // Bounded per pass: sleep may last all weekend, and one
+                        // mega-pass would hold zone locks while the disk writer
+                        // queues. Repeated passes make the same progress.
+                        for _ in 0..4 {
+                            // Dict entries go through note_demotion (counters +
+                            // pre-warm ring in one step). proxy_cache entries are
+                            // evictions of reconstructible data — counters only.
+                            let records = shared_dict::governor_demote_all(64);
+                            let dict_n = records.len();
+                            for (zone, key, bytes) in records {
+                                g.note_demotion(zone, key, true, bytes);
+                            }
+                            let (en, eb) = pc.governor_evict_pass(64);
+                            g.counters.demoted.fetch_add(en as u64, Ordering::Relaxed);
+                            g.counters
+                                .demoted_bytes
+                                .fetch_add(eb, Ordering::Relaxed);
+                            if dict_n == 0 && en == 0 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+                governor::Action::EnterBoost => {
+                    // Pre-warm what deep sleep pushed out: single batch per boost
+                    // entry, cold tier only, bounded by the demotion ring itself.
+                    for k in g.take_prewarm_batch(64) {
+                        if let Some(zone) = shared_dict::governor_zone(&k.zone) {
+                            if zone.governor_prewarm(&k.key) {
+                                g.counters.prewarmed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                governor::Action::EnterNormal => {}
+            }
+        }
+    });
+}
+
 /// Scheduled window runner: **one** task, sleeping until the next natural minute boundary and, on waking,
 /// recomputing every window.
 ///
@@ -986,6 +1130,33 @@ fn do_reload(
                 }
                 for line in state.schedule.describe(schedule::now_ms()) {
                     log_info!("after hot reload, {line}");
+                }
+                // Cache governor: a reload swaps only the configuration — the window,
+                // the phase and the learned profile are observations and stay put.
+                // A rejected definition keeps the running one (a bad threshold pair
+                // must not take the cache layer down mid-flight), unlike startup,
+                // where the same error aborts.
+                match governor::parse_governor(&cfg) {
+                    Ok((c, ws)) => {
+                        state.governor.apply(c);
+                        for w in ws {
+                            log_warn!("cache_governor reload: {w}");
+                        }
+                        if state.governor.enabled() {
+                            spawn_governor_task(
+                                Arc::clone(&state.governor),
+                                Arc::clone(&state.proxy_cache),
+                            );
+                            log_info!("{}", state.governor.describe());
+                        } else {
+                            log_info!(
+                                "cache_governor off: phase machine stays idle, window and profile stop being fed"
+                            );
+                        }
+                    }
+                    Err(e) => log_error!(
+                        "cache_governor reload rejected, keeping the running configuration: {e}"
+                    ),
                 }
                 // upstream 池（连同 least_time 的 EWMA）挂在启动时构建的 Arc 上，热重载不替换它。
                 // 这里照样按新配置打一行档位并说明"要重启"，否则运维会以为 SIGHUP 就切了档。

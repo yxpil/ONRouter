@@ -111,6 +111,9 @@ pub struct AppState {
     /// Scheduled access window table (`schedule_window` + `schedule_access`). When no window is declared this
     /// is an empty table; on the request path only routes whose `schedule_gate` is None skip this lookup at all.
     pub schedule: Arc<crate::schedule::Scheduler>,
+    /// Cache governor (`cache_governor`): traffic-phase machine for the cache layers.
+    /// Off by default; the only request-path touchpoint is one atomic add when enabled.
+    pub governor: Arc<crate::governor::Governor>,
     /// 全局并发连接额度（worker_connections）
     pub permits: Arc<tokio::sync::Semaphore>,
     /// 运行期 TLS 接受器 / QUIC endpoint 注册表：热重载时原地刷新证书与协议配置
@@ -593,6 +596,12 @@ impl Service<Request<Incoming>> for Gateway {
         // h2 不能用 Connection 头，交由 keep_alive_interval / 停机时的 GOAWAY 处理。
         let seq = meta.requests.fetch_add(1, Ordering::Relaxed) + 1;
         crate::metrics::get().on_request();
+        // Cache governor: one fetch_add into the 32-slot window per request while
+        // the feature is on. With `cache_governor off` (the default) this branch
+        // is never taken and the request path is unchanged.
+        if state.governor.enabled() {
+            state.governor.note_request(unix_now() as u64);
+        }
         let must_close = meta.http1 && seq >= state.settings.keepalive_requests as u64;
 
         // gzip 判定要在 `req` 被 move 进 handle_request 之前取走请求头的 Accept-Encoding。

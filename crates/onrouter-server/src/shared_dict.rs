@@ -282,6 +282,47 @@ impl ZoneInner {
         store.spill(key, &entry.value, entry.expires_at, freq);
     }
 
+    /// 缓存治理器（governor）深档休眠的降级原语：与 `evict_one` 同一套采样评分选
+    /// 受害者，但**无视 `spill_after` 频率门强制落盘**，返回 `(key, 字节数)` 供预取
+    /// 环记录。容量淘汰可以"低频就丢"——那是缓存语义；休眠降级不行：这里搬的是
+    /// Lua 应用状态，丢了磁盘副本就是丢数据，不是清扫。
+    ///
+    /// Author: yxpil
+    fn demote_one(&self) -> Option<(String, u64)> {
+        let now = now_epoch();
+        let start = (self.tick() as usize) % SHARDS;
+        for offset in 0..SHARDS {
+            let shard_idx = (start + offset) % SHARDS;
+            let mut map = self.lock_slot(shard_idx);
+            if map.is_empty() {
+                continue;
+            }
+            let mut best: Option<(String, f32, u64)> = None;
+            for (k, v) in map.iter().take(8) {
+                let s = self.victim_score(v, now);
+                let better = match &best {
+                    None => true,
+                    Some((_, bs, bt)) => s < *bs || (s == *bs && v.last_used < *bt),
+                };
+                if better {
+                    best = Some((k.clone(), s, v.last_used));
+                }
+            }
+            let Some((key, _, _)) = best else { continue };
+            if let Some(entry) = map.remove(&key) {
+                self.release(entry.cost);
+                if let Some(store) = &self.disk {
+                    let freq = entry.decayed_freq(now);
+                    // Forced: the governor's sleep contract is "value stays readable
+                    // through the cold path", so no admit() frequency gate here.
+                    store.spill(&key, &entry.value, entry.expires_at, freq);
+                }
+                return Some((key, entry.cost as u64));
+            }
+        }
+        None
+    }
+
     /// 注销某 key 的冷层副本（覆盖写、删除、add 成功时调用）。
     ///
     /// 只允许在**不持有分片锁**时调用：它要拿冷层索引锁并排队删文件。
@@ -422,6 +463,39 @@ impl SharedZone {
         SharedZone {
             inner: Arc::new(ZoneInner::new(capacity, disk)),
         }
+    }
+
+    /// Whether this zone has a disk cold tier. The governor's deep-sleep pass
+    /// refuses to touch zones without one — they hold Lua application state with
+    /// nowhere to demote it to.
+    pub fn has_disk(&self) -> bool {
+        self.inner.disk.is_some()
+    }
+
+    /// Governor deep-sleep pass: force-spill up to `max` coldest entries to the
+    /// cold tier and reclaim their memory. Returns one `(key, bytes)` record per
+    /// demoted entry — the governor needs the keys to build its pre-warm ring.
+    /// Zones without `disk=` answer empty by construction (see [`Self::has_disk`]).
+    pub fn governor_demote_pass(&self, max: usize) -> Vec<(String, u64)> {
+        if self.inner.disk.is_none() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for _ in 0..max {
+            match self.inner.demote_one() {
+                Some((k, b)) => out.push((k, b)),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Governor boost pre-warm: bring one key back from the cold tier into memory
+    /// (the same promote path a cold get() takes, lock discipline included).
+    /// False = the cold tier has no such entry (already promoted, expired, or the
+    /// value lived in a proxy_cache zone that has no cold copy at all).
+    pub fn governor_prewarm(&self, key: &str) -> bool {
+        self.inner.cold_promote(key, false, false).is_some()
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
@@ -1122,8 +1196,82 @@ impl SharedDicts {
                 .and_then(|_| cold.iter().find(|(n, _)| *n == name).map(|(_, s)| s.clone()));
             zones.insert(name.clone(), SharedZone::new(capacity, store));
         }
-        Ok(SharedDicts { zones })
+        let dicts = SharedDicts { zones };
+        register_governor_zones(&dicts);
+        Ok(dicts)
     }
+}
+
+/// Process-wide zone registry the cache governor reads. The Lua VM owns its own
+/// `SharedDicts` clone deep inside the engine; rather than threading a handle
+/// through every layer, parse_all publishes the zone table here (hot reload
+/// overwrites it — the zones are Arc-shared, so in-flight VM handles stay valid).
+///
+/// Author: yxpil
+static GOV_ZONES: std::sync::OnceLock<std::sync::RwLock<HashMap<String, SharedZone>>> =
+    std::sync::OnceLock::new();
+
+pub fn register_governor_zones(zones: &SharedDicts) {
+    let lock = GOV_ZONES.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    *lock.write().unwrap_or_else(|e| e.into_inner()) = zones.zones.clone();
+}
+
+pub fn governor_zone(name: &str) -> Option<SharedZone> {
+    let lock = GOV_ZONES.get()?;
+    lock.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .cloned()
+}
+
+/// How many declared zones carry a `disk=` cold tier — the `-t` input for the
+/// "deep sleep tier but nothing can actually be demoted" advisory.
+pub fn governor_disk_zone_count() -> usize {
+    let Some(lock) = GOV_ZONES.get() else { return 0 };
+    lock.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|z| z.has_disk())
+        .count()
+}
+
+/// Config-level twin of [`governor_disk_zone_count`] for `-t`: there the runtime
+/// registry is still empty because `parse_all` runs at Lua engine init, so the
+/// advisory has to read the `disk=` argument straight from the directive.
+pub fn config_disk_zone_count(config: &Config) -> usize {
+    config
+        .root
+        .block
+        .iter()
+        .filter(|d| {
+            d.name == "lua_shared_dict"
+                && d.args.iter().skip(2).any(|kv| {
+                    kv.split_once('=')
+                        .map(|(k, _)| k.trim() == "disk")
+                        .unwrap_or(false)
+                })
+        })
+        .count()
+}
+
+/// Governor deep-sleep demotion across every registered disk-backed zone:
+/// force-spill up to `max_per_zone` coldest entries per zone, returning one
+/// `(zone, key, bytes)` record per demoted entry. The governor routes these
+/// through `note_demotion` so the counters and the pre-warm ring stay in sync
+/// (never both — that would double-count).
+///
+/// Author: yxpil
+pub fn governor_demote_all(max_per_zone: usize) -> Vec<(String, String, u64)> {
+    let Some(lock) = GOV_ZONES.get() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (name, zone) in lock.read().unwrap_or_else(|e| e.into_inner()).iter() {
+        for (key, bytes) in zone.governor_demote_pass(max_per_zone) {
+            out.push((name.clone(), key, bytes));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1425,6 +1573,50 @@ mod tests {
         assert_eq!(z.get("b"), Some(V_B.to_vec()));
         s.flush_pending();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governor_demote_pass_force_spills_fresh_entries_and_prewarm_restores_them() {
+        let dir = tmpdir("gov-demote");
+        // spill_after 3 would normally refuse these fresh entries (freq = 1).
+        // The governor's sleep pass must bypass that gate: it moves application
+        // state, and a dropped cold copy here would be data loss, not cleanup.
+        // Capacity 4096 keeps both entries in memory until the pass -- the pass
+        // is what must drain a populated zone, not eviction by a tiny budget.
+        let cfg = DiskConfig {
+            root: dir.clone(),
+            spill_after: 3.0,
+            ..Default::default()
+        };
+        let s = DiskStore::open(cfg, None).unwrap();
+        let z = SharedZone::new(4096, Some(s.clone()));
+        z.set("a", V_A.to_vec(), None).unwrap();
+        z.set("b", V_B.to_vec(), None).unwrap();
+        let recs = z.governor_demote_pass(64);
+        assert_eq!(recs.len(), 2, "pass must drain every in-memory entry");
+        assert!(
+            recs.iter().all(|(_, bytes)| *bytes > 0),
+            "each record carries the reclaimed byte count for the governor"
+        );
+        s.flush_pending();
+        assert_eq!(z.num(), 2, "after demotion the entries live in the cold tier");
+        assert!(s.has("a") && s.has("b"), "forced spill must not hit the frequency gate");
+        assert!(z.governor_prewarm("a"), "pre-warm must bring the cold entry back");
+        assert_eq!(z.get("a"), Some(V_A.to_vec()));
+        assert!(!z.governor_prewarm("never-existed"), "absent keys answer false");
+        s.flush_pending();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governor_demote_pass_is_inert_without_a_disk_tier() {
+        let z = zone(1024);
+        z.set("a", V_A.to_vec(), None).unwrap();
+        assert!(
+            z.governor_demote_pass(64).is_empty(),
+            "zones without disk= hold Lua state and must never be demoted"
+        );
+        assert_eq!(z.get("a"), Some(V_A.to_vec()), "the value stays in memory");
     }
 
     #[test]
