@@ -38,9 +38,6 @@ mod proxy_tls;
 mod realip;
 mod resp_rewrite;
 mod router;
-// 阶段 1 只有日历内核，消费者（定时动作）在下一步接入；先允许它暂时没有调用点，
-// 好让"到点算得对不对"这件事单独证完，而不是和动作一起塞进同一个改动。
-#[allow(dead_code)]
 mod schedule;
 mod server;
 mod settings;
@@ -271,6 +268,22 @@ fn main() {
         startup_warnings.push(note);
     }
 
+    // 定时窗口：表在启动时一次建好，之后 runner 到点重算、热重载只原地换定义。
+    // 读不通必须在这里退出：一条写歪的"每天 9 点开门"不能变成"带着半套窗口上线"。
+    let schedule = Arc::new(match schedule::Scheduler::parse_all(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            log_error!("定时窗口配置无效: {e}");
+            eprintln!("[onrouter] 定时窗口配置无效: {e}");
+            std::process::exit(1);
+        }
+    });
+    // 摘要按窗口自己的时区打印"算出来的下次触发时刻"：运维据此核对网关用的钟和自己
+    // 系统时钟是不是同一个时间 —— 日历类配置最常见的事故就是主机时钟漂移。
+    for line in schedule.describe(schedule::now_ms()) {
+        log_info!("{line}");
+    }
+
     let router = match Router::build(&config, &base_dir) {
         Ok(r) => r,
         Err(e) => {
@@ -291,7 +304,7 @@ fn main() {
 
     if args.test {
         std::process::exit(
-            match check(&router, &settings, &limits, &learning, &config, &startup_warnings) {
+            match check(&router, &settings, &limits, &learning, &schedule, &config, &startup_warnings) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("[onrouter] {e}");
@@ -317,6 +330,7 @@ fn main() {
         settings,
         limits,
         Arc::clone(&learning),
+        schedule,
         base_dir,
         conf_path,
         workers,
@@ -346,6 +360,7 @@ fn check(
     settings: &Settings,
     limits: &limit::Limits,
     learning: &learning::Learning,
+    schedule: &schedule::Scheduler,
     config: &Config,
     warnings: &[String],
 ) -> Result<(), String> {
@@ -393,6 +408,11 @@ fn check(
     if !fps.is_empty() {
         println!("  前置代理识别 {}", front_proxy::describe(&fps));
     }
+    // 定时窗口：把"按这个配置算出来的开合与下次触发"打在 -t 里。日历类配置最容易出的
+    // 事故是主机时钟/时区口径错了，而那件事只有把算出来的墙钟摆出来才看得见。
+    for line in schedule.describe(schedule::now_ms()) {
+        println!("  {line}");
+    }
     // upstream 段：以前只有真正启动时才解析，于是出现过"-t 通过、启动才炸"。
     // 自适应选点的冲突（ip_hash + least_time、单节点池）必须在这一步就看得见。
     let pool = UpstreamPool::parse_all(config).map_err(|e| e.to_string())?;
@@ -430,6 +450,7 @@ async fn run(
     settings: Settings,
     limits: Arc<limit::Limits>,
     learning: Arc<learning::Learning>,
+    schedule: Arc<schedule::Scheduler>,
     base_dir: PathBuf,
     conf_path: PathBuf,
     workers: usize,
@@ -479,6 +500,7 @@ async fn run(
         access_log: Arc::clone(&access_log),
         settings: settings.clone(),
         limits: Arc::clone(&limits),
+        schedule: Arc::clone(&schedule),
         permits: server::permits_for(&settings),
         tls_registry: crate::tls::TlsRegistry::new(),
         cert_files: std::sync::RwLock::new(cert_files),
@@ -497,6 +519,9 @@ async fn run(
     crate::metrics::register_proxy_cache(&state.proxy_cache);
     // 限流队列：`Limits` 实例进程内唯一，热重载只原地换策略，计数不清零
     crate::metrics::register_limits(&limits);
+    // 定时窗口：同理注册一次；关闭时段里被 403 挡掉的次数要能在 /metrics 上看到，
+    // 否则"闸门在工作"和"这条路由根本没挂闸门"两种情况长得一模一样。
+    crate::metrics::register_schedule(&schedule);
 
     // 先全部绑定再开始服务：端口冲突要在启动阶段就失败，而不是半启动状态
     let mut bound = Vec::with_capacity(listener_specs.len());
@@ -585,6 +610,9 @@ async fn run(
     };
 
     let signals = spawn_signal_handlers(tx.clone(), reload_notify.clone());
+
+    // 定时窗口 runner：没声明任何窗口时**这个任务不存在**（默认 off 的零 footprint 要求）。
+    let schedule_runner = spawn_schedule_task(Arc::clone(&state));
 
     let mut tasks = tokio::task::JoinSet::new();
     for (l, tcp) in bound {
@@ -691,6 +719,9 @@ async fn run(
     while tasks.join_next().await.is_some() {}
     maintain.abort();
     reload.abort();
+    if let Some(s) = schedule_runner {
+        s.abort();
+    }
     for h in health {
         h.abort();
     }
@@ -776,6 +807,46 @@ fn spawn_signal_handlers(
             std::process::exit(1);
         }))
     }
+}
+
+/// 定时窗口 runner：**一个**任务，睡到下一个自然分钟边界再醒，醒来把所有窗口重算一遍。
+///
+/// 为什么按分钟睡、而不是精确睡到最早的那次触发：cron 的分辨率本来就是分钟，而
+/// "睡到 next_fire"会让一次时钟跳变或晚醒变成"整段窗口都错过"。按分钟重算最多晚一秒
+/// 判定，且只有一条代码路径 —— 状态永远由日历推出，不依赖"上一次我记得是开还是关"。
+///
+/// 表为空（没写任何 schedule_window）时**这个任务根本不建**：默认 off 不留常驻开销。
+fn spawn_schedule_task(state: Arc<server::AppState>) -> Option<tokio::task::JoinHandle<()>> {
+    if state.schedule.is_empty() {
+        return None;
+    }
+    log_info!(
+        "定时窗口 runner 已启动：{} 个窗口，每分钟边界重算一次；翻转记录在 error_log，落点见 /metrics 的 onrouter_schedule_*",
+        state.schedule.len()
+    );
+    Some(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(next_minute_wait()).await;
+            let now = schedule::now_ms();
+            for ch in state.schedule.advance(now) {
+                // 只在**真的**变了状态时出声：到点不等于翻转（见 schedule.rs 的 next_trigger_at）。
+                log_info!(
+                    "schedule: 窗口 '{}' 于 {} 转为{}；引用它的路由当场生效（闸门状态见 /metrics 的 onrouter_schedule_open，被挡次数见 onrouter_schedule_denied_total）",
+                    ch.name,
+                    state.schedule.wall(&ch.name, ch.at_ms),
+                    if ch.open { "开放" } else { "关闭" }
+                );
+            }
+        }
+    }))
+}
+
+/// 到下一个自然分钟边界还要多久。多给 20ms 越过边界，免得在上一分钟的最后一毫秒里
+/// 把新状态算成旧的、然后下一次醒又判一边（同一分钟判两次结果必须一致）。
+fn next_minute_wait() -> Duration {
+    let now = schedule::now_ms();
+    let to_next = 60_000 - now.rem_euclid(60_000);
+    Duration::from_millis((to_next.max(1) + 20) as u64)
 }
 
 /// 配置热重载后台任务：监听 SIGHUP 通知与（可选）`reload <interval>` 轮询；
@@ -893,6 +964,15 @@ fn do_reload(
                 }
                 for note in state.limits.apply_vip(&live) {
                     log_warn!("热重载信誉: {note}");
+                }
+                // 定时窗口：窗口实例进程内不换（引用它们的路由要能对上名字），所以这里
+                // 只原地换定义并按新配置**重算当前状态** —— 状态是日历的纯函数，重算即正确，
+                // 不需要任何"记住上一次是开还是关"的持久化。
+                for note in state.schedule.apply(&cfg, schedule::now_ms()) {
+                    log_warn!("热重载定时窗口: {note}");
+                }
+                for line in state.schedule.describe(schedule::now_ms()) {
+                    log_info!("热重载后 {line}");
                 }
                 // upstream 池（连同 least_time 的 EWMA）挂在启动时构建的 Arc 上，热重载不替换它。
                 // 这里照样按新配置打一行档位并说明"要重启"，否则运维会以为 SIGHUP 就切了档。

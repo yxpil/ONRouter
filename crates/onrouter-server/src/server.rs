@@ -108,6 +108,9 @@ pub struct AppState {
     pub access_log: Arc<AccessLog>,
     pub settings: Settings,
     pub limits: Arc<crate::limit::Limits>,
+    /// 定时窗口表（`schedule_window` + `schedule_access`）。没有声明任何窗口时是一张空表，
+    /// 请求路径上只有 `schedule_gate` 为 None 的路由会完全跳过这次查找。
+    pub schedule: Arc<crate::schedule::Scheduler>,
     /// 全局并发连接额度（worker_connections）
     pub permits: Arc<tokio::sync::Semaphore>,
     /// 运行期 TLS 接受器 / QUIC endpoint 注册表：热重载时原地刷新证书与协议配置
@@ -2284,10 +2287,11 @@ fn acquire_conn_guards(
     Ok(guards)
 }
 
-/// ACCESS 阶段内置访问控制：先 IP（allow/deny）后 HTTP Basic（auth_basic），都在
-/// access_by_* 之前执行（与 nginx 内置模块的注册顺序一致）。命中拒绝则返回统一错误页。
+/// ACCESS 阶段内置访问控制：先 IP（allow/deny），再定时闸门（schedule_access），最后
+/// HTTP Basic（auth_basic），都在 access_by_* 之前执行（与 nginx 内置模块的注册顺序一致）。
+/// 命中拒绝则返回统一错误页。
 async fn check_access_and_auth(
-    _state: &Arc<AppState>,
+    state: &Arc<AppState>,
     ctx: &mut RequestCtx,
     loc: &Location,
     server: &Arc<Server>,
@@ -2314,6 +2318,23 @@ async fn check_access_and_auth(
                 ctx.status = 403;
                 return Some(status_page(403));
             }
+        }
+    }
+
+    // ---- 定时闸门：location 未写时继承 server（与 auth_basic 同一条继承路）----
+    // 放在 allow/deny 之后：IP 白名单因此是运维在"关闭时段"里的天然逃生口，
+    // 也让一条 deny 仍然优先于"当前正好开放"。
+    let gate = loc
+        .schedule_gate
+        .as_deref()
+        .or(server.schedule_gate.as_deref());
+    if let Some(name) = gate {
+        // 状态只是一个原子位：判定路径不碰锁、不读时区、不碰日历。
+        if !state.schedule.is_open(name) {
+            state.schedule.on_denied(name);
+            log_debug!("schedule_access '{name}' 窗口关闭，拒绝 {}", ctx.remote_addr);
+            ctx.status = 403;
+            return Some(status_page(403));
         }
     }
 

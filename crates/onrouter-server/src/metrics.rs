@@ -80,6 +80,15 @@ pub fn register_limits(l: &Arc<crate::limit::Limits>) {
     let _ = LIMITS.set(Arc::clone(l));
 }
 
+/// 定时窗口句柄：窗口在启动时建表、进程内不换（热重载只原地换定义），所以计数
+/// 跨重载延续 —— "这个窗口今天翻过几次、挡过多少请求"不能因为一次 SIGHUP 归零。
+static SCHEDULE: OnceLock<Arc<crate::schedule::Scheduler>> = OnceLock::new();
+
+/// 登记窗口表，供 `/metrics` 渲染逐窗口的当前开合、下次触发时刻、翻转与拒绝计数。
+pub fn register_schedule(s: &Arc<crate::schedule::Scheduler>) {
+    let _ = SCHEDULE.set(Arc::clone(s));
+}
+
 /// 取得全局指标单例（首次调用时按 capacity 初始化容量与启动时刻）。
 pub fn global(worker_connections: usize) -> &'static Metrics {
     let m = METRICS.get_or_init(Metrics::default);
@@ -438,6 +447,54 @@ impl Metrics {
                         "onrouter_vip_events_total{{role=\"{role}\"}} {n}\n"
                     ));
                 }
+            }
+        }
+        if let Some(sch) = SCHEDULE.get() {
+            let rows = sch.snapshot();
+            if !rows.is_empty() {
+                s.push_str("# HELP onrouter_schedule_open Current state of a timed access window; 1 = open (requests pass), 0 = closed (routes with schedule_access for this window get 403). Derived from the calendar at every minute boundary, so this is the same value the request path reads.\n");
+                s.push_str("# TYPE onrouter_schedule_open gauge\n");
+                s.push_str("# HELP onrouter_schedule_next_fire_ms Absolute Unix-ms at which this window will next be re-evaluated. -1 = nothing scheduled (window removed from the config; its state is frozen). Compare it with your own clock to prove the gateway and the operator agree on the time.\n");
+                s.push_str("# TYPE onrouter_schedule_next_fire_ms gauge\n");
+                s.push_str("# HELP onrouter_schedule_enabled 0 once a window has been removed from the config by a reload — the row stays so the counters above remain attributable instead of silently vanishing.\n");
+                s.push_str("# TYPE onrouter_schedule_enabled gauge\n");
+                s.push_str("# HELP onrouter_schedule_changes_total Times this window actually changed state. Note that a trigger does not imply a change: waking at a moment that leaves the state as it was is not counted.\n");
+                s.push_str("# TYPE onrouter_schedule_changes_total counter\n");
+                s.push_str("# HELP onrouter_schedule_denied_total Requests answered 403 because this window was closed.\n");
+                s.push_str("# TYPE onrouter_schedule_denied_total counter\n");
+                s.push_str("# HELP onrouter_schedule_gate_miss_total Route lookups for a window name this process has no instance of (only possible right after a reload that added a window); those requests are passed, not blocked.\n");
+                s.push_str("# TYPE onrouter_schedule_gate_miss_total counter\n");
+                for row in rows {
+                    let name = label(&row.name);
+                    s.push_str(&format!(
+                        "onrouter_schedule_open{{name=\"{name}\"}} {}\n",
+                        if row.open { 1 } else { 0 }
+                    ));
+                    s.push_str(&format!(
+                        "onrouter_schedule_next_fire_ms{{name=\"{name}\"}} {}\n",
+                        if row.enabled {
+                            row.next_ms
+                        } else {
+                            -1
+                        }
+                    ));
+                    s.push_str(&format!(
+                        "onrouter_schedule_enabled{{name=\"{name}\"}} {}\n",
+                        if row.enabled { 1 } else { 0 }
+                    ));
+                    s.push_str(&format!(
+                        "onrouter_schedule_changes_total{{name=\"{name}\"}} {}\n",
+                        row.changes
+                    ));
+                    s.push_str(&format!(
+                        "onrouter_schedule_denied_total{{name=\"{name}\"}} {}\n",
+                        row.denied
+                    ));
+                }
+                s.push_str(&format!(
+                    "onrouter_schedule_gate_miss_total {}\n",
+                    sch.misses()
+                ));
             }
         }
         s.push_str("# HELP onrouter_tls_handshake_failures_total Inbound TLS/QUIC handshake failures (including timeouts).\n");

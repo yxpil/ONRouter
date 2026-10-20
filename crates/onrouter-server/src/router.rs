@@ -232,6 +232,9 @@ pub struct Location {
     pub auth_basic_realm: Option<String>,
     /// `auth_basic_user_file <path>;` 解析后的绝对路径
     pub auth_basic_user_file: Option<PathBuf>,
+    /// `schedule_access <window>;`：引用的顶层窗口名。None = 本路由不设定时闸门。
+    /// location 没写时继承 server 级（与 access_rules/auth_basic 同一条路）。
+    pub schedule_gate: Option<String>,
     /// `proxy_cache <zone>|off;`：Some(zone) 启用命名缓存区，None 关闭
     pub proxy_cache: Option<String>,
     /// `proxy_cache_key <模板>;`，默认 `$scheme$proxy_host$request_uri`
@@ -305,6 +308,8 @@ pub struct Server {
     pub access_rules: Vec<crate::access::AccessRule>,
     pub auth_basic_realm: Option<String>,
     pub auth_basic_user_file: Option<PathBuf>,
+    /// server 级 `schedule_access`：location 未自带时继承（同 access_rules）。
+    pub schedule_gate: Option<String>,
     /// `real_ip_header` / `set_real_ip_from` / `real_ip_recursive`（server 级，对标 nginx http/server）
     pub real_ip: crate::realip::RealIpConf,
     /// 前置代理/CDN 感知（`front_proxy_mode` / `front_proxy_auto_trust` + 顶层 profile 表）
@@ -442,6 +447,7 @@ struct ServerTemplate {
     access_rules: Vec<crate::access::AccessRule>,
     auth_basic_realm: Option<String>,
     auth_basic_user_file: Option<PathBuf>,
+    schedule_gate: Option<String>,
     real_ip: crate::realip::RealIpConf,
     front_proxy: crate::front_proxy::FrontProxyConf,
     ssl_cert: Option<PathBuf>,
@@ -1805,6 +1811,10 @@ impl Router {
                 .map(|z| z.split(':').next().unwrap_or(z).to_string()))
             .collect();
 
+        // 定时窗口的名字表：`schedule_access <name>;` 引用未声明的窗口要硬失败（见 parse_schedule_gate）。
+        // 这里只做名字扫描 —— 日历本身在 `Scheduler::parse_all` 里解析，那一步更早、也更严。
+        let schedule_declared = crate::schedule::Scheduler::declared_names(config);
+
         // 限流区的 key 决定"按什么计数"。本实现只会按客户端地址计数：写成别的变量
         // （$http_x_api_key、$uri…）时请求路径根本不展开它，配置看着生效、实际按 IP 限——
         // 这种"写了但那一维不存在"是静默的放行失败，`-t` 必须直接否决（审计 S11）。
@@ -1867,6 +1877,7 @@ impl Router {
                    "log_by_lua", "log_by_lua_file",
                    "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
                    "allow", "deny", "auth_basic", "auth_basic_user_file",
+                   "schedule_access",
                    "set_real_ip_from", "real_ip_header", "real_ip_recursive",
                    "front_proxy_mode", "front_proxy_auto_trust"],
                 "server",
@@ -1890,6 +1901,7 @@ impl Router {
                 d,
                 base_dir,
                 &limits_declared,
+                &schedule_declared,
                 &var_targets,
                 &front_profiles,
                 &mut warnings,
@@ -1986,6 +1998,7 @@ impl Router {
                     access_rules: tmpl.access_rules.clone(),
                     auth_basic_realm: tmpl.auth_basic_realm.clone(),
                     auth_basic_user_file: tmpl.auth_basic_user_file.clone(),
+                    schedule_gate: tmpl.schedule_gate.clone(),
                     real_ip: tmpl.real_ip.clone(),
                     front_proxy: tmpl.front_proxy.clone(),
                 };
@@ -2112,6 +2125,36 @@ impl Router {
                 front_profiles.len(),
                 crate::front_proxy::describe(&front_profiles)
             ));
+        }
+        // 定时窗口的"声明了却没引用"：窗口会照常在每个分钟边界翻转，但没有任何路由被它挡 ——
+        // 配置读起来像"已经限时段开放了"，其实一行没生效（与 front_proxy 未启用同一条硬要求）。
+        if !schedule_declared.is_empty() {
+            let mut referenced: HashSet<&str> = HashSet::new();
+            for group in out_groups.values() {
+                for srv in &group.servers {
+                    if let Some(g) = &srv.schedule_gate {
+                        referenced.insert(g.as_str());
+                    }
+                    for loc in &srv.locations {
+                        if let Some(g) = &loc.schedule_gate {
+                            referenced.insert(g.as_str());
+                        }
+                    }
+                }
+            }
+            let unused: Vec<&str> = schedule_declared
+                .iter()
+                .filter(|n| !referenced.contains(n.as_str()))
+                .map(|n| n.as_str())
+                .collect();
+            if !unused.is_empty() {
+                warnings.push(format!(
+                    "顶层声明的 schedule_window 里 {} 个没有任何 server/location 用 schedule_access 引用（{}）：\
+                     它们会照常按日历翻转，只是没有路由被挡 —— 定时闸门要写在 server 或 location 里才生效",
+                    unused.len(),
+                    unused.join(", ")
+                ));
+            }
         }
         for group in out_groups.values() {
             for srv in &group.servers {
@@ -2328,6 +2371,47 @@ impl Router {
     }
 
     /// 未知指令告警：拼错的指令静默失效是网关最难排查的一类故障
+    /// 解析 `schedule_access <窗口名>;`（server 级与 location 级同一条路，location 覆盖 server）。
+    ///
+    /// 引用了没声明的窗口必须**硬失败**：闸门写错名字的结果是"运维以为挡住了、其实一路放行"，
+    /// 这是这套代码库认定最不能只留一条告警的那类静默失效（同 limit_conn 引用未声明区域）。
+    fn parse_schedule_gate(
+        d: &Directive,
+        ctx: &str,
+        windows: &[String],
+    ) -> Result<Option<String>, AppError> {
+        let mut found: Option<String> = None;
+        for c in d.block.iter().filter(|x| x.name == "schedule_access") {
+            let name = c.arg(0).ok_or_else(|| {
+                AppError::Other(format!(
+                    "第 {} 行 {ctx} 里 schedule_access 缺少窗口名（写成 schedule_access office;）",
+                    c.line
+                ))
+            })?;
+            if found.is_some() {
+                return Err(AppError::Other(format!(
+                    "第 {} 行 {ctx} 里 schedule_access 出现了多次：一条路由只能挂一个窗口，\
+                     要组合多段开放时间请在顶层声明一个覆盖它们的窗口",
+                    c.line
+                )));
+            }
+            if !windows.iter().any(|w| w == name) {
+                let known = if windows.is_empty() {
+                    "（本配置没有任何 schedule_window）".to_string()
+                } else {
+                    format!("（已声明：{}）", windows.join(", "))
+                };
+                return Err(AppError::Other(format!(
+                    "第 {} 行 {ctx} 里 schedule_access 引用了未声明的窗口 '{name}'{known}：\
+                     这条路由的定时闸门不会生效，而\"看起来挡住了\"比没有闸门更糟",
+                    c.line
+                )));
+            }
+            found = Some(name.to_string());
+        }
+        Ok(found)
+    }
+
     fn warn_unknown(
         d: &Directive,
         known: &[&str],
@@ -2370,6 +2454,7 @@ impl Router {
             "learning", "learning_memory_budget", "proxy_cache_learning",
             "limit_req_queue", "limit_req_learning", "vip_learning",
             "front_proxy",
+            "schedule_window",
         ];
         for d in &config.root.block {
             match d.name.as_str() {
@@ -2396,6 +2481,7 @@ impl Router {
         d: &Directive,
         base_dir: &PathBuf,
         limits: &[String],
+        windows: &[String],
         var_targets: &Arc<HashSet<String>>,
         front_profiles: &std::sync::Arc<Vec<std::sync::Arc<crate::front_proxy::FrontProfile>>>,
         warnings: &mut Vec<String>,
@@ -2441,6 +2527,7 @@ impl Router {
             access_rules: Vec::new(),
             auth_basic_realm: None,
             auth_basic_user_file: None,
+            schedule_gate: None,
             real_ip: crate::realip::RealIpConf::default(),
             front_proxy: crate::front_proxy::FrontProxyConf::default(),
             ssl_cert: None,
@@ -2661,6 +2748,7 @@ impl Router {
         tmpl.access_rules = a_rules;
         tmpl.auth_basic_realm = a_realm;
         tmpl.auth_basic_user_file = a_file;
+        tmpl.schedule_gate = Self::parse_schedule_gate(d, "server", windows)?;
 
         // realip 模块：set_real_ip_from（可重复）/ real_ip_header / real_ip_recursive
         {
@@ -2795,7 +2883,7 @@ impl Router {
         for loc in d.block.iter().filter(|x| x.name == "location") {
             tmpl.locations
                 .push(Self::build_location(
-                    loc, base_dir, &tmpl, limits, var_targets, warnings,
+                    loc, base_dir, &tmpl, limits, windows, var_targets, warnings,
                 )?);
         }
         Ok(tmpl)
@@ -2806,6 +2894,7 @@ impl Router {
         base_dir: &PathBuf,
         tmpl: &ServerTemplate,
         limits: &[String],
+        windows: &[String],
         var_targets: &Arc<HashSet<String>>,
         warnings: &mut Vec<String>,
     ) -> Result<Location, AppError> {
@@ -2865,6 +2954,7 @@ impl Router {
             access_rules: Vec::new(),
             auth_basic_realm: None,
             auth_basic_user_file: None,
+            schedule_gate: None,
             sub_filter: None,
             proxy_redirect: crate::resp_rewrite::ProxyRedirect::default(),
             proxy_cookie_domain: crate::resp_rewrite::CookieRewrite::default(),
@@ -2894,6 +2984,7 @@ impl Router {
                "balancer_by_lua", "balancer_by_lua_file",
                "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
                "allow", "deny", "auth_basic", "auth_basic_user_file",
+               "schedule_access",
                "sub_filter", "sub_filter_once", "sub_filter_types",
                "proxy_redirect", "proxy_cookie_domain", "proxy_cookie_path"],
             &format!("location '{}'", loc.pattern),
@@ -2938,6 +3029,8 @@ impl Router {
         loc.access_rules = rules;
         loc.auth_basic_realm = realm;
         loc.auth_basic_user_file = user_file;
+        loc.schedule_gate =
+            Self::parse_schedule_gate(d, &format!("location '{}'", loc.pattern), windows)?;
         loc.error_pages = parse_error_pages(d);
         // sub_filter：收集多条规则 + once + types，有任一规则才启用
         {
@@ -5254,5 +5347,54 @@ mod tests {
         );
         let addr2: SocketAddr = "127.0.0.1:18262".parse().unwrap();
         assert!(r.groups[&addr2].servers[0].front_proxy.auto_trust);
+    }
+
+    /// `schedule_access` 的引用完整性：写错名字必须硬失败（闸门静默失效比没有闸门更糟），
+    /// 而"声明了却没人引用"要留一条告警 —— 两者都是这套代码库不接受"看着生效"的那类形状。
+    #[test]
+    fn schedule_gate_references_are_resolved_at_build_time() {
+        let win = "schedule_window office { tz +08:00; open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; }";
+        let good = format!(
+            "{win}\nserver {{ listen 127.0.0.1:18331;\n  schedule_access office;\n  location / {{ return 200; }}\n  location /open {{ schedule_access office; return 200; }}\n}}\n"
+        );
+        let r = build(&good);
+        let addr: SocketAddr = "127.0.0.1:18331".parse().unwrap();
+        let srv = &r.groups[&addr].servers[0];
+        assert_eq!(srv.schedule_gate.as_deref(), Some("office"));
+        // location 各自记下自己的值；没写的那条留 None = 继承 server（判定在 server.rs 里做）。
+        assert_eq!(srv.locations[0].schedule_gate.as_deref(), None);
+        assert_eq!(srv.locations[1].schedule_gate.as_deref(), Some("office"));
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("schedule_window")),
+            "引用齐了却还告警：{:?}",
+            r.warnings
+        );
+
+        // 名字写错：硬失败，且报错里要点出到底是哪个名字、有哪些可选。
+        let typo = format!("{win}\nserver {{ listen 127.0.0.1:18332; location / {{ schedule_access offic; return 200; }} }}");
+        let e = Router::build(&cfg(&typo), &PathBuf::from(".")).expect_err("拼错的窗口名该否决");
+        let msg = e.to_string();
+        assert!(msg.contains("offic") && msg.contains("office"), "{msg}");
+
+        // 一个窗口都没声明就写 schedule_access：同样否决，而不是"永远开放"。
+        let orphan = "server { listen 127.0.0.1:18333; location / { schedule_access office; return 200; } }";
+        let e = Router::build(&cfg(orphan), &PathBuf::from(".")).expect_err("没有窗口该否决");
+        assert!(e.to_string().contains("没有任何 schedule_window"), "{e}");
+
+        // 缺参数与写两遍都在 -t 就停住。
+        let noarg = format!("{win}\nserver {{ listen 127.0.0.1:18334; location / {{ schedule_access; return 200; }} }}");
+        assert!(Router::build(&cfg(&noarg), &PathBuf::from(".")).is_err());
+        let twice = format!("{win}\nserver {{ listen 127.0.0.1:18335; location / {{ schedule_access office; schedule_access office; return 200; }} }}");
+        let e = Router::build(&cfg(&twice), &PathBuf::from(".")).expect_err("一条路由挂两个窗口该否决");
+        assert!(e.to_string().contains("多次"), "{e}");
+
+        // 声明了没人引用 ⇒ 告警（窗口会翻转但没有路由被挡）。
+        let unused = format!("{win}\nserver {{ listen 127.0.0.1:18336; location / {{ return 200; }} }}");
+        let r = build(&unused);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("office") && w.contains("schedule_access")),
+            "声明未引用却没告警：{:?}",
+            r.warnings
+        );
     }
 }

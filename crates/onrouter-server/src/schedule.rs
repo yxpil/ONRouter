@@ -1,4 +1,4 @@
-//! 定时调度的内核：日历时间（cron）与间隔时间（interval）→ 下一次触发时刻。
+//! 定时调度的内核：日历时间（cron）→ 窗口开合状态与下一次触发时刻。
 //!
 //! 这一层刻意**不碰任何动作**，也不读配置：它只是一个能被把时钟捏在手里的纯函数集合
 //! （沿用 `vip.rs` 的口径 —— 生产路径喂真实时间，单测喂假时间）。这样"到点算得对不对"可以
@@ -20,13 +20,6 @@ use onrouter_config::Config;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-/// 一次触发的最小间隔下限。比这更短的"定时"其实是热路径的事，不该由调度任务去轮。
-///
-/// 这里刻意比 `reload <interval>;` 自己的 200ms 下限更严：reload 只是碰一下配置的
-/// mtime，而调度动作可能要跑 Lua、切换限流档位或触发重启，轮得越勤代价越不像"定时"。
-pub const MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// cron 的搜索上限（年）。超过它就认为这条表达式永远不会成立，宁可报错也不要无限找。
 const SEARCH_CAP_YEARS: i32 = 8;
 
@@ -265,21 +258,6 @@ pub fn parse_cron(expr: &str) -> Result<Cron, String> {
         dom_star,
         dow_star,
     })
-}
-
-/// 解析间隔写法。**单位口径完全交给 `settings::parse_duration`** —— `500ms` / `15s` / `1m` /
-/// `2h` / `1d`、裸数字按秒、允许小数，与 `reload`、`proxy_read_timeout` 那些写法一致。
-/// 这里只加一条下限：定时任务不做亚秒级调度。
-pub fn parse_interval(text: &str) -> Result<u64, String> {
-    let d = crate::settings::parse_duration(text)
-        .ok_or_else(|| format!("间隔 {text:?} 写法无效（参考 reload：500ms / 15s / 1m / 2h / 1d）"))?;
-    if d < MIN_INTERVAL {
-        return Err(format!(
-            "间隔 {text:?} 小于 {}s：定时任务不做亚秒级调度",
-            MIN_INTERVAL.as_secs()
-        ));
-    }
-    Ok(d.as_millis() as u64)
 }
 
 fn floor_minute(dt: NaiveDateTime) -> NaiveDateTime {
@@ -521,6 +499,8 @@ pub struct Slot {
     open: AtomicBool,
     next: AtomicI64,
     changes: AtomicU64,
+    /// 因本窗口关闭而被 403 挡掉的请求数。
+    denied: AtomicU64,
 }
 
 impl Slot {
@@ -553,6 +533,7 @@ pub struct Stat {
     pub open: bool,
     pub next_ms: i64,
     pub changes: u64,
+    pub denied: u64,
 }
 
 pub struct Scheduler {
@@ -582,6 +563,7 @@ impl Scheduler {
                 open: AtomicBool::new(open),
                 next: AtomicI64::new(next),
                 changes: AtomicU64::new(0),
+                denied: AtomicU64::new(0),
             });
             by_name.insert(name, Arc::clone(&slot));
             slots.push(slot);
@@ -739,6 +721,13 @@ impl Scheduler {
         self.misses.load(Ordering::Relaxed)
     }
 
+    /// 记账一次"因窗口关闭而被挡住"。只在拒绝路径上调用，不碰放行路径的原子量。
+    pub fn on_denied(&self, name: &str) {
+        if let Some(s) = self.by_name.get(name) {
+            s.denied.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// 到点重算：返回**真的**变了状态的窗口。runner 每分钟喂一次真实时间。
     ///
     /// 每次重算都会刷新 `next`，否则 `next_fire_ms` 这项自证指标会一直停在启动那一刻的值 ——
@@ -766,24 +755,18 @@ impl Scheduler {
         out
     }
 
-    /// 在排期窗口里最早的下一次触发。移除的窗口不算。
-    /// runner 用它决定"最远睡多久"，指标用它做自证（运维能核对网关算出的时刻与自己
-    /// 系统时钟是否同一个钟 —— 日历类配置最容易出的事故就是主机时钟漂移）。
-    pub fn earliest(&self) -> Option<i64> {
-        self.slots
-            .iter()
-            .map(|s| s.next.load(Ordering::Relaxed))
-            .filter(|n| *n != NO_NEXT)
-            .min()
-    }
 
-    /// 有窗口被移除后为 `NO_NEXT`；全部移除时 `earliest` 返回 None，runner 仍在分钟边界上
-    /// 空转，直到下一次热重载把定义换回来。
-    pub fn next_of(&self, name: &str) -> Option<i64> {
-        self.by_name
+
+    /// 把某个绝对时刻按**该窗口自己配置的时区**写成墙钟串（日志用）。
+    /// 运维写的是 `tz +08:00`，日志里却打 UTC 的话，"定时没到点"和"网关差八小时"分不开。
+    /// 名字查不到（窗口已移除）时退回 UTC —— 只影响这一行可读性，不参与任何判定。
+    pub fn wall(&self, name: &str, ms: i64) -> String {
+        let zone = self
+            .by_name
             .get(name)
-            .map(|s| s.next.load(Ordering::Relaxed))
-            .filter(|n| *n != NO_NEXT)
+            .and_then(|s| s.view().map(|v| v.3))
+            .unwrap_or(Zone::Utc);
+        fmt_wall(ms, zone)
     }
 
     pub fn snapshot(&self) -> Vec<Stat> {
@@ -795,6 +778,7 @@ impl Scheduler {
                 open: s.open.load(Ordering::Relaxed),
                 next_ms: s.next.load(Ordering::Relaxed),
                 changes: s.changes.load(Ordering::Relaxed),
+                denied: s.denied.load(Ordering::Relaxed),
             })
             .collect()
     }
@@ -1065,23 +1049,6 @@ mod tests {
         assert!(Zone::parse("+24:00").is_err());
     }
 
-    #[test]
-    fn interval_units_and_floor() {
-        assert_eq!(parse_interval("1s").unwrap(), 1_000);
-        assert_eq!(parse_interval("30m").unwrap(), 1_800_000);
-        assert_eq!(parse_interval("2h").unwrap(), 7_200_000);
-        assert_eq!(parse_interval("1d").unwrap(), 86_400_000);
-        assert_eq!(parse_interval("5").unwrap(), 5_000, "裸数字按秒，与 reload/timeout 一致");
-        assert_eq!(parse_interval("1.5m").unwrap(), 90_000, "小数走同一套写法");
-        // 亚秒拒绝：那是热路径的事，不该由调度任务轮。
-        assert!(parse_interval("500ms").is_err());
-        assert!(parse_interval("999ms").is_err());
-        assert!(parse_interval("0.5s").is_err());
-        assert!(parse_interval("10x").is_err());
-        assert!(parse_interval("s").is_err());
-        assert!(parse_interval("").is_err());
-    }
-
     /// `expr` 在 `from` 这一分钟或更早的最近一次成立时刻（UTC 墙钟字符串）。
     fn prev_at(expr: &str, from: i64) -> String {
         let c = parse_cron(expr).unwrap();
@@ -1261,6 +1228,16 @@ mod tests {
         Scheduler::parse_all_at(&cfg, now).unwrap_or_else(|e| panic!("合法配置却被拒：{e}"))
     }
 
+    /// 读某个窗口的下次触发时刻（`None` = 已移除或名字不存在）。
+    /// 生产路径用 `snapshot()`，测试里这个更顺手 —— 它同时验证了快照与排期一致。
+    fn next_ms(t: &Scheduler, name: &str) -> Option<i64> {
+        t.snapshot()
+            .into_iter()
+            .find(|s| s.name == name)
+            .filter(|s| s.enabled)
+            .map(|s| s.next_ms)
+    }
+
     fn reject(text: &str) -> String {
         let cfg = Config::parse(text).unwrap();
         match Scheduler::parse_all_at(&cfg, ms(2026, 10, 21, 0, 0)) {
@@ -1336,12 +1313,12 @@ mod tests {
         assert_eq!(wed.len(), 1);
         assert!(!wed.is_empty());
         // 下次触发 = 当天 +08 的 18:00 = 10:00 UTC。
-        assert_eq!(wed.next_of("office"), Some(ms(2026, 10, 21, 10, 0)));
+        assert_eq!(next_ms(&wed, "office"), Some(ms(2026, 10, 21, 10, 0)));
 
         let sat = table(OFFICE, ms(2026, 10, 24, 2, 0));
         assert!(!sat.is_open("office"));
         // 周六的下次触发要跳到周一：+08:00 的 09:00 开门 = UTC 01:00。
-        assert_eq!(sat.next_of("office"), Some(ms(2026, 10, 26, 1, 0)));
+        assert_eq!(next_ms(&sat, "office"), Some(ms(2026, 10, 26, 1, 0)));
     }
 
     #[test]
@@ -1352,22 +1329,22 @@ mod tests {
         assert_eq!(t.misses(), 1);
         assert!(t.is_open("nope"));
         assert_eq!(t.misses(), 2);
-        assert_eq!(t.next_of("nope"), None);
+        assert_eq!(next_ms(&t, "nope"), None);
     }
 
     #[test]
     fn advance_reports_only_real_changes_and_keeps_next_fresh() {
         let t = table(OFFICE, ms(2026, 10, 21, 2, 0));
-        let before = t.next_of("office").unwrap();
+        let before = next_ms(&t, "office").unwrap();
         // 还没到点：不产出变化，next 也不该倒退。
         assert!(t.advance(ms(2026, 10, 21, 9, 59)).is_empty());
-        assert_eq!(t.next_of("office"), Some(before));
+        assert_eq!(next_ms(&t, "office"), Some(before));
         // 到点：开放→关闭，且 next 推到第二天。
         let ch = t.advance(ms(2026, 10, 21, 10, 0));
         assert_eq!(ch.len(), 1);
         assert_eq!(ch[0], Change { name: "office".into(), open: false, at_ms: ms(2026, 10, 21, 10, 0) });
         assert!(!t.is_open("office"));
-        assert!(t.next_of("office").unwrap() > before);
+        assert!(next_ms(&t, "office").unwrap() > before);
         // 快照里的计数只统计真实翻转。
         let st = &t.snapshot()[0];
         assert_eq!(st.changes, 1);
@@ -1385,7 +1362,7 @@ mod tests {
         assert!(t.advance(mar1).is_empty(), "2026 年 3/1 到点不该变状态");
         // close 年年成立，所以醒完之后 next 推的是**下一年的 3/1**，不是闰日 ——
         // 如果这里算成 2028-02-29，说明 next 只看了 open 一侧。
-        assert_eq!(t.next_of("leap"), Some(ms(2027, 3, 1, 0, 30)));
+        assert_eq!(next_ms(&t, "leap"), Some(ms(2027, 3, 1, 0, 30)));
         // 真到了闰日 00:00：开。
         assert_eq!(t.advance(ms(2028, 2, 29, 0, 0)).len(), 1);
         assert!(t.is_open("leap"));
@@ -1429,7 +1406,7 @@ mod tests {
         assert!(notes.iter().any(|n| n.contains("night") && n.contains("已从新配置移除")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("'new'") && n.contains("一律放行")), "{notes:?}");
         // 移除的窗口：状态冻结、不再排期、但名字还在表里（指标要说清它曾经存在）。
-        assert_eq!(t.next_of("night"), None);
+        assert_eq!(next_ms(&t, "night"), None);
         let snap = t.snapshot();
         let frozen = snap.iter().find(|s| s.name == "night").unwrap();
         assert!(!frozen.enabled && !frozen.open);
@@ -1453,13 +1430,4 @@ mod tests {
         assert!(Scheduler::declared_names(&Config::parse("worker_processes 2;").unwrap()).is_empty());
     }
 
-    #[test]
-    fn interval_still_usable_for_non_calendar_triggers() {
-        // 后面几步（定时重载、定时限流档位）走间隔而不是 cron；这里把下限钉住，
-        // 免得有人为了"更准时"把它降到毫秒级、让调度任务变成热路径轮询。
-        assert_eq!(parse_interval("60s").unwrap(), 60_000);
-        assert_eq!(parse_interval("1m").unwrap(), 60_000);
-        assert!(parse_interval("999ms").is_err());
-        assert_eq!(MIN_INTERVAL, Duration::from_secs(1));
-    }
 }
