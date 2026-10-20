@@ -2463,6 +2463,9 @@ impl Router {
             "limit_req_queue", "limit_req_learning", "vip_learning",
             "front_proxy",
             "schedule_window",
+            "cache_governor", "cache_governor_low", "cache_governor_high",
+            "cache_governor_hold", "cache_governor_tier", "cache_governor_learn",
+            "cache_governor_lead",
         ];
         for d in &config.root.block {
             match d.name.as_str() {

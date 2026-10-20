@@ -176,12 +176,12 @@ pub fn parse_governor(config: &Config) -> Result<(GovernorConf, Vec<String>), St
     let mut warns = Vec::new();
     let mut seen_mode = false;
 
-    for d in config.find("cache_governor") {
+    if let Some(d) = config.find("cache_governor") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
         conf.mode = GovernorMode::parse(raw).map_err(|e| format!("line {}: {e}", d.line))?;
         seen_mode = true;
     }
-    for d in config.find("cache_governor_low") {
+    if let Some(d) = config.find("cache_governor_low") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
         conf.low_rps = raw
             .parse::<f64>()
@@ -190,7 +190,7 @@ pub fn parse_governor(config: &Config) -> Result<(GovernorConf, Vec<String>), St
             return Err(format!("line {}: cache_governor_low {raw} out of range 0..1e6", d.line));
         }
     }
-    for d in config.find("cache_governor_high") {
+    if let Some(d) = config.find("cache_governor_high") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
         conf.high_rps = raw
             .parse::<f64>()
@@ -200,7 +200,7 @@ pub fn parse_governor(config: &Config) -> Result<(GovernorConf, Vec<String>), St
         }
     }
 
-    for d in config.find("cache_governor_hold") {
+    if let Some(d) = config.find("cache_governor_hold") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
         let secs: u64 = raw
             .parse()
@@ -211,12 +211,12 @@ pub fn parse_governor(config: &Config) -> Result<(GovernorConf, Vec<String>), St
         conf.hold = Duration::from_secs(secs);
     }
 
-    for d in config.find("cache_governor_tier") {
+    if let Some(d) = config.find("cache_governor_tier") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
         conf.tier = SleepTier::parse(raw).map_err(|e| format!("line {}: {e}", d.line))?;
     }
 
-    for d in config.find("cache_governor_learn") {
+    if let Some(d) = config.find("cache_governor_learn") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
         match raw {
             "on" => conf.learn = true,
@@ -256,7 +256,7 @@ pub fn parse_governor(config: &Config) -> Result<(GovernorConf, Vec<String>), St
         );
     }
 
-    for d in config.find("cache_governor_lead") {
+    if let Some(d) = config.find("cache_governor_lead") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
         let secs: u64 = raw
             .parse()
