@@ -1,3 +1,4 @@
+# Author: yxpil
 """发布产物闸门：验证 target/dist/archives 里**随包的 zip**（解压后驱动），不是构建树里的 exe。
 
 为什么单独要这一个脚本：构建树的 target/release/onrouter.exe 可能被别的脚本换掉过
@@ -6,6 +7,8 @@
 
   1) 解压出的 onrouter.exe 自报版本 == Cargo.toml 版本，响应 Server 头同样是这个版本；
   2) 随包的 conf/front_proxy_examples.conf 用这个二进制 -t 退 0，并且真能服务静态文件；
+  2b) 随包的 conf/schedule.conf 用这个二进制 -t 退 0（0.7.0 起定时窗口随包，闸门特性必须
+      真的被编译进去，而不是只存在于构建树）；
   3) 带 CF-Ray 探针头的请求被标成 cloudflare-edge，而 $remote_addr 仍是直连对端（识别 ≠ 信任），
      缺探针的对照请求**不**被标成 Cloudflare（探针是 AND 语义）；
   4) 二进制里厂商名/专有头 0 命中，并打印控制项次数（front_proxy / auto_trust / nginx 自己的头），
@@ -111,6 +114,14 @@ def main():
 
     t = subprocess.run([exe, "-t", "-c", CONF_REL], cwd=ROOT, capture_output=True)
     check("-t 随包的 front_proxy 示例配置退 0", t.returncode == 0, t.stderr.decode(errors="replace")[:400])
+
+    # Author: yxpil -- schedule ships with the package since 0.7.0; prove the gate feature is compiled in,
+    # not just present in the build tree: -t must exit 0 AND print the per-window describe lines.
+    t = subprocess.run([exe, "-t", "-c", os.path.join("conf", "schedule.conf")], cwd=ROOT, capture_output=True)
+    out = (t.stdout + t.stderr).decode(errors="replace")
+    check("-t 随包的 schedule 示例配置退 0", t.returncode == 0, out[:400])
+    check("-t 输出里有逐窗口的 describe 行（特性真的编进产物）",
+          "schedule window" in out and "tz=" in out and "next_trigger=" in out, out[:200])
 
     logf = open(os.path.join(ROOT, "logs", "release_verify_out.log"), "wb")
     proc = subprocess.Popen([exe, os.path.join(ROOT, CONF_REL)], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)

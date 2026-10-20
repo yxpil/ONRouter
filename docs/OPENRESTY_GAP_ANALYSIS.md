@@ -1,6 +1,9 @@
 # ONRouter vs OpenResty — Gap Analysis
 
-Updated: 2026-10-20 (v0.6.0, Windows host). This revision also folds in the business traffic splitting
+Updated: 2026-10-20 (v0.7.0, Windows host). This revision also folds in scheduled access windows
+(`schedule_window` / `schedule_access`: Vixie-cron open/close pairs whose state is derived from the
+calendar on every minute-boundary wake, never toggled or persisted; window state survives hot reload
+because definitions swap in place and counters are never re-created), business traffic splitting
 (`split_clients` ratios driving `proxy_pass http://$var`, `proxy_split_failover`, and the declared-target
 allowlist that closes the SSRF door that feature opened), the
 adaptive upstream selection tier (`least_time off|observe|on`, P2C over a time-decayed latency EWMA), the
@@ -23,13 +26,18 @@ TCP/UDP cosockets, light threads, `ngx.semaphore`, subrequests (including
 concurrent `capture_multi`), shared dicts, `resty.lock` / `resty.http` /
 `resty.redis` / `resty.string` / `resty.cookie` / `resty.limit.req|count|conn`,
 dynamic TLS certificate selection at handshake time, session resumption shared
-across listeners, and in-process config/Lua hot reload. It also carries four
+across listeners, in-process config/Lua hot reload, and calendar-driven access
+windows (`schedule_window`/`schedule_access`) — OpenResty reaches the same place
+only by writing cron-style Lua by hand, with no derivation guarantee and no
+first-class metrics. It also carries five
 additions nginx/OpenResty has no equivalent for: a disk cold tier behind
 `ngx.shared.DICT` (§1.2), the Still ONLine last-known-good replay layer (§1.3),
 an opt-in learning layer — TinyLFU cache admission, per-key adaptive queue
 depth and client reputation, all on one process-wide byte budget (§1.3) — and a
 vendor-free front-proxy layer that puts recognition *after* realip's trust gate,
-adds an egress mode and emits RFC 9209 `Cache-Status` (§1.3).
+adds an egress mode and emits RFC 9209 `Cache-Status` (§1.3) — and calendar-driven
+access windows whose state is derived from the cron definitions on every wake
+rather than toggled or remembered (§1.1).
 
 The remaining gaps are concentrated in four areas:
 

@@ -644,7 +644,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   is booted, not eyeballed: `tools/front_proxy_examples_e2e.py` (24 checks) runs the gateway on it and proves
   both halves — `-t` echoes all three profiles with their chains and 22/0/3 range counts, and at runtime a
   full Cloudflare-shaped header set is *labelled* but never *applied* from a loopback peer, the probe is
-  AND-ed, and per-profile counters stay in their own accounts. `grep -a -i -o` over the 0.6.0 release binary
+  AND-ed, and per-profile counters stay in their own accounts. `grep -a -i -o` over the 0.7.0 release binary
   finds 0 hits for any provider name or its headers, while the controls `front_proxy`/`auto_trust` hit 49/10
   times (re-measured against the packaged zip by `tools/release_verify.py`).
 - Proxy response-header rewrite — the nginx `proxy_redirect` + `proxy_cookie_domain`/`proxy_cookie_path`
@@ -944,20 +944,20 @@ them as standalone runnable assertion scripts.
   an undeclared window, a missing `tz`, an open/close pair that fires in the same minute, a duplicate name,
   a bare `schedule_access;`), and "declared but referenced by nobody" is asserted to stay a *warning* with
   exit 0, so an old config's `-t` result cannot get worse.
-- The whole suite (409 unit tests + 78 Python E2E scripts: every `tools/*_e2e.py`
-  (70) plus the 8 root scenario/compat/security/static/upstream suites) is re-run after
+- The whole suite (440 unit tests + 79 Python E2E scripts: every `tools/*_e2e.py`
+  (71) plus the 8 root scenario/compat/security/static/upstream suites) is re-run after
   these changes: every E2E script passes with real traffic
-  (`python run_regression.py reg_060_20261020.txt` → `TOTAL 78 scripts, nonzero=0`,
-  2026-10-20 — the run against the final 0.6.0 binary, covering `proxy_split` 76/76, the
-  business model 32/32 and the shipped example config 24/24 alongside `least_time` 43/43,
-  `front_proxy` 54/54 and the three learning suites, `learning_cache` 34/34,
-  `queue_learning` 42/42 and `vip_learning` 51/51; the previous roll-up `reg_ssrf_20261020.txt`
-  was `TOTAL 78 scripts, nonzero=1` — the one nonzero line was `least_time_e2e.py`, whose
-  ratio checks had no margin against this host's `sleep()` jitter, fixed by spacing the fake
-  backends 5/200/400 ms rather than by relaxing a threshold) and
-  `cargo test --workspace` → 409/409
-  (396 in `onrouter-server` + 13 in `onrouter-config`).
-  The packaged artefact is checked separately by `tools/release_verify.py` (24/24 for 0.6.0):
+  (`python run_regression.py reg_070_20261020.txt` → `TOTAL 79 scripts, nonzero=0`,
+  2026-10-20 — the run against the final 0.7.0 binary, with `schedule_e2e` 50/50 and
+  `least_time` 43/43 alongside the carries from 0.6.0: `proxy_split` 76/76, the business
+  model 32/32, the shipped example config 24/24, `front_proxy` 54/54, `rce_matrix` 32/32,
+  `security_matrix` 36/36 and the three learning suites) and
+  `cargo test --workspace` → 440/440
+  (427 in `onrouter-server` + 13 in `onrouter-config`).
+  The packaged artefact is checked separately by `tools/release_verify.py` (26/26 for 0.7.0 —
+  24 prior checks plus two new ones: the extracted binary must `-t` the shipped
+  `conf/schedule.conf` to exit 0 *and* print the per-window `describe` lines, proving the
+  gate feature is compiled into what users download):
   it extracts the shipped zip — not the build tree, which another suite may have swapped the
   binary under — boots it on the shipped example config and asserts the version string, the
   `Server` header, a real static response, the recognise-but-don't-trust split and the
