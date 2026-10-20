@@ -15,7 +15,7 @@
 //! "每天 09:00"实际变成当地 08:00 或 10:00。对中国大陆（无 DST）没有影响，对欧美站点必须显式写
 //! 成 UTC 或按季节改偏移，而不是假装我们能算对。
 
-use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
 use std::time::Duration;
 
 /// 一次触发的最小间隔下限。比这更短的"定时"其实是热路径的事，不该由调度任务去轮。
@@ -351,6 +351,145 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
+/// 这两条表达式会不会在**同一分钟**都要求改变状态。
+/// on/close 成对时这是必须否决的配置：碰上这一刻，
+/// "现在算开着还是算关着"没有答案，而判据在平手时的兜底方向是"关" ——
+/// 这条窗口会从撞车那一刻起一直关到下一个独立触发点，看起来就是"定时没生效"。
+/// 判定域见 [`CYCLE_DAYS`]：分钟集合与小时集合都有交集，且 400 年周期里存在
+/// 同一天被两者接受。所以"没报冲突"是证明过的没有冲突，不是"找几年没撞上"。
+pub fn collides(a: &Cron, b: &Cron) -> bool {
+    if a.minute & b.minute == 0 || a.hour & b.hour == 0 {
+        return false;
+    }
+    let base = NaiveDate::from_ymd_opt(CYCLE_EPOCH.0, CYCLE_EPOCH.1, CYCLE_EPOCH.2)
+        .expect("周期锚点本身必须合法");
+    for i in 0..CYCLE_DAYS {
+        let date = base
+            .checked_add_signed(chrono::Duration::days(i))
+            .expect("400 年不会超出 NaiveDate 的范围");
+        if a.accepts_date(&date) && b.accepts_date(&date) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 格里历的完整周期天数：400 年 = 146097 天，同时是 7 的整数倍
+/// （146097 / 7 = 20871 整周）。用它做判定域，"月-日-星期几"的组合从这里起只会重复，
+/// 所以结论对整个可表示时间范围永久有效 —— 不是"找了几年没撞上"。
+const CYCLE_DAYS: i64 = 146_097;
+/// 周期锚点，取一个整世纪日便于人工核对。
+const CYCLE_EPOCH: (i32, u32, u32) = (2000, 1, 1);
+
+impl Cron {
+    /// 只看月/日/周三层：某一天是否被这条表达式接受（不涉时刻，也不涉时区）。
+    fn accepts_date(&self, date: &NaiveDate) -> bool {
+        self.month & (1u64 << date.month0()) != 0
+            && self.accepts_day(date.day(), date.weekday().num_days_from_sunday())
+    }
+}
+
+/// 这条表达式在 `from_unix_ms` **所在分钟或更早**的下一次成立时刻往前找（Unix 毫秒）。
+///
+/// 为什么需要"往回算"：网关在窗口中途启动或热重载时，"此刻开着还是关着"不能靠猜 ——
+/// 它等于"open 与 close 各自最近一次发生的时刻谁更晚"。只有正向算式的话，
+/// 这个答案要么靠假设、要么真的等到明天。
+///
+/// 含等于：`from` 落在 `09:00:30` 而 cron 是 `0 9 * * *` 时返回今天的 09:00。
+/// 与 `next_after` 一样有 8 年上界，只是方向相反。
+pub fn prev_before(cron: &Cron, zone: Zone, from_unix_ms: i64) -> Option<i64> {
+    let mut dt = floor_minute(to_naive_in_zone(from_unix_ms, zone)?);
+    let cap_year = dt.year() - SEARCH_CAP_YEARS;
+    loop {
+        if dt.year() < cap_year {
+            return None;
+        }
+        if cron.month & (1u64 << dt.month0()) == 0 {
+            // 回到上月最后一天的 23:59。
+            dt = dt
+                .with_day(1)?
+                .with_hour(0)?
+                .with_minute(0)?
+                .checked_sub_signed(chrono::Duration::days(1))?
+                .with_hour(23)?
+                .with_minute(59)?;
+            continue;
+        }
+        if !cron.accepts_day(dt.day(), dt.weekday().num_days_from_sunday()) {
+            dt = dt
+                .with_hour(23)?
+                .with_minute(59)?
+                .checked_sub_signed(chrono::Duration::days(1))?;
+            continue;
+        }
+        if cron.hour & (1u64 << dt.hour()) == 0 {
+            dt = dt
+                .with_minute(59)?
+                .checked_sub_signed(chrono::Duration::hours(1))?;
+            continue;
+        }
+        if cron.minute & (1u64 << dt.minute()) == 0 {
+            dt = dt.checked_sub_signed(chrono::Duration::minutes(1))?;
+            continue;
+        }
+        return Some(to_unix_ms(dt, zone));
+    }
+}
+
+/// 一个时间窗口 = 一对 cron：`open` 那一刻进入，`close` 那一刻离开。
+///
+/// 为什么成对而不是"每天 9 点到 18 点"那种区间写法：区间要么跨午夜、要么跨周、要么跨月，
+/// 每一种都得再编一套语法；两个独立的日历触发点天然覆盖这几种情况
+/// （`open 22 * * *` + `close 2 * * *` 就是跨午夜的维护窗口），而语义仍然看得见。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub zone: Zone,
+    pub open: Cron,
+    pub close: Cron,
+}
+
+impl Window {
+    /// 此刻是否在窗口内。**边界归"离开"那一侧**：close 命中的那一分钟起就是关闭，
+    /// 所以 `open 09:00 / close 18:00` 含 09:00、不含 18:00。
+    ///
+    /// 两边都往回找，比较谁更晚发生；两条 cron 若会在同一分钟同时成立，`-t` 先否决
+    /// （见 [`collides`]），所以这里不存在"平手"的配置。
+    pub fn is_open_at(&self, now_ms: i64) -> bool {
+        let opened = prev_before(&self.open, self.zone, now_ms);
+        let closed = prev_before(&self.close, self.zone, now_ms);
+        match (opened, closed) {
+            (Some(o), Some(c)) => o > c,
+            // 只找得到开、找不到关 ⇒ 开了就没关过；反过来 ⇒ 还没开过。
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    /// 两个触发点里更早的那个 —— 注意名字里刻意不叫"改变"：**到点不一定改变状态**。
+    ///
+    /// 反例（这条是单测逼出来的，不是设想）：`open 0 0 29 2 *` 与 `close 30 0 1 3 *`，
+    /// 在非闰年里 3 月 1 日年年到点，而状态一次都没变过 —— 那个窗口四年才开一天。
+    /// 所以 runner 的正确走法是"到点重新算 `is_open_at`"，绝不是"翻一下"：
+    /// 盲目取反会把这种配置变成"每次到点都在开/关之间乱跳"。
+    pub fn next_trigger_at(&self, now_ms: i64) -> Option<i64> {
+        let a = next_after(&self.open, self.zone, now_ms);
+        let b = next_after(&self.close, self.zone, now_ms);
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        }
+    }
+}
+
+/// 把 Unix 毫秒按 `zone` 写成人类要核对的那种时间（运维追问"你算的下次到底是几点"时，
+/// 日志里必须出现带时区口径的墙钟，而不是一个裸 epoch）。
+pub fn fmt_wall(ms: i64, zone: Zone) -> String {
+    match to_naive_in_zone(ms, zone) {
+        Some(n) => n.format("%Y-%m-%d %H:%M").to_string(),
+        None => format!("{ms}ms"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +671,177 @@ mod tests {
         assert!(parse_interval("10x").is_err());
         assert!(parse_interval("s").is_err());
         assert!(parse_interval("").is_err());
+    }
+
+    /// `expr` 在 `from` 这一分钟或更早的最近一次成立时刻（UTC 墙钟字符串）。
+    fn prev_at(expr: &str, from: i64) -> String {
+        let c = parse_cron(expr).unwrap();
+        show(prev_before(&c, Zone::Utc, from).unwrap(), Zone::Utc)
+    }
+
+    fn window(open: &str, close: &str, zone: Zone) -> Window {
+        Window {
+            zone,
+            open: parse_cron(open).unwrap(),
+            close: parse_cron(close).unwrap(),
+        }
+    }
+
+    #[test]
+    fn prev_before_is_inclusive_and_walks_backwards() {
+        // 含等于：09:00:30 时，今天的 09:00 已经发生了。
+        assert_eq!(prev_at("0 9 * * *", ms(2026, 10, 20, 9, 0) + 30_000), "2026-10-20T09:00");
+        assert_eq!(prev_at("0 9 * * *", ms(2026, 10, 20, 8, 59)), "2026-10-19T09:00");
+        assert_eq!(prev_at("*/15 * * * *", ms(2026, 10, 20, 10, 7)), "2026-10-20T10:00");
+        // 2 月没有 31 日：3 月 1 日往前找，最近的是 1 月 31 日。
+        assert_eq!(prev_at("0 0 31 * *", ms(2026, 3, 1, 0, 0)), "2026-01-31T00:00");
+        // 只在闰年成立。
+        assert_eq!(prev_at("0 0 29 2 *", ms(2026, 6, 15, 0, 0)), "2024-02-29T00:00");
+        // 只在周一：周一 08:00 往前找的是上周一，不是"今天还没到所以算昨天"。
+        assert_eq!(prev_at("0 9 * * 1", ms(2026, 10, 26, 8, 0)), "2026-10-19T09:00");
+        // 固定偏移下也必须按同一个墙钟往回走。
+        let cn = Zone::parse("+08:00").unwrap();
+        let c = parse_cron("0 9 * * *").unwrap();
+        assert_eq!(
+            show(prev_before(&c, cn, ms(2026, 10, 20, 0, 30)).unwrap(), cn),
+            "2026-10-19T09:00"
+        );
+    }
+
+    #[test]
+    fn forward_and_backward_agree_on_every_fire() {
+        // 这两条恒等式是"往回算"与"往前走"共用同一套日历算术的证据：
+        // 任何一个正向算出的触发时刻，往回找必须正好落在它自己身上。
+        for expr in [
+            "*/7 3-5 * * *",
+            "0 9 * * 1-5",
+            "30 6 20 * *",
+            "0 0 29 2 *",
+            "17 * * * *",
+            "0 0 1 1 *",
+        ] {
+            let c = parse_cron(expr).unwrap();
+            let mut t = ms(2026, 3, 9, 0, 0);
+            for _ in 0..30 {
+                let n = next_after(&c, Zone::Utc, t).unwrap_or_else(|| panic!("{expr} 找不到下次触发"));
+                assert_eq!(prev_before(&c, Zone::Utc, n), Some(n), "{expr} 在 {}", show(n, Zone::Utc));
+                assert_eq!(
+                    next_after(&c, Zone::Utc, n - 1),
+                    Some(n),
+                    "{expr} 在 {} 的前一格必须回到它自己",
+                    show(n, Zone::Utc)
+                );
+                t = n;
+            }
+        }
+    }
+
+    #[test]
+    fn window_state_is_derived_not_assumed() {
+        // 2026-10-21 是周三，10-24 是周六。
+        let w = window("0 9 * * 1-5", "0 18 * * 1-5", Zone::Utc);
+        assert!(w.is_open_at(ms(2026, 10, 21, 9, 0)), "打开的那一刻起就算开着");
+        assert!(w.is_open_at(ms(2026, 10, 21, 17, 59)));
+        assert!(!w.is_open_at(ms(2026, 10, 21, 18, 0)), "边界归关闭那一侧");
+        assert!(!w.is_open_at(ms(2026, 10, 21, 8, 59)));
+        assert!(!w.is_open_at(ms(2026, 10, 24, 12, 0)), "周末整天都关");
+        // 网关可以在窗口中间启动：此刻是开着还是关着必须当场算得出来。
+        assert!(w.is_open_at(ms(2026, 10, 21, 14, 20)));
+    }
+
+    #[test]
+    fn window_next_trigger_picks_the_sooner_one() {
+        let w = window("0 9 * * 1-5", "0 18 * * 1-5", Zone::Utc);
+        assert_eq!(
+            show(w.next_trigger_at(ms(2026, 10, 21, 10, 0)).unwrap(), Zone::Utc),
+            "2026-10-21T18:00"
+        );
+        assert_eq!(
+            show(w.next_trigger_at(ms(2026, 10, 21, 19, 0)).unwrap(), Zone::Utc),
+            "2026-10-22T09:00"
+        );
+        // 周六上午：下一次改变要等到下周一 9 点（跨过整个周末）。
+        assert_eq!(
+            show(w.next_trigger_at(ms(2026, 10, 24, 10, 0)).unwrap(), Zone::Utc),
+            "2026-10-26T09:00"
+        );
+    }
+
+    #[test]
+    fn overnight_window_wraps_midnight() {
+        // 22:00 开、02:00 关。跨午夜必须还是"夜里开着"，而不是退化成"只有 22-24 点开"。
+        let w = window("0 22 * * *", "0 2 * * *", Zone::Utc);
+        assert!(w.is_open_at(ms(2026, 10, 21, 23, 0)));
+        assert!(w.is_open_at(ms(2026, 10, 22, 1, 0)));
+        assert!(!w.is_open_at(ms(2026, 10, 22, 2, 30)));
+        assert!(!w.is_open_at(ms(2026, 10, 22, 21, 0)));
+    }
+
+    #[test]
+    fn state_is_constant_between_triggers() {
+        // 这条取代了"每次到点都必须翻转"的想当然：`0 0 29 2 *` / `30 0 1 3 *` 这种
+        // "四年才开一天"的窗口，3 月 1 日年年到点而状态一次都不变。
+        // runner 因此必须**到点重算**，不能取反（见 next_trigger_at 的文档）。
+        // 这里检查的是真正成立的不变式：两次触发之间状态恒定，且整段里至少变过一次
+        // （否则一个恒返回 false 的 is_open_at 也能混过去）。
+        for (open, close) in [
+            ("0 9 * * 1-5", "30 18 * * 1-5"),
+            ("0 22 * * *", "0 2 * * *"),
+            ("0 0 1 * *", "59 23 15 * *"),
+            ("0 0 29 2 *", "30 0 1 3 *"),
+        ] {
+            let w = window(open, close, Zone::Utc);
+            let mut t = ms(2026, 1, 1, 0, 0);
+            let mut got = w.is_open_at(t);
+            let mut changes = 0;
+            for _ in 0..60 {
+                let n = w
+                    .next_trigger_at(t)
+                    .unwrap_or_else(|| panic!("{open} / {close} 找不到下次触发"));
+                // 触发点前一刻仍属于上一段 ⇒ 状态必须还是 got。
+                assert_eq!(
+                    w.is_open_at(n - 60_000),
+                    got,
+                    "{open} / {close} 在 {} 之前不该已经变过状态",
+                    show(n, Zone::Utc)
+                );
+                let derived = w.is_open_at(n);
+                if derived != got {
+                    changes += 1;
+                    got = derived;
+                }
+                t = n;
+            }
+            assert!(changes > 0, "{open} / {close} 走了 60 次触发都没变过状态，判据一定是死的");
+        }
+    }
+
+    #[test]
+    fn strictly_alternating_window_flips_at_every_trigger() {
+        // 工作日 9:00 开、18:00 关是运维真正会写的那种窗口：两个触发点严格交替，
+        // 每一次到点都必须改变状态。这一条只对它会成立，所以单独写、单独证。
+        let w = window("0 9 * * 1-5", "30 18 * * 1-5", Zone::Utc);
+        let mut t = ms(2026, 1, 5, 0, 0);
+        let mut got = w.is_open_at(t);
+        for i in 0..80 {
+            let n = w.next_trigger_at(t).unwrap();
+            let derived = w.is_open_at(n);
+            assert_ne!(derived, got, "第 {i} 次到点 {} 状态没变", show(n, Zone::Utc));
+            got = derived;
+            t = n;
+        }
+    }
+
+    #[test]
+    fn collision_check_is_decidable_not_sampled() {
+        let daily9 = parse_cron("0 9 * * *").unwrap();
+        assert!(collides(&daily9, &daily9), "同一条当然撞");
+        assert!(collides(&daily9, &parse_cron("0 9 15 * *").unwrap()), "每月 15 日 9 点必然撞上每天 9 点");
+        assert!(!collides(&daily9, &parse_cron("30 18 * * *").unwrap()), "小时错开就不撞，日子天天重叠也不算");
+        assert!(!collides(&parse_cron("0 12 * * 1").unwrap(), &parse_cron("0 12 * * 5").unwrap()), "周一与周五永不同一天");
+        assert!(!collides(&parse_cron("0 0 29 2 *").unwrap(), &parse_cron("0 0 1 8 *").unwrap()), "只在闰年 2/29 与只在 8/1");
+        // 阴险的一条：dom 与 dow 各自都不相交，但"某月 1 号正好是周五"时两边同时成立。
+        // 只看位图相交会判成不撞 —— 这就是必须按完整 400 年周期逐日推的原因。
+        assert!(collides(&parse_cron("0 12 1 * 1").unwrap(), &parse_cron("0 12 15 * 5").unwrap()));
     }
 }
