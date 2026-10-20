@@ -1,6 +1,10 @@
 # ONRouter vs OpenResty — Gap Analysis
 
-Updated: 2026-10-20 (v0.7.0, Windows host). This revision also folds in scheduled access windows
+Updated: 2026-10-21 (post-v0.7.0 main, Windows host). This revision also folds in the cache governor
+(`cache_governor off|observe|auto` plus `low/high/hold/tier/learn/lead`: a trailing-8s traffic phase
+machine with hysteresis and a hold dwell, light vs deep sleep, force-spill demotion into each dict
+zone's `disk=` tier plus `proxy_cache` LRU eviction, boost pre-warming from a bounded demotion ring,
+and an opt-in minute-of-day profile that may pre-switch to boost), scheduled access windows
 (`schedule_window` / `schedule_access`: Vixie-cron open/close pairs whose state is derived from the
 calendar on every minute-boundary wake, never toggled or persisted; window state survives hot reload
 because definitions swap in place and counters are never re-created), business traffic splitting
@@ -29,15 +33,17 @@ dynamic TLS certificate selection at handshake time, session resumption shared
 across listeners, in-process config/Lua hot reload, and calendar-driven access
 windows (`schedule_window`/`schedule_access`) — OpenResty reaches the same place
 only by writing cron-style Lua by hand, with no derivation guarantee and no
-first-class metrics. It also carries five
+first-class metrics. It also carries six
 additions nginx/OpenResty has no equivalent for: a disk cold tier behind
 `ngx.shared.DICT` (§1.2), the Still ONLine last-known-good replay layer (§1.3),
 an opt-in learning layer — TinyLFU cache admission, per-key adaptive queue
-depth and client reputation, all on one process-wide byte budget (§1.3) — and a
+depth and client reputation, all on one process-wide byte budget (§1.3) — a
 vendor-free front-proxy layer that puts recognition *after* realip's trust gate,
-adds an egress mode and emits RFC 9209 `Cache-Status` (§1.3) — and calendar-driven
-access windows whose state is derived from the cron definitions on every wake
-rather than toggled or remembered (§1.1).
+adds an egress mode and emits RFC 9209 `Cache-Status` (§1.3),
+calendar-driven access windows whose state is derived from the cron definitions
+on every wake rather than toggled or remembered (§1.1), and a cache governor
+whose sleep/boost phases act on the cache layers themselves — deep sleep
+reclaims memory through the cold tier, boost pre-warms it back (§1.3).
 
 The remaining gaps are concentrated in four areas:
 
@@ -275,6 +281,26 @@ The remaining gaps are concentrated in four areas:
   the queue and the cache side. Evidence: `tools/learning_cache_e2e.py` 34/34,
   `tools/queue_learning_e2e.py` 42/42, `tools/vip_learning_e2e.py` 51/51, unit tests in
   `learning.rs`, `limit.rs`, `proxy_cache.rs`, `vip.rs`, `router.rs`.
+- **Cache governor (ONRouter-only: traffic-phase sleep/boost)**: `cache_governor off|observe|auto;`
+  (**default off**) with `cache_governor_low/high/hold/tier/learn/lead`. A 32-slot per-second request
+  ring is sampled over the trailing **8 whole seconds**; `high` requires two consecutive 500 ms ticks,
+  boost exits below `0.8 × high`, sleep exits above `1.5 × low`, and `hold` gives every phase a
+  minimum dwell — so a jittery rps curve cannot flap the cache layer. `auto` light sleep stretches the
+  background sweep from 60 s to 600 s with no data movement; **deep** sleep additionally force-spills
+  dict entries past `spill_after` into the zone's `disk=` cold tier (bounded passes per tick) and
+  evicts `proxy_cache` LRU entries, which are reconstructible from the origin. Dict zones **without**
+  `disk=` are never touched (application state, not cache), and a deep tier with no `disk=` zone is a
+  `-t` warning. Demotions go into a 256-entry ring; boost pre-warms a bounded batch back through the
+  transparent cold path and restores the 60 s cadence. `learn on` folds one EWMA slot per natural
+  minute into a 1440-slot day profile (≈2.9 KiB, memory-only) and may pre-switch to boost `lead`
+  seconds ahead; a predicted boost holds `hold` and exits to `normal`, never straight to `sleep`.
+  While enabled the request path costs one relaxed load plus one `fetch_add`; **off** means no task,
+  no metric series and no allocation, and a hot reload can strip/restore the family in place
+  (off leaves the task idle). `-t` rejects `low >= high` and orphan `learn`, warns on observe+learn and
+  deep-without-`disk=`. Evidence: `tools/governor_e2e.py` 32/32 (real traffic: sleep on quiet, wake at
+  8 rps, 64 real dict entries demoted with the cold files and `free_space` proving the reclaim,
+  512-byte reads through the cold tier, 45 rps boost with ≥40 pre-warmed, profile coverage, hot
+  reload) and 15 governor/shared-dict unit tests.
 - **Front-proxy / CDN awareness (ONRouter-only, vendor-free)**: nginx only has `realip`, which trusts one
   header from one range list and knows nothing about *who* is in front. ONRouter declares each front as a
   profile of roles (`front_proxy <name> { probe/ip_header/country_header/proto_header/host_header/trust }`)
@@ -541,6 +567,15 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
     `$binary_remote_addr` rejected (that variable is never expanded on the request path,
     so accepting it would mean silently limiting by IP), and `set_real_ip_from` alongside
     `vip_learning` warned about (client-asserted address is the reputation trust root)
+  - `governor` 32/32 (the sleep/boost round on two live gateways, auto/deep vs the off control:
+    the off instance renders no governor series and logs no governor line, an idle start settles in
+    `sleep`, 8 rps wakes `normal` while quiet re-enters `sleep` after the hold, deep sleep demotes all
+    64 seeded dict entries with the cold root holding the forced spills (`spill_after=1000` rules out
+    ordinary eviction) and `free_space` jumping back while `num`/`size` still count the cold copies,
+    sampled 512-byte values read back through the cold tier, a 45 rps burst enters `boost`, pre-warms
+    ≥40 keys, counts boost ticks and feeds the profile, stopping the traffic exits to `normal`, and a
+    hot reload strips/restores the directive family with the dict data readable throughout; five `-t`
+    variants pin the reject/warn contract)
   - `front_proxy` 54/54 (the CDN-awareness round over six ports: egress rewriting `$remote_addr` proven
     through the access log's first column and a `geo` variable rather than through a header echo, forged
     vendor headers from an out-of-range peer proven to change nothing while still being *labelled*,
@@ -631,6 +666,13 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
    `Cache-Status` is emitted on the buffered path only (the streaming path would have to decide the tag
    before the first byte leaves); and per-provider *deployment* examples — where the ranges are fetched from
    the vendor's published list at install time — belong in configs, which is why none ship in the engine.
+9. **Cache-governor follow-ups**: boost restores the sweep cadence and pre-warms demoted keys, but it
+   does **not** raise `limit_req_queue` ceilings — the limiter's learned depth still comes only from
+   that queue's own history, so "boost" does not widen admission anywhere else. The minute-of-day
+   profile is memory-only by design (a restart rebuilds it), and prediction pre-switches to boost
+   only: a wrongly predicted quiet hour must never demote state on a guess. Deep sleep's
+   `proxy_cache` eviction is LRU, not frequency-aware; frequency is the admission sketch's job, and
+   sleep is about dropping reconstructible bodies.
 
 ## References
 

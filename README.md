@@ -175,6 +175,7 @@ all gateway logic is hand-written.
 | `allow` / `deny` | ACCESS-phase IP ACL: IPv4/IPv6/CIDR/`all`, ordered first-match-wins (default allow), location inherits server rules | `access.rs` |
 | `auth_basic` / `auth_basic_user_file` | HTTP Basic auth in ACCESS phase; htpasswd supports plaintext, `{SHA}` (SHA-1), `$1$`/`$apr1$` (MD5-crypt), realm tri-state incl. `off`. Fail closed: a realm with no user file denies, empty-hash entries are dropped, and the file cache invalidates on `(mtime, size)` **or** after 1 s of age, so a rewritten credential file takes effect even with preserved timestamps | `access.rs` |
 | `schedule_window <name> { tz/open/close }` + `schedule_access <name>;` — calendar-gated access (ONRouter-only) | a window is a pair of Vixie crons (`min hour dom mon dow`, with `*/n`, ranges, lists, month/weekday names, `@daily`-style aliases); **the state is derived from the calendar, never remembered** — `open ⟺ the last open firing is newer than the last close firing`, so a gateway that starts mid-window, a hot reload and a clock jump all land on the same answer with nothing persisted. A trigger does not imply a flip (`0 0 29 2 *` opened, then a `0 0 1 3 *` close firing every March 1 leaves the state as it was), so the runner re-evaluates at every real minute boundary instead of toggling: a late wake costs at most one minute of judgement and can never skip a whole window. Zones are `UTC` or a fixed `±HH:MM` only — an IANA name is refused at `-t` because no tz database is vendored, which also means DST-following is explicitly given up, not silently approximate. The gate runs in the ACCESS phase **after** `allow`/`deny` (the IP allowlist stays the operator's escape hatch during closed hours) and **before** `auth_basic`; a `location` wins over the `server`, and a window that is merely *unreferenced* is a `-t` warning, not a failure. Requests for a name this process has no instance of pass and count `onrouter_schedule_gate_miss_total` (the only way to reach it is a window added by reload, and blocking live traffic there is worse than letting it through) while a typo is a `-t` **error**, together with a missing `tz`/`close`, a duplicate name, an open/close pair that can fire in the same minute (that instant has no criterion for "open or closed"), a name that would break a Prometheus label, and more than 64 windows. With no window declared the runner task is never spawned and the request path pays one `Option` check. `onrouter_schedule_open/_next_fire_ms/_changes_total/_denied_total` plus a `-t` line per window (computed wall-clock open/close in the window's own zone) exist so an operator can check the gateway's arithmetic against their own calendar | `schedule.rs`, `router.rs`, `server.rs`, `main.rs`, `metrics.rs`, `tools/schedule_e2e.py` |
+| `cache_governor off\|observe\|auto;` + `cache_governor_low/high/hold/tier/learn/lead` — traffic-phase sleep/boost (ONRouter-only) | one process-wide phase machine (`sleep` / `normal` / `boost`) fed by a 32-slot per-second request ring; the trailing **8 whole seconds** are the estimate, so the partial second under measurement never enters it. Entry and exit are separated by hysteresis (`high` needs two consecutive 500 ms ticks; boost exits below `0.8 × high`; sleep exits above `1.5 × low`) plus a `hold` dwell that makes flapping impossible in a jittery rps curve. `auto` light sleep only stretches the background sweep from 60 s to 600 s (cheap, reversible, no data movement); **deep** sleep additionally demotes: shared-dict entries whose zone declares `disk=` are force-spilled past `spill_after` (bounded passes per tick, so a long sleep stays responsive) and `proxy_cache` zones evict least-recently-used entries (reconstructible from the origin). A shared-dict zone **without** `disk=` is never touched — it is Lua application state, and sleep must not mean data loss; a deep tier with no `disk=` zone at all is a `-t` warning. Demotions are recorded in a bounded ring, and boost pulls a bounded batch back through the transparent cold path while restoring the 60 s cadence. `learn on` keeps one EWMA slot per minute of day (1440 × u16 ≈ 2.9 KiB, **memory-only**, folded at most once per natural minute) and may pre-switch to boost `lead` seconds before a learned busy slot; a predicted boost holds `hold` and exits to `normal`, never straight to `sleep`. **Default off** (directive absent): no task, no allocation, no metric series; the request path pays one relaxed `AtomicBool` load while enabled and one `fetch_add` per request. Hot reload swaps the whole family in place (off leaves the task idle; on starts it). `-t` rejects `low >= high` and `learn` without a live mode, and warns on observe+learn and deep-without-`disk=` | `governor.rs`, `shared_dict.rs`, `proxy_cache.rs`, `main.rs`, `server.rs`, `metrics.rs`, `tools/governor_e2e.py` |
 | nginx syntax compatibility | `location =/\^~/~/~*`, server_name wildcards, error_page, try_files, index, autoindex, alias, client_max_body_size, return URL shorthand | |
 
 ## Directory layout
@@ -944,20 +945,35 @@ them as standalone runnable assertion scripts.
   an undeclared window, a missing `tz`, an open/close pair that fires in the same minute, a duplicate name,
   a bare `schedule_access;`), and "declared but referenced by nobody" is asserted to stay a *warning* with
   exit 0, so an old config's `-t` result cannot get worse.
-- The whole suite (440 unit tests + 79 Python E2E scripts: every `tools/*_e2e.py`
-  (71) plus the 8 root scenario/compat/security/static/upstream suites) is re-run after
+- `tools/governor_e2e.py`: 32/32 passing — the phase machine proved on two live gateways (auto/deep
+  on 18560, the off control on 18561) with real traffic on a real clock, never a faked one. Default
+  off leaves the control instance with **not one** `onrouter_governor_*` series and no governor line
+  in its logs, while the auto instance starts the run in `sleep` on an idle start. The test's own
+  traffic is the only input: 8 rps wakes the cache layer to `normal` (`> low × 1.5`) and quiet
+  settles it back to `sleep`; deep sleep then demotes all 64 seeded 512-byte dict entries
+  (`demoted_total ≥ 64`), the cold root holds the forced spills with `spill_after=1000` (ordinary
+  eviction cannot have written a byte), `free_space` jumps back by >20 KB while `num()`/`size()`
+  still report 64 cold copies, and sampled reads return the full 512-byte values through the cold
+  tier. A paced 45 rps burst crosses `high` on the trailing-8s estimate, enters `boost` inside the
+  burst, pre-warms ≥40 keys back, moves `boost_ticks_total` and feeds the minute profile
+  (`profile_coverage > 0`); stopping the traffic decays the estimate and exits to `normal` with no
+  restart. Five `-t` variants pin the contract (inverted thresholds and orphan `learn` exit
+  non-zero; deep-without-`disk=` and observe+learn warn at exit 0; the off config prints no governor
+  line), and a hot reload strips the whole directive family — every series disappears while dict
+  data stays readable — then restores it, with the parsed line re-logged.
+- The whole suite (460 unit tests + 80 Python E2E scripts: every `tools/*_e2e.py`
+  (72) plus the 8 root scenario/compat/security/static/upstream suites) is re-run after
   these changes: every E2E script passes with real traffic
-  (`python run_regression.py reg_070_20261020.txt` → `TOTAL 79 scripts, nonzero=0`,
-  2026-10-20 — the run against the final 0.7.0 binary, with `schedule_e2e` 50/50 and
-  `least_time` 43/43 alongside the carries from 0.6.0: `proxy_split` 76/76, the business
-  model 32/32, the shipped example config 24/24, `front_proxy` 54/54, `rce_matrix` 32/32,
-  `security_matrix` 36/36 and the three learning suites) and
-  `cargo test --workspace` → 440/440
-  (`python run_regression.py reg_fpopt_20261020.txt` → `TOTAL 79 scripts, nonzero=0`,
-  2026-10-20 — re-run over the post-de-allocation build after the #77 round: the
-  optimized binary passes the whole suite including the binary-swapping
-  `tls_legacy` and the margin-sensitive `least_time`).
-  (427 in `onrouter-server` + 13 in `onrouter-config`).
+  (`python run_regression.py reg_gov_final_20261021.txt` → `TOTAL 80 scripts, nonzero=0`,
+  2026-10-21 — the run over the governor build, with `governor_e2e` 32/32, `schedule_e2e`
+  50/50, `least_time` 43/43, `realworld` 26/26 and the binary-swapping `tls_legacy`
+  passing *including* its native-tls rebuild/restore, alongside `proxy_split` 76/76,
+  the business model 32/32, the shipped example config 24/24, `front_proxy` 54/54,
+  `rce_matrix` 32/32, `security_matrix` 36/36 and the three learning suites
+  34/34, 42/42 and 51/51) and `cargo test --workspace` → 460/460
+  (447 in `onrouter-server` + 13 in `onrouter-config`; the previous 0.7.0 roll is
+  `reg_070_20261020.txt` → `TOTAL 79 scripts, nonzero=0`, and `reg_fpopt_20261020.txt`
+  re-ran the same 79 over the post-de-allocation build).
   The packaged artefact is checked separately by `tools/release_verify.py` (26/26 for 0.7.0 —
   24 prior checks plus two new ones: the extracted binary must `-t` the shipped
   `conf/schedule.conf` to exit 0 *and* print the per-window `describe` lines, proving the
