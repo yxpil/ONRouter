@@ -16,6 +16,10 @@
 //! 成 UTC 或按季节改偏移，而不是假装我们能算对。
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
+use onrouter_config::Config;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// 一次触发的最小间隔下限。比这更短的"定时"其实是热路径的事，不该由调度任务去轮。
@@ -490,6 +494,411 @@ pub fn fmt_wall(ms: i64, zone: Zone) -> String {
     }
 }
 
+// ==================== 窗口表：配置态 + 运行态 ====================
+
+/// 一张表里最多多少个窗口。上限是给定的：这张表会在每个分钟边界被走一遍，
+/// 而"有界"是这套代码库对每一个常驻结构的硬要求。
+pub const MAX_WINDOWS: usize = 64;
+/// 窗口名会原样进 Prometheus 标签，所以字符集必须先收紧再谈别的。
+const MAX_NAME_LEN: usize = 64;
+/// "没有下一次触发"的哨兵值（窗口已从配置移除时使用）。
+const NO_NEXT: i64 = i64::MAX;
+
+/// 一个窗口的可替换定义：两条 cron + 时区口径 + 原文（原文是给运维核对用的）。
+#[derive(Debug, Clone)]
+struct Def {
+    tz_spec: String,
+    open_expr: String,
+    close_expr: String,
+    win: Window,
+}
+
+/// 运行态：请求路径只碰 `open` 与 `misses`，其余字段都在锁里、只在到点与重载时动。
+pub struct Slot {
+    pub name: String,
+    /// `None` = 这份配置里已经没有这个窗口了（热重载移除）。状态就此冻结，不再翻转。
+    def: Mutex<Option<Def>>,
+    open: AtomicBool,
+    next: AtomicI64,
+    changes: AtomicU64,
+}
+
+impl Slot {
+    /// 定义在锁里，摘要一次性读全 —— 包括时区枚举本身，不要拿 `tz_spec` 去二次解析。
+    fn view(&self) -> Option<(String, String, String, Zone)> {
+        let g = self.def.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|d| {
+            (
+                d.open_expr.clone(),
+                d.close_expr.clone(),
+                d.tz_spec.clone(),
+                d.win.zone,
+            )
+        })
+    }
+}
+
+/// 一次**真实的**状态变化。注意不是"到点了"：到点不一定变（见 [`Window::next_trigger_at`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub name: String,
+    pub open: bool,
+    pub at_ms: i64,
+}
+
+/// `/metrics` 与启动摘要读的一行快照。
+pub struct Stat {
+    pub name: String,
+    pub enabled: bool,
+    pub open: bool,
+    pub next_ms: i64,
+    pub changes: u64,
+}
+
+pub struct Scheduler {
+    slots: Vec<Arc<Slot>>,
+    by_name: HashMap<String, Arc<Slot>>,
+    /// 有 location 引用了本进程没有的窗口 ⇒ 那条路暂时是**放行**的。必须可见。
+    misses: AtomicU64,
+}
+
+impl Scheduler {
+    pub fn parse_all(config: &Config) -> Result<Self, String> {
+        Self::parse_all_at(config, now_ms())
+    }
+
+    /// 同一个构造，但把"现在"交给调用方。生产传 `now_ms()`，单测传假时间 ——
+    /// 沿用 `vip.rs` 的口径：窗口状态是日历的纯函数，没有它就没法在毫秒里断言边界。
+    pub fn parse_all_at(config: &Config, now: i64) -> Result<Self, String> {
+        let defs = Self::parse_defs(config)?;
+        let mut slots = Vec::with_capacity(defs.len());
+        let mut by_name = HashMap::new();
+        for (name, def) in defs {
+            let open = def.win.is_open_at(now);
+            let next = def.win.next_trigger_at(now).unwrap_or(NO_NEXT);
+            let slot = Arc::new(Slot {
+                name: name.clone(),
+                def: Mutex::new(Some(def)),
+                open: AtomicBool::new(open),
+                next: AtomicI64::new(next),
+                changes: AtomicU64::new(0),
+            });
+            by_name.insert(name, Arc::clone(&slot));
+            slots.push(slot);
+        }
+        // 按名字排序：指标渲染与 -t 摘要必须逐次可比对，不能跟着 HashMap 抖。
+        slots.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Scheduler {
+            slots,
+            by_name,
+            misses: AtomicU64::new(0),
+        })
+    }
+
+    /// 解析顶层 `schedule_window <名字> { tz/open/close }`。返回 (名字, 定义) 的有序表。
+    fn parse_defs(config: &Config) -> Result<Vec<(String, Def)>, String> {
+        let mut out: Vec<(String, Def)> = Vec::new();
+        for d in config
+            .root
+            .block
+            .iter()
+            .filter(|x| x.name == "schedule_window")
+        {
+            let name = match d.arg(0) {
+                Some(n) if is_valid_name(n) => n.to_string(),
+                Some(n) => {
+                    return Err(format!(
+                        "第 {} 行 schedule_window 的名字 {n:?} 无效：只允许字母、数字、-、_、.，\
+                         长度 1..{MAX_NAME_LEN}（名字会原样进指标标签，必须不能带引号、空格或换行）",
+                        d.line
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "第 {} 行 schedule_window 缺少名字（schedule_window <名字> {{ … }}）",
+                        d.line
+                    ))
+                }
+            };
+            if out.iter().any(|(n, _)| *n == name) {
+                return Err(format!(
+                    "第 {} 行 schedule_window '{name}' 重复声明：同名窗口会让指标分不出是哪一个",
+                    d.line
+                ));
+            }
+            let mut tz_spec: Option<String> = None;
+            let mut open_expr: Option<String> = None;
+            let mut close_expr: Option<String> = None;
+            for c in &d.block {
+                // cron 里全是空格，正常必须写成引号串；写成裸的也能拼回一条表达式，
+                // 不该因为少打两个引号就变成"这条配置读不懂"。
+                let text = c.args.join(" ");
+                match c.name.as_str() {
+                    "tz" => tz_spec = Some(text),
+                    "open" => open_expr = Some(text),
+                    "close" => close_expr = Some(text),
+                    other => {
+                        return Err(format!(
+                            "第 {} 行 schedule_window '{name}' 里 {other} 不是子指令（只有 tz / open / close）",
+                            c.line
+                        ))
+                    }
+                }
+            }
+            // 时区必须显式写。默认 UTC 会让"每天 9 点开门"在中国站点安静地变成"下午 5 点"，
+            // 这正是这套代码库认定必须硬失败的那类"配置读起来像生效"。
+            let tz_spec = tz_spec.ok_or_else(|| format!(
+                "第 {} 行 schedule_window '{name}' 缺少 tz：必须写明 UTC 还是固定偏移（如 +08:00），\
+                 不给默认值是为了让\"按哪个钟开\"这件事出现在配置里",
+                d.line
+            ))?;
+            let zone = Zone::parse(&tz_spec)?;
+            let open_expr = open_expr.ok_or_else(|| format!(
+                "第 {} 行 schedule_window '{name}' 缺少 open（open \"0 9 * * 1-5\";）",
+                d.line
+            ))?;
+            let close_expr = close_expr.ok_or_else(|| format!(
+                "第 {} 行 schedule_window '{name}' 缺少 close：只写 open 的话\"现在算开着还是关着\"\
+                 没有可判定的答案（要长期开着就别用窗口挡这条路由）",
+                d.line
+            ))?;
+            let open = parse_cron(&open_expr)
+                .map_err(|e| format!("第 {} 行 schedule_window '{name}' 的 open：{e}", d.line))?;
+            let close = parse_cron(&close_expr)
+                .map_err(|e| format!("第 {} 行 schedule_window '{name}' 的 close：{e}", d.line))?;
+            // 两条都得在搜索上界内真的会成立，否则窗口永远不会动 —— 这是配置错误，不是运维事实。
+            let probe = now_ms();
+            if next_after(&open, zone, probe).is_none() || next_after(&close, zone, probe).is_none() {
+                return Err(format!(
+                    "第 {} 行 schedule_window '{name}' 的 open/close 里有在 {} 年内永不成立的表达式\
+                     （如 0 0 31 2 *），这种窗口看起来存在、实际永远不会动",
+                    d.line, SEARCH_CAP_YEARS
+                ));
+            }
+            if collides(&open, &close) {
+                return Err(format!(
+                    "第 {} 行 schedule_window '{name}' 的 open 与 close 会在同一分钟同时要求改变状态，\
+                     那一刻没有任何判据能说\"现在算开着还是关着\"（open={open_expr:?} close={close_expr:?}）",
+                    d.line
+                ));
+            }
+            out.push((
+                name,
+                Def {
+                    tz_spec,
+                    open_expr,
+                    close_expr,
+                    win: Window { zone, open, close },
+                },
+            ));
+        }
+        if out.len() > MAX_WINDOWS {
+            return Err(format!(
+                "schedule_window 声明了 {} 个，超过上限 {MAX_WINDOWS}：这张表每个分钟边界都要走一遍",
+                out.len()
+            ));
+        }
+        Ok(out)
+    }
+
+    /// 配置里声明过的窗口名（`-t` 用它否决 `schedule_access` 的拼写错误）。
+    /// 只做名字扫描：解析错误由 [`Scheduler::parse_all`] 在更早的地方硬失败。
+    pub fn declared_names(config: &Config) -> Vec<String> {
+        config
+            .root
+            .block
+            .iter()
+            .filter(|d| d.name == "schedule_window")
+            .filter_map(|d| d.arg(0).map(|s| s.to_string()))
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// 这条路由现在能不能过。**未知名字 = 放行**，并把这次计入 `misses`：
+    /// 名字写错在 `-t` 就被否决了，走到这里只会是"热重载新加的窗口"，
+    /// 而那种情况下把流量挡死比放行更糟（见 [`Scheduler::apply`] 的告警）。
+    #[inline]
+    pub fn is_open(&self, name: &str) -> bool {
+        match self.by_name.get(name) {
+            Some(s) => s.open.load(Ordering::Relaxed),
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+        }
+    }
+
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    /// 到点重算：返回**真的**变了状态的窗口。runner 每分钟喂一次真实时间。
+    ///
+    /// 每次重算都会刷新 `next`，否则 `next_fire_ms` 这项自证指标会一直停在启动那一刻的值 ——
+    /// 而它存在的意义正是让运维核对"网关算出的下次触发"和"自己表上的时间"是不是同一个钟。
+    pub fn advance(&self, now: i64) -> Vec<Change> {
+        let mut out = Vec::new();
+        for s in &self.slots {
+            let (want, next) = {
+                let g = s.def.lock().unwrap_or_else(|e| e.into_inner());
+                match g.as_ref() {
+                    Some(d) => (
+                        d.win.is_open_at(now),
+                        d.win.next_trigger_at(now).unwrap_or(NO_NEXT),
+                    ),
+                    None => continue,
+                }
+            };
+            s.next.store(next, Ordering::Relaxed);
+            if want != s.open.load(Ordering::Relaxed) {
+                s.open.store(want, Ordering::Relaxed);
+                s.changes.fetch_add(1, Ordering::Relaxed);
+                out.push(Change { name: s.name.clone(), open: want, at_ms: now });
+            }
+        }
+        out
+    }
+
+    /// 在排期窗口里最早的下一次触发。移除的窗口不算。
+    /// runner 用它决定"最远睡多久"，指标用它做自证（运维能核对网关算出的时刻与自己
+    /// 系统时钟是否同一个钟 —— 日历类配置最容易出的事故就是主机时钟漂移）。
+    pub fn earliest(&self) -> Option<i64> {
+        self.slots
+            .iter()
+            .map(|s| s.next.load(Ordering::Relaxed))
+            .filter(|n| *n != NO_NEXT)
+            .min()
+    }
+
+    /// 有窗口被移除后为 `NO_NEXT`；全部移除时 `earliest` 返回 None，runner 仍在分钟边界上
+    /// 空转，直到下一次热重载把定义换回来。
+    pub fn next_of(&self, name: &str) -> Option<i64> {
+        self.by_name
+            .get(name)
+            .map(|s| s.next.load(Ordering::Relaxed))
+            .filter(|n| *n != NO_NEXT)
+    }
+
+    pub fn snapshot(&self) -> Vec<Stat> {
+        self.slots
+            .iter()
+            .map(|s| Stat {
+                name: s.name.clone(),
+                enabled: s.def.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+                open: s.open.load(Ordering::Relaxed),
+                next_ms: s.next.load(Ordering::Relaxed),
+                changes: s.changes.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
+    /// 启动与热重载共用的摘要行。运维要能在日志里看到"这条窗口按我的配置算出来是几点、
+    /// 此刻是什么状态"，否则"定时没生效"和"定时本来就是关着的"这两种情况长得一模一样。
+    pub fn describe(&self, now: i64) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.slots.len());
+        for s in &self.slots {
+            let next = s.next.load(Ordering::Relaxed);
+            let open_txt = if s.open.load(Ordering::Relaxed) { "开放" } else { "关闭" };
+            let Some((open_expr, close_expr, tz, zone)) = s.view() else {
+                out.push(format!(
+                    "schedule window '{}' 已从配置移除，状态冻结在{open_txt}",
+                    s.name
+                ));
+                continue;
+            };
+            let next_txt = if next == NO_NEXT {
+                "无（窗口已移除）".to_string()
+            } else {
+                fmt_wall(next, zone)
+            };
+            out.push(format!(
+                "schedule window '{}' tz={tz} open={open_expr:?} close={close_expr:?} \
+                 此刻={open_txt} 下次触发={next_txt}（现在 {}）",
+                s.name,
+                fmt_wall(now, zone),
+            ));
+        }
+        out
+    }
+
+    /// 热重载：窗口名在进程内不换（与 limit_req 的区同理 —— 请求路径上的引用要能对上），
+    /// 所以这里只原地换定义并重算状态。返回的是**给日志看的说明**，不是错误：
+    /// 新增窗口本进程没有实例、被移除窗口状态冻结，都不该让重载失败。
+    pub fn apply(&self, config: &Config, now: i64) -> Vec<String> {
+        let mut notes = Vec::new();
+        let defs = match Self::parse_defs(config) {
+            Ok(d) => d,
+            // `-t` 已经走通一次才可能到这里；真出现就说明两份读法分叉了，如实说。
+            Err(e) => return vec![format!("schedule: 新配置里的窗口定义读不通，保留原窗口：{e}")],
+        };
+        for s in &self.slots {
+            match defs.iter().find(|(n, _)| n == &s.name) {
+                Some((_, d)) => {
+                    let before = s.open.load(Ordering::Relaxed);
+                    let want = d.win.is_open_at(now);
+                    {
+                        let mut g = s.def.lock().unwrap_or_else(|e| e.into_inner());
+                        *g = Some(d.clone());
+                    }
+                    s.next.store(d.win.next_trigger_at(now).unwrap_or(NO_NEXT), Ordering::Relaxed);
+                    if want != before {
+                        s.open.store(want, Ordering::Relaxed);
+                        s.changes.fetch_add(1, Ordering::Relaxed);
+                        notes.push(format!(
+                            "schedule: 窗口 '{}' 按新配置重算，状态 {}→{}",
+                            s.name,
+                            if before { "开放" } else { "关闭" },
+                            if want { "开放" } else { "关闭" }
+                        ));
+                    }
+                }
+                None => {
+                    let mut g = s.def.lock().unwrap_or_else(|e| e.into_inner());
+                    let was = g.take().is_some();
+                    s.next.store(NO_NEXT, Ordering::Relaxed);
+                    if was {
+                        notes.push(format!(
+                            "schedule: 窗口 '{}' 已从新配置移除，停止翻转，状态冻结在{}（引用它的路由\
+                             在新一轮路由里已经不存在，这里只是让指标不再出现它）",
+                            s.name,
+                            if s.open.load(Ordering::Relaxed) { "开放" } else { "关闭" }
+                        ));
+                    }
+                }
+            }
+        }
+        for (n, _) in defs.iter().filter(|(n, _)| !self.by_name.contains_key(n)) {
+            notes.push(format!(
+                "schedule: 新配置里的窗口 '{n}' 本进程没有实例（窗口在启动时建立，新增要重启才生效）；\
+                 在那之前引用它的路由一律放行 —— 已计入 onrouter_schedule_gate_miss_total"
+            ));
+        }
+        notes
+    }
+}
+
+fn is_valid_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= MAX_NAME_LEN
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// 绝对时钟（Unix 毫秒）。窗口状态是日历的纯函数，所以这里不需要进程原点，
+/// 也就不依赖 #103 那条"限流用的进程相对时钟"。
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,5 +1252,214 @@ mod tests {
         // 阴险的一条：dom 与 dow 各自都不相交，但"某月 1 号正好是周五"时两边同时成立。
         // 只看位图相交会判成不撞 —— 这就是必须按完整 400 年周期逐日推的原因。
         assert!(collides(&parse_cron("0 12 1 * 1").unwrap(), &parse_cron("0 12 15 * 5").unwrap()));
+    }
+
+    // ==================== 窗口表 ====================
+
+    fn table(text: &str, now: i64) -> Scheduler {
+        let cfg = Config::parse(text).unwrap();
+        Scheduler::parse_all_at(&cfg, now).unwrap_or_else(|e| panic!("合法配置却被拒：{e}"))
+    }
+
+    fn reject(text: &str) -> String {
+        let cfg = Config::parse(text).unwrap();
+        match Scheduler::parse_all_at(&cfg, ms(2026, 10, 21, 0, 0)) {
+            Ok(_) => panic!("这份配置本该被拒：{text}"),
+            Err(e) => e,
+        }
+    }
+
+    /// 工作日 9:00–18:00（+08:00）。2026-10-21 是周三。
+    const OFFICE: &str = "schedule_window office { tz +08:00; open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; }";
+
+    #[test]
+    fn table_rejects_every_declared_but_inert_shape() {
+        // 每条都必须是**硬失败**而不是"看起来生效、实际永远不动"。
+        // 断言里带上窗口名：运维拿到报错要能直接定位是哪一条。
+        let no_tz = "schedule_window office { open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; }";
+        let e = reject(no_tz);
+        assert!(e.contains("缺少 tz") && e.contains("office"), "{e}");
+
+        let no_close = "schedule_window office { tz UTC; open \"0 9 * * 1-5\"; }";
+        let e = reject(no_close);
+        assert!(e.contains("缺少 close") && e.contains("office"), "{e}");
+
+        let dup = format!("{OFFICE}\n{OFFICE}");
+        let e = reject(&dup);
+        assert!(e.contains("重复声明"), "{e}");
+
+        // 名字带空格：只有把它写成引号串才可能到这里，正是指标标签最不能吃的字符。
+        let e = reject("schedule_window \"office hours\" { tz UTC; open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; }");
+        assert!(e.contains("无效"), "{e}");
+        assert!(!is_valid_name("office hours") && !is_valid_name("office/x") && !is_valid_name(""));
+        assert!(is_valid_name("office.hours-1_2"));
+
+        let e = reject("schedule_window office { tz UTC; open \"0 0 31 2 *\"; close \"0 18 * * 1-5\"; }");
+        assert!(e.contains("永不成立"), "{e}");
+
+        // open 与 close 同一分钟：那一刻"算开着还是关着"没有判据，必须拒绝而不是靠顺序猜。
+        let e = reject("schedule_window office { tz UTC; open \"0 9 * * *\"; close \"0 9 * * *\"; }");
+        assert!(e.contains("同时要求改变状态"), "{e}");
+
+        let e = reject("schedule_window office { tz UTC; open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; keep on; }");
+        assert!(e.contains("不是子指令"), "{e}");
+
+        let e = reject("schedule_window { tz UTC; open \"0 9 * * *\"; close \"0 18 * * *\"; }");
+        assert!(e.contains("缺少名字"), "{e}");
+    }
+
+    #[test]
+    fn table_over_capacity_is_refused_not_truncated() {
+        let lines: Vec<String> = (0..=MAX_WINDOWS)
+            .map(|i| {
+                format!(
+                    "schedule_window w{i} {{ tz UTC; open \"0 {} * * *\"; close \"30 {} * * *\"; }}",
+                    i % 24,
+                    i % 24
+                )
+            })
+            .collect();
+        let over = lines.join("\n");
+        let e = reject(&over);
+        assert!(e.contains(&format!("超过上限 {MAX_WINDOWS}")), "{e}");
+        // 刚好在上限内必须能建表，否则这条断言等于永远为真。
+        let fits = lines[..MAX_WINDOWS].join("\n");
+        assert_eq!(table(&fits, ms(2026, 10, 21, 0, 0)).len(), MAX_WINDOWS);
+    }
+
+    #[test]
+    fn table_state_and_next_are_derived_from_the_calendar() {
+        // 周三 02:00 UTC = +08:00 的 10:00 ⇒ 开放；周六同一时刻 ⇒ 关闭。
+        // 构造时不给初值，全由日历算出：重启后 gate 状态不需要任何持久化就是对的。
+        let wed = table(OFFICE, ms(2026, 10, 21, 2, 0));
+        assert!(wed.is_open("office"));
+        assert_eq!(wed.len(), 1);
+        assert!(!wed.is_empty());
+        // 下次触发 = 当天 +08 的 18:00 = 10:00 UTC。
+        assert_eq!(wed.next_of("office"), Some(ms(2026, 10, 21, 10, 0)));
+
+        let sat = table(OFFICE, ms(2026, 10, 24, 2, 0));
+        assert!(!sat.is_open("office"));
+        // 周六的下次触发要跳到周一：+08:00 的 09:00 开门 = UTC 01:00。
+        assert_eq!(sat.next_of("office"), Some(ms(2026, 10, 26, 1, 0)));
+    }
+
+    #[test]
+    fn unknown_window_name_passes_and_is_counted() {
+        // 放行 + 计数，而不是挡死：见 is_open 的文档。
+        let t = table(OFFICE, ms(2026, 10, 21, 2, 0));
+        assert!(t.is_open("nope"));
+        assert_eq!(t.misses(), 1);
+        assert!(t.is_open("nope"));
+        assert_eq!(t.misses(), 2);
+        assert_eq!(t.next_of("nope"), None);
+    }
+
+    #[test]
+    fn advance_reports_only_real_changes_and_keeps_next_fresh() {
+        let t = table(OFFICE, ms(2026, 10, 21, 2, 0));
+        let before = t.next_of("office").unwrap();
+        // 还没到点：不产出变化，next 也不该倒退。
+        assert!(t.advance(ms(2026, 10, 21, 9, 59)).is_empty());
+        assert_eq!(t.next_of("office"), Some(before));
+        // 到点：开放→关闭，且 next 推到第二天。
+        let ch = t.advance(ms(2026, 10, 21, 10, 0));
+        assert_eq!(ch.len(), 1);
+        assert_eq!(ch[0], Change { name: "office".into(), open: false, at_ms: ms(2026, 10, 21, 10, 0) });
+        assert!(!t.is_open("office"));
+        assert!(t.next_of("office").unwrap() > before);
+        // 快照里的计数只统计真实翻转。
+        let st = &t.snapshot()[0];
+        assert_eq!(st.changes, 1);
+        assert!(!st.open && st.enabled);
+    }
+
+    #[test]
+    fn wake_without_a_flip_still_moves_next_forward() {
+        // 这条是 runner 走法的核心：到点 ≠ 变状态。四年才开一天的窗口，
+        // 每年 3/1 00:30 都要醒一次、算一次、什么都不变，但 next 必须继续往前推。
+        let cfg = "schedule_window leap { tz UTC; open \"0 0 29 2 *\"; close \"30 0 1 3 *\"; }";
+        let t = table(cfg, ms(2026, 1, 1, 0, 0));
+        assert!(!t.is_open("leap"));
+        let mar1 = ms(2026, 3, 1, 0, 30);
+        assert!(t.advance(mar1).is_empty(), "2026 年 3/1 到点不该变状态");
+        // close 年年成立，所以醒完之后 next 推的是**下一年的 3/1**，不是闰日 ——
+        // 如果这里算成 2028-02-29，说明 next 只看了 open 一侧。
+        assert_eq!(t.next_of("leap"), Some(ms(2027, 3, 1, 0, 30)));
+        // 真到了闰日 00:00：开。
+        assert_eq!(t.advance(ms(2028, 2, 29, 0, 0)).len(), 1);
+        assert!(t.is_open("leap"));
+        // 同一天内的 3/1 触发点不翻转吗？2028-03-01 00:30 关。
+        assert_eq!(t.advance(ms(2028, 3, 1, 0, 30)).len(), 1);
+        assert!(!t.is_open("leap"));
+    }
+
+    #[test]
+    fn describe_reads_the_windows_own_clock() {
+        // 运维核对的就是这一行：如果它把 +08:00 的 09:00 打印成 01:00，
+        // "定时没生效"与"主机时钟差 8 小时"看起来一模一样。
+        let t = table(OFFICE, ms(2026, 10, 21, 0, 30));
+        let line = t.describe(ms(2026, 10, 21, 0, 30)).remove(0);
+        assert!(line.contains("open=\"0 9 * * 1-5\""), "{line}");
+        assert!(line.contains("下次触发=2026-10-21 09:00"), "{line}");
+        assert!(line.contains("现在 2026-10-21 08:30"), "{line}");
+        assert!(line.contains("此刻=关闭"), "{line}");
+    }
+
+    #[test]
+    fn apply_swaps_defs_freezes_removals_and_announces_new_names() {
+        let two = format!("{OFFICE}\nschedule_window night {{ tz UTC; open \"0 22 * * *\"; close \"0 2 * * *\"; }}");
+        // 周六 02:00 UTC 建表：office（+08 的工作日窗口）关着，night 正好在 02:00 关上。
+        let t = table(&two, ms(2026, 10, 24, 2, 0));
+        assert_eq!(t.len(), 2);
+        assert!(!t.is_open("office") && !t.is_open("night"));
+        // 快照按名字排序，指标渲染才可比对。
+        let names: Vec<String> = t.snapshot().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["night", "office"]);
+
+        // 新配置：office 改成全天开（此刻立刻算作开放）、night 移除、多出一个从未实例化的 new。
+        let next_cfg = "schedule_window office { tz UTC; open \"0 0 * * *\"; close \"59 23 * * *\"; }\n\
+                        schedule_window new { tz UTC; open \"0 0 1 1 *\"; close \"0 0 2 1 *\"; }";
+        let notes = t.apply(&Config::parse(next_cfg).unwrap(), ms(2026, 10, 24, 12, 0));
+        assert!(t.is_open("office"), "新定义下重算必须立刻生效");
+        assert!(
+            notes.iter().any(|n| n.contains("office") && n.contains("关闭→开放")),
+            "{notes:?}"
+        );
+        assert!(notes.iter().any(|n| n.contains("night") && n.contains("已从新配置移除")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("'new'") && n.contains("一律放行")), "{notes:?}");
+        // 移除的窗口：状态冻结、不再排期、但名字还在表里（指标要说清它曾经存在）。
+        assert_eq!(t.next_of("night"), None);
+        let snap = t.snapshot();
+        let frozen = snap.iter().find(|s| s.name == "night").unwrap();
+        assert!(!frozen.enabled && !frozen.open);
+        // 22:00 UTC 是 night 原本会开门的时刻：冻结之后它一次都不该翻。
+        assert!(t.advance(ms(2026, 10, 25, 22, 0)).is_empty(), "冻结的窗口还在翻转");
+        assert!(!t.snapshot().into_iter().find(|s| s.name == "night").unwrap().open);
+        // 新名字没有实例 ⇒ 放行 + 计入 misses。
+        assert!(t.is_open("new"));
+        assert_eq!(t.misses(), 1);
+        // 空表不建 runner。
+        assert!(table("", ms(2026, 10, 21, 0, 0)).is_empty());
+    }
+
+    #[test]
+    fn declared_names_is_a_name_only_scan_for_the_test_flag() {
+        // -t 要用它否决 schedule_access 的拼写错误；这里只取名字，不做日历判定。
+        let cfg = Config::parse(&format!("{OFFICE}\nschedule_window night {{ tz UTC; open \"0 22 * * *\"; close \"0 2 * * *\"; }}")).unwrap();
+        let mut names = Scheduler::declared_names(&cfg);
+        names.sort();
+        assert_eq!(names, ["night", "office"]);
+        assert!(Scheduler::declared_names(&Config::parse("worker_processes 2;").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn interval_still_usable_for_non_calendar_triggers() {
+        // 后面几步（定时重载、定时限流档位）走间隔而不是 cron；这里把下限钉住，
+        // 免得有人为了"更准时"把它降到毫秒级、让调度任务变成热路径轮询。
+        assert_eq!(parse_interval("60s").unwrap(), 60_000);
+        assert_eq!(parse_interval("1m").unwrap(), 60_000);
+        assert!(parse_interval("999ms").is_err());
+        assert_eq!(MIN_INTERVAL, Duration::from_secs(1));
     }
 }
