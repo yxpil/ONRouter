@@ -38,6 +38,10 @@ mod proxy_tls;
 mod realip;
 mod resp_rewrite;
 mod router;
+// 阶段 1 只有日历内核，消费者（定时动作）在下一步接入；先允许它暂时没有调用点，
+// 好让"到点算得对不对"这件事单独证完，而不是和动作一起塞进同一个改动。
+#[allow(dead_code)]
+mod schedule;
 mod server;
 mod settings;
 mod shared_dict;
