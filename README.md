@@ -1003,7 +1003,15 @@ them as standalone runnable assertion scripts.
   emits the per-request `log_debug!` — cost −0.4% … −9.2% at c=1 and −1.6% … −3.9% at c=32 before that
   diagnostic was gated, and −0.4% … −4.8% / −1.6% … −4.2% after the log macros started checking
   `log::enabled(level)` before building their `format!` string. The rest of the egress cost is the
-  per-request `String`/`Vec` clones on the rewrite path, not the log line.
+  per-request `String`/`Vec` clones on the rewrite path, not the log line. A follow-up round
+  (2026-10-20) removed most of those: `percent_decode` returns `Cow<str>` (no `%` ⇒ borrowed, zero
+  alloc), `ip_from_value` walks the comma chain without materialising a `Vec` (forward pass keeps the
+  last address, reverse pass the leftmost non-trusted), `scheme_from_value` returns `&'static str`, and
+  `nets_for` borrows either trust list when the other is empty. The rps bench cannot separate this
+  round from jitter (medians overlap pass-to-pass spread at c=32), so the causal proof is
+  allocation-count tests instead: a counting thread-local global allocator in the `front_proxy.rs`
+  test module asserts 0 heap allocations for a plain XFF chain, for the recursive walk with trusted
+  nets, and for every scheme shape, and exactly 1 for a percent-encoded value (the decoded string).
 - `bench_least_time.py` costs *and* earns back the adaptive-selection branch with the same harness
   shape: one binary, one vhost, four `proxy_pass` locations pointing at four pools that differ only by
   the `least_time` tier (`conf/bench_least_time.conf`: single-node pool, default `off`, `observe`,

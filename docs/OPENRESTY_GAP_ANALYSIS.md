@@ -293,7 +293,8 @@ The remaining gaps are concentrated in four areas:
   + 1 `router` unit tests. Vendor knowledge stays data, not code: `grep -a -i -o` over the 0.6.0 release binary
   finds 0 occurrences of `Cloudflare`/`Fastly`/`CloudFront`/`Akamai` and 0 of their header names (`CF-Ray`,
   `True-Client-IP`, `CloudFront-Viewer-Address`, …), while the control words `front_proxy`/`auto_trust`
-  occur 49/10 times — the only baked-in header names are nginx's own (`x-real-ip` as the `real_ip_header`
+  occur 49/10 times (re-measured against the 0.7.0 package by `tools/release_verify.py`) — the only
+  baked-in header names are nginx's own (`x-real-ip` as the `real_ip_header`
   default, `x-forwarded-for` in the header interning table and in `$proxy_add_x_forwarded_for`).
   `conf/front_proxy_examples.conf` ships the copy-paste profiles for Cloudflare, CloudFront and a plain-XFF
   self-built edge, each naming where to refresh that provider's ranges (ranges are a rolling announcement),
@@ -304,7 +305,12 @@ The remaining gaps are concentrated in four areas:
   because the loopback peer is outside the ranges; the probe is AND-ed, so `CF-Connecting-IP` alone is not
   recognised while `CF-Ray` alone is; CloudFront's `ip:port` shape labels `cloudfront-edge` and a profile with
   0 ranges can never self-authorise; XFF alone labels the self-built profile; a request claimed by two
-  profiles goes to the first declared; per-profile counters do not cross accounts).
+  profiles goes to the first declared; per-profile counters do not cross accounts). The egress rewrite path
+  was then de-allocated (2026-10-20): `percent_decode` returns `Cow<str>`, the address chain is walked
+  without a temporary `Vec`, the scheme answer is a `&'static str`, and one-sided trust lists are borrowed —
+  the rps bench cannot separate the round from jitter, so the proof is allocation-count tests (a counting
+  thread-local global allocator asserts 0 allocations on the plain-chain and scheme paths, exactly 1 on the
+  percent-encoded path).
 - **REWRITE-phase conditionals**: `set $var <value…>` (request-scoped, interpolated, last write wins,
   may shadow a built-in) and `if ($v)` / `if (!$v)` / `=`, `!=`, `~`, `~*`, `!~`, `!~*` wrapping
   `rewrite`/`set`/`return`, executed in config order alongside `rewrite`. Unsupported forms (nested
