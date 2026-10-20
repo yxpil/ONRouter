@@ -133,8 +133,11 @@ The remaining gaps are concentrated in four areas:
 
 ### 1.3 HTTP / TLS / upstream
 
-- HTTP/1.1 (keepalive, upgrades/WebSocket tunnel), HTTP/2 (ALPN + h2c
-  prior-knowledge), HTTP/3 (QUIC + Alt-Svc).
+- HTTP/1.0 and HTTP/1.1 (keepalive, upgrades/WebSocket tunnel on plaintext and TLS),
+  HTTP/2 (ALPN + h2c prior-knowledge), HTTP/3 (QUIC + Alt-Svc). WebSocket over
+  HTTP/2 (RFC 8441) / HTTP/3 (RFC 9220) and h2/h3 *upstreams* are not implemented
+  (nginx does not implement them either); ws/wss as HTTP/1.1 upgrades are covered
+  end-to-end by `tools/protocol_matrix_e2e.py` 37/37.
 - Multi-certificate SNI vhosts on shared listen ports; exact > wildcard > default;
   Host routing independent of SNI.
 - TLS 1.2/1.3 via rustls; legacy TLS 1.0/1.1 via the optional `native-tls`
@@ -576,6 +579,15 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
     ≥40 keys, counts boost ticks and feeds the profile, stopping the traffic exits to `normal`, and a
     hot reload strips/restores the directive family with the dict data readable throughout; five `-t`
     variants pin the reject/warn contract)
+  - `protocol_matrix` 37/37 (one process, all client-facing protocols, and the gateway's own access
+    log read back so a 200 cannot hide a silent down-conversion: HTTP/1.0 on plaintext and TLS with
+    an `HTTP/1.0` status line, no chunked encoding, default close, `Connection: keep-alive` for two
+    requests on one socket and a POST body; HTTP/1.1 keep-alive on both transports; HTTP/2 via Node
+    core http2 as h2c (8 streams) and TLS ALPN while HTTP/1.0 still works on the h2c port; HTTP/3
+    via `orr-h3check` (single, ≥15 KB body, 5 streams) with TCP HTTP/1.1 + `Alt-Svc` on the same
+    port; ws and wss handshakes with computed `Sec-WebSocket-Accept`, text/binary/ping/close frames
+    and a 70 000-byte frame through a real Node WebSocket backend; `HTTP/1.0`, `HTTP/1.1`,
+    `HTTP/2.0`, `HTTP/3.0` and two 101 upgrades then appear in the access log)
   - `front_proxy` 54/54 (the CDN-awareness round over six ports: egress rewriting `$remote_addr` proven
     through the access log's first column and a `geo` variable rather than through a header echo, forged
     vendor headers from an out-of-range peer proven to change nothing while still being *labelled*,

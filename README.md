@@ -961,16 +961,36 @@ them as standalone runnable assertion scripts.
   non-zero; deep-without-`disk=` and observe+learn warn at exit 0; the off config prints no governor
   line), and a hot reload strips the whole directive family — every series disappears while dict
   data stays readable — then restores it, with the parsed line re-logged.
-- The whole suite (460 unit tests + 80 Python E2E scripts: every `tools/*_e2e.py`
-  (72) plus the 8 root scenario/compat/security/static/upstream suites) is re-run after
+- `tools/protocol_matrix_e2e.py`: 37/37 passing — one gateway process serving every client-facing
+  protocol at once, with both the client's and the gateway's own view asserted (the access log is
+  read back, so a 200 cannot come from a protocol the gateway silently down-converted). HTTP/1.0 on
+  plaintext and TLS returns an `HTTP/1.0` status line with no chunked encoding, closes by default,
+  honors `Connection: keep-alive` for a second request on the same socket, and carries a POST body;
+  HTTP/1.1 does two keep-alive requests on one connection on both transports. HTTP/2 is a real
+  Node-core-`http2` h2c prior-knowledge session (8 streams) and an ALPN-h2 TLS session, while
+  HTTP/1.0 still works on the h2c port. HTTP/3 runs over QUIC via `orr-h3check` (single request,
+  ≥15 KB body, 5 streams) and the same port keeps serving HTTP/1.1 with `Alt-Svc: h3=":port"`. ws
+  and wss both complete the RFC6455 handshake, check the computed `Sec-WebSocket-Accept`, and
+  round-trip text frames, a ping answered as pong, and a close handshake through a real Node
+  WebSocket backend (ws also sends a 500 B binary frame, wss a 70 000 B one — the latter exercises
+  the 64-bit length).
+  The access log then shows `HTTP/1.0`, `HTTP/1.1`, `HTTP/2.0`, `HTTP/3.0` and two `101` upgrades.
+  Boundary, asserted by construction rather than by omission: WebSocket upgrades stay HTTP/1.1
+  (RFC 8441/9220 over h2/h3 are not implemented, matching nginx), and h2/h3 to upstreams remain
+  open as noted below.
+- The whole suite (460 unit tests + 81 Python E2E scripts: every `tools/*_e2e.py`
+  (73) plus the 8 root scenario/compat/security/static/upstream suites) is re-run after
   these changes: every E2E script passes with real traffic
-  (`python run_regression.py reg_gov_final_20261021.txt` → `TOTAL 80 scripts, nonzero=0`,
-  2026-10-21 — the run over the governor build, with `governor_e2e` 32/32, `schedule_e2e`
-  50/50, `least_time` 43/43, `realworld` 26/26 and the binary-swapping `tls_legacy`
-  passing *including* its native-tls rebuild/restore, alongside `proxy_split` 76/76,
-  the business model 32/32, the shipped example config 24/24, `front_proxy` 54/54,
-  `rce_matrix` 32/32, `security_matrix` 36/36 and the three learning suites
-  34/34, 42/42 and 51/51) and `cargo test --workspace` → 460/460
+  (`python run_regression.py reg_proto_20261021.txt` → `TOTAL 81 scripts, nonzero=0`,
+  2026-10-21 — the run over the protocol-matrix build, adding `protocol_matrix_e2e` 37/37
+  (HTTP/1.0, HTTP/1.1, h2c/TLS h2, HTTP/3 and ws/wss on one process) to `governor_e2e`
+  32/32, `schedule_e2e` 50/50, `least_time` 43/43, `realworld` 26/26 and the
+  binary-swapping `tls_legacy` passing *including* its native-tls rebuild/restore,
+  alongside `proxy_split` 76/76, the business model 32/32, the shipped example config
+  24/24, `front_proxy` 54/54, `rce_matrix` 32/32, `security_matrix` 36/36 and the
+  three learning suites 34/34, 42/42 and 51/51; the previous roll is
+  `reg_gov_final_20261021.txt` → `TOTAL 80 scripts, nonzero=0`) and
+  `cargo test --workspace` → 460/460
   (447 in `onrouter-server` + 13 in `onrouter-config`; the previous 0.7.0 roll is
   `reg_070_20261020.txt` → `TOTAL 79 scripts, nonzero=0`, and `reg_fpopt_20261020.txt`
   re-ran the same 79 over the post-de-allocation build).
@@ -1553,6 +1573,18 @@ Already done (previously listed as gaps, now implemented):
   body; a ~15 KB response arrives complete across h3 `DATA` frames; 5 concurrent streams on one QUIC
   connection all reach `200`; and HTTP/1.1 over TLS still works on the same port with an `alt-svc: h3=`
   header present.)
+- **Protocol matrix (HTTP/1.0, HTTP/1.1, HTTP/2, HTTP/3, ws, wss)**: all six client-facing protocols are
+  served by the same process and the same request core. HTTP/1.0 requests are answered with an
+  `HTTP/1.0` status line, are never chunked, close by default and keep the connection alive when the
+  client asks with `Connection: keep-alive` (bodies and request bodies work); HTTP/1.1 runs keep-alive
+  on plaintext and TLS; HTTP/2 is served as h2c (prior knowledge) and as ALPN h2 over TLS; HTTP/3 is
+  served over QUIC with TCP `Alt-Svc` advertisement on the same port; ws and wss are the HTTP/1.1
+  Upgrade tunnel on a plaintext and a TLS listener respectively (the tunnel's backend may itself be
+  `http://` or `https://`/`wss://`, see below). `tools/protocol_matrix_e2e.py` proves all of this in
+  one run (37/37) and asserts the gateway's own access-log protocol field, not just the client's
+  parse. Explicit boundaries: WebSocket over HTTP/2 (RFC 8441) and over HTTP/3 (RFC 9220) are not
+  implemented — nginx does not implement them either — and `proxy_pass` to h2/h3 *upstreams* remains
+  open; WebSocket `Upgrade` therefore stays an HTTP/1.1 feature by design.
 - **TLS protocol selection (`ssl_protocols`)**: `ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;` sets an
   explicit *enabled version set*, nginx-style, and `ssl_min_version` is accepted as an alias for the
   "everything from this floor up" form. Several servers sharing one `listen` address merge their sets by
