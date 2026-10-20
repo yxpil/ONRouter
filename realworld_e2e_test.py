@@ -211,6 +211,10 @@ def main():
         check("S3 鉴权 401/403/200", (st1, st2, st3) == (401, 403, 200) and b"admin" in b3, f"{st1}/{st2}/{st3}")
 
         # ================= S4 登录限流 =================
+        # The Lua limiter keys on floor(ngx.time()/10): start the seven requests at a
+        # fresh window boundary, otherwise a burst that straddles one legitimately gets
+        # all 200 and the assertion reads "no limiter" when it only saw two windows.
+        time.sleep(10 - (time.time() % 10) + 0.05)
         codes = []
         for i in range(7):
             st, _, _b = req(f"/login?user=u{i}")
