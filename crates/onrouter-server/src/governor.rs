@@ -25,7 +25,7 @@
 //!     `disk=` cold tier that means spill-to-disk + reclaim memory (the value stays
 //!     readable through the transparent cold path). For `proxy_cache` zones (pure
 //!     in-memory, reconstructible from the origin) it means a bounded eviction of the
-//!     coldest TinyLFU-weak entries. **A shared-dict zone without a disk tier is never
+//!     least-recently-used entries. **A shared-dict zone without a disk tier is never
 //!     touched** — it holds Lua application state, and "sleep" must not mean data loss.
 //!   * **boost**: the background loop returns to full cadence and recently demoted keys
 //!     are pre-warmed back (bounded ring of demotion records, single-flight, cold tier
@@ -523,12 +523,15 @@ impl Governor {
     }
 
     /// Background cadence for the main.rs maintenance loop. Normal/boost: the stock
-    /// 60s. Light/deep sleep: ×10 — the sweep is a directory walk, and walking it
-    /// ten times per quiet hour buys nothing.
+    /// 60s. Light/deep sleep in `auto`: ×10 — the sweep is a directory walk, and
+    /// walking it ten times per quiet hour buys nothing. `observe` never stretches
+    /// it, even when a reload left the phase at `sleep`: observe promises that the
+    /// sweep loop behaves exactly as it would with the governor absent.
     pub fn sweep_interval(&self) -> Duration {
-        match self.phase() {
-            Phase::Sleep => Duration::from_secs(600),
-            _ => Duration::from_secs(60),
+        if self.phase() == Phase::Sleep && self.acting() {
+            Duration::from_secs(600)
+        } else {
+            Duration::from_secs(60)
         }
     }
 
@@ -873,6 +876,27 @@ mod tests {
         assert!(matches!(r, Some((Phase::Normal, Phase::Sleep, Cause::Load, Action::EnterSleep))));
         assert_eq!(g.phase(), Phase::Sleep);
         assert_eq!(g.sweep_interval(), Duration::from_secs(600), "sleep stretches the sweep");
+    }
+
+    #[test]
+    fn observe_never_keeps_a_stretched_sweep_after_reload() {
+        let g = Governor::new(conf(GovernorMode::Auto));
+        let t0 = 8_000;
+        stamp(&g, t0, 1);
+        let mut t = t0;
+        for _ in 0..9 {
+            g.advance(t);
+            t += 500;
+        }
+        assert_eq!(g.phase(), Phase::Sleep);
+        assert_eq!(g.sweep_interval(), Duration::from_secs(600));
+
+        // Hot reload auto -> observe while the phase is still sleep: the reported
+        // phase may stay, but the background loop must go back to the stock cadence.
+        g.apply(conf(GovernorMode::Observe));
+        assert!(g.enabled() && !g.acting());
+        assert_eq!(g.sweep_interval(), Duration::from_secs(60), "observe touches nothing");
+        assert!(!g.should_skip_sweep(), "observe must not skip the sweep either");
     }
 
     #[test]
