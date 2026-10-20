@@ -174,6 +174,7 @@ all gateway logic is hand-written.
 | `stub_status` / Prometheus scraping | process-global runtime metrics (accepted/active/capacity + requests + 2xx/3xx/4xx/5xx) plus per-upstream node connections/health/success/failure, cache-status counters, TLS handshake failures, limit_req/limit_conn rejections and dropped access-log lines, rendered as Prometheus text via `content_by_rust metrics` | `metrics.rs` |
 | `allow` / `deny` | ACCESS-phase IP ACL: IPv4/IPv6/CIDR/`all`, ordered first-match-wins (default allow), location inherits server rules | `access.rs` |
 | `auth_basic` / `auth_basic_user_file` | HTTP Basic auth in ACCESS phase; htpasswd supports plaintext, `{SHA}` (SHA-1), `$1$`/`$apr1$` (MD5-crypt), realm tri-state incl. `off`. Fail closed: a realm with no user file denies, empty-hash entries are dropped, and the file cache invalidates on `(mtime, size)` **or** after 1 s of age, so a rewritten credential file takes effect even with preserved timestamps | `access.rs` |
+| `schedule_window <name> { tz/open/close }` + `schedule_access <name>;` — calendar-gated access (ONRouter-only) | a window is a pair of Vixie crons (`min hour dom mon dow`, with `*/n`, ranges, lists, month/weekday names, `@daily`-style aliases); **the state is derived from the calendar, never remembered** — `open ⟺ the last open firing is newer than the last close firing`, so a gateway that starts mid-window, a hot reload and a clock jump all land on the same answer with nothing persisted. A trigger does not imply a flip (`0 0 29 2 *` opened, then a `0 0 1 3 *` close firing every March 1 leaves the state as it was), so the runner re-evaluates at every real minute boundary instead of toggling: a late wake costs at most one minute of judgement and can never skip a whole window. Zones are `UTC` or a fixed `±HH:MM` only — an IANA name is refused at `-t` because no tz database is vendored, which also means DST-following is explicitly given up, not silently approximate. The gate runs in the ACCESS phase **after** `allow`/`deny` (the IP allowlist stays the operator's escape hatch during closed hours) and **before** `auth_basic`; a `location` wins over the `server`, and a window that is merely *unreferenced* is a `-t` warning, not a failure. Requests for a name this process has no instance of pass and count `onrouter_schedule_gate_miss_total` (the only way to reach it is a window added by reload, and blocking live traffic there is worse than letting it through) while a typo is a `-t` **error**, together with a missing `tz`/`close`, a duplicate name, an open/close pair that can fire in the same minute (that instant has no criterion for "open or closed"), a name that would break a Prometheus label, and more than 64 windows. With no window declared the runner task is never spawned and the request path pays one `Option` check. `onrouter_schedule_open/_next_fire_ms/_changes_total/_denied_total` plus a `-t` line per window (computed wall-clock open/close in the window's own zone) exist so an operator can check the gateway's arithmetic against their own calendar | `schedule.rs`, `router.rs`, `server.rs`, `main.rs`, `metrics.rs`, `tools/schedule_e2e.py` |
 | nginx syntax compatibility | `location =/\^~/~/~*`, server_name wildcards, error_page, try_files, index, autoindex, alias, client_max_body_size, return URL shorthand | |
 
 ## Directory layout
@@ -924,6 +925,25 @@ them as standalone runnable assertion scripts.
   implementation shared by both, and the branch is read back out of the origin's own response body
   (`who=<node>` + `branch=<pool>`), so "which release answered" is the backend's word plus the
   gateway's header plus the metric increment, required to agree.
+- `tools/schedule_e2e.py`: 50/50 passing — timed access windows proved across **two genuine minute
+  boundaries** with real traffic, not a faked clock: the script rewrites `conf/schedule.conf`'s `office`
+  window into "open at floor(now)+2 min, close +3 min after that", starts the gateway, and waits. Closed
+  phase: `/office/` is `403` while the origin's total request count does not move by one — and the very
+  next assertions (`/free/` → `200` with delta +1, `/any/` → `200` with delta +1) are what make that zero
+  mean "the gate answered locally" instead of "the counter is broken". Flip: `/office/` turns `200` and the
+  whole wait produced **exactly one** origin hit, `onrouter_schedule_open` went 0→1 with
+  `changes_total=1`, and `next_fire_ms` equals the epoch-ms the script computed, to the digit — before the
+  flip the open instant, after it the close instant, after the close tomorrow's open. `+08:00` is verified
+  as arithmetic rather than as a log line: an unreferenced window's `next_fire_ms` must be the UTC instant
+  of its 12:00 wall clock. Then a hot reload moves the close two minutes later while the window is open:
+  `next_fire_ms` follows, `changes_total` stays 1 (reaching a trigger that flips nothing is not a change),
+  and requests keep passing *past the old close* — which is only possible if the state really is re-derived
+  from the calendar. Precedence is asserted on a second listener whose gate sits on the `server`: an
+  ungated location inherits it and flips with it, while a location that names the permanently-closed window
+  stays `403` throughout. Five configs are asserted to fail `-t` with a locate-able reason (a reference to
+  an undeclared window, a missing `tz`, an open/close pair that fires in the same minute, a duplicate name,
+  a bare `schedule_access;`), and "declared but referenced by nobody" is asserted to stay a *warning* with
+  exit 0, so an old config's `-t` result cannot get worse.
 - The whole suite (409 unit tests + 78 Python E2E scripts: every `tools/*_e2e.py`
   (70) plus the 8 root scenario/compat/security/static/upstream suites) is re-run after
   these changes: every E2E script passes with real traffic
