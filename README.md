@@ -953,6 +953,10 @@ them as standalone runnable assertion scripts.
   model 32/32, the shipped example config 24/24, `front_proxy` 54/54, `rce_matrix` 32/32,
   `security_matrix` 36/36 and the three learning suites) and
   `cargo test --workspace` → 440/440
+  (`python run_regression.py reg_fpopt_20261020.txt` → `TOTAL 79 scripts, nonzero=0`,
+  2026-10-20 — re-run over the post-de-allocation build after the #77 round: the
+  optimized binary passes the whole suite including the binary-swapping
+  `tls_legacy` and the margin-sensitive `least_time`).
   (427 in `onrouter-server` + 13 in `onrouter-config`).
   The packaged artefact is checked separately by `tools/release_verify.py` (26/26 for 0.7.0 —
   24 prior checks plus two new ones: the extracted binary must `-t` the shipped
