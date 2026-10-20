@@ -192,9 +192,10 @@ def fetch(path):
         c.close()
 
 
-def _bench_conn(port, path, per, timeout, sink, errs):
+def _bench_conn(port, path, per, timeout, sink, errs, headers=None):
     """一条长连接跑 per 个请求，把每次往返耗时追加进 sink。"""
     local = []
+    headers = headers or {}
     try:
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     except OSError:
@@ -203,7 +204,7 @@ def _bench_conn(port, path, per, timeout, sink, errs):
     for _ in range(per):
         t0 = time.perf_counter()
         try:
-            c.request("GET", path)
+            c.request("GET", path, headers=headers)
             r = c.getresponse()
             r.read()
             local.append(time.perf_counter() - t0)
@@ -229,9 +230,10 @@ def _bench_conn(port, path, per, timeout, sink, errs):
 def _bench_proc(job):
     """一个压测进程：起 threads 条连接。返回 (完成数, 错误数, 自身耗时s, p50, p90, p99)。
     分进程是为了绕开单进程 GIL —— 32 线程共用一个解释器时，瓶颈是 Python 而不是网关。"""
-    port, path, per, threads, timeout = job
+    port, path, per, threads, timeout, headers = job
     sink, errs = [], []
-    ts = [threading.Thread(target=_bench_conn, args=(port, path, per, timeout, sink, errs))
+    ts = [threading.Thread(target=_bench_conn,
+                           args=(port, path, per, timeout, sink, errs, headers))
           for _ in range(threads)]
     t0 = time.perf_counter()
     for t in ts:
@@ -255,7 +257,7 @@ def _pool():
     return _POOL
 
 
-def bench(path, n, conns, timeout=20, port=None):
+def bench(path, n, conns, timeout=20, port=None, headers=None):
     """固定请求数、固定并发长连接，压测端按进程切分。
     返回 (req/s, p50, p90, p99, 错误数)；rps 用父进程墙钟，分位数是各进程分位数的
     按完成数加权平均（跨进程合并完整样本太贵，同数量级下不影响结论）。"""
@@ -263,7 +265,7 @@ def bench(path, n, conns, timeout=20, port=None):
     per = max(1, n // conns)
     procs = max(1, min(conns, _MP_PROCS))
     base, extra = divmod(conns, procs)
-    jobs = [(port, path, per, base + (1 if i < extra else 0), timeout)
+    jobs = [(port, path, per, base + (1 if i < extra else 0), timeout, headers)
             for i in range(procs) if base + (1 if i < extra else 0) > 0]
     t0 = time.perf_counter()
     if procs == 1:
