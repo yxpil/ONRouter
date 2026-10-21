@@ -117,7 +117,13 @@ mod tests {
         let key = "127.0.0.1:9".to_string();
         purge(&key);
         let (client, _server) = localhost_pair().await;
-        put(key.clone(), client, vec![1, 2, 3], Duration::from_secs(60), 0);
+        put(
+            key.clone(),
+            client,
+            vec![1, 2, 3],
+            Duration::from_secs(60),
+            0,
+        );
         assert_eq!(idle_count(&key), 1);
         let (s, buf) = take(&key).expect("应复用刚放入的连接");
         assert_eq!(buf, vec![1, 2, 3]);

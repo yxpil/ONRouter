@@ -307,9 +307,13 @@ enum Job {
         epoch: u64,
         bytes: Vec<u8>,
     },
-    Remove { path: PathBuf },
+    Remove {
+        path: PathBuf,
+    },
     /// 腾出 `need` 字节的额度：由写线程逐出最冷的条目（请求线程绝不做 O(n) 逐出）
-    Trim { need: u64 },
+    Trim {
+        need: u64,
+    },
     /// 屏障：此前入队的所有任务都处理完才应答（FIFO 保证）
     Barrier(std::sync::mpsc::Sender<bool>),
 }
@@ -346,10 +350,7 @@ impl std::fmt::Debug for DiskStore {
         f.debug_struct("DiskStore")
             .field("root", &self.inner.cfg.root)
             .field("max_bytes", &self.inner.cfg.max_bytes)
-            .field(
-                "entries",
-                &self.inner.stats.entries.load(Ordering::Relaxed),
-            )
+            .field("entries", &self.inner.stats.entries.load(Ordering::Relaxed))
             .field("bytes", &self.inner.stats.bytes.load(Ordering::Relaxed))
             .finish()
     }
@@ -385,7 +386,11 @@ impl DiskStore {
         });
         let store = DiskStore { inner };
         let recovered = store.scan_rebuild()?;
-        store.inner.stats.warm_recovered.store(recovered as u64, Ordering::Relaxed);
+        store
+            .inner
+            .stats
+            .warm_recovered
+            .store(recovered as u64, Ordering::Relaxed);
         if recovered > 0 {
             log_info!(
                 "磁盘冷层 {:?}：扫描重建恢复 {recovered} 条 / {} 字节",
@@ -563,8 +568,13 @@ impl DiskStore {
         let seq = self.inner.next_seq();
         let removed = {
             let mut idx = self.lock_mut();
-            idx.tomb
-                .insert(key.to_string(), Tombstone { seq, at: Instant::now() });
+            idx.tomb.insert(
+                key.to_string(),
+                Tombstone {
+                    seq,
+                    at: Instant::now(),
+                },
+            );
             if idx.tomb.len() > TOMBSTONE_CAP {
                 let half = TOMBSTONE_TTL / 2;
                 idx.tomb.retain(|_, t| t.at.elapsed() < half);
@@ -660,7 +670,9 @@ impl DiskStore {
             out
         };
         let n = paths.len();
-        self.inner.stats.add(&self.inner.stats.expired_removed, n as u64);
+        self.inner
+            .stats
+            .add(&self.inner.stats.expired_removed, n as u64);
         for p in paths {
             self.send_remove(p);
         }
@@ -700,7 +712,13 @@ impl DiskStore {
 
     /// 等写线程把排队中的落盘做完（优雅停机、热重载替换、单测里的"已可见"同步点）。
     pub fn flush_pending(&self) {
-        let Some(tx) = self.inner.tx.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        let Some(tx) = self
+            .inner
+            .tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
             return;
         };
         let (done, wait) = std::sync::mpsc::channel();
@@ -768,9 +786,14 @@ impl DiskStore {
             // 账目自愈：以索引为准重算，任何异常路径留下的偏差在这里归零
             let sum: u64 = idx.slots.values().map(|s| s.bytes).sum();
             self.inner.stats.bytes.store(sum, Ordering::Relaxed);
-            self.inner.stats.entries.store(idx.slots.len() as u64, Ordering::Relaxed);
+            self.inner
+                .stats
+                .entries
+                .store(idx.slots.len() as u64, Ordering::Relaxed);
         }
-        self.inner.stats.add(&self.inner.stats.expired_removed, expired_n);
+        self.inner
+            .stats
+            .add(&self.inner.stats.expired_removed, expired_n);
         self.inner.stats.add(&self.inner.stats.evicted, idle_n);
         for p in removed_files {
             self.send_remove(p);
@@ -1026,9 +1049,14 @@ impl DiskStore {
                 );
             }
             self.inner.stats.bytes.store(bytes, Ordering::Relaxed);
-            self.inner.stats.entries.store(idx.slots.len() as u64, Ordering::Relaxed);
+            self.inner
+                .stats
+                .entries
+                .store(idx.slots.len() as u64, Ordering::Relaxed);
         }
-        self.inner.stats.add(&self.inner.stats.corrupt, dropped as u64);
+        self.inner
+            .stats
+            .add(&self.inner.stats.corrupt, dropped as u64);
         if dropped > 0 {
             log_warn!("磁盘冷层：扫描 {root:?} 丢弃 {dropped} 个无效/超额条目文件");
         }
@@ -1165,7 +1193,11 @@ fn decode_header(head: &[u8; HEADER_LEN]) -> Result<HeaderParts, ReadError> {
         val_len,
         expires,
         // freq 只参与分层排序，不参与正确性判定：脏值收敛到 0
-        freq: if freq.is_finite() && freq >= 0.0 { freq.min(1e6) } else { 0.0 },
+        freq: if freq.is_finite() && freq >= 0.0 {
+            freq.min(1e6)
+        } else {
+            0.0
+        },
         crc,
     })
 }
@@ -1204,7 +1236,11 @@ fn crc32(key: &[u8], value: &[u8]) -> u32 {
         for (i, v) in t.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *v = c;
         }
@@ -1273,10 +1309,7 @@ fn open_exclusive(p: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// 取走当前分数最低（最冷）的一条。后台路径专用：O(n) 扫描，只在写线程/清扫里跑。
-fn pop_coldest(
-    index: &Mutex<Index>,
-    scorer: &Arc<dyn Scorer>,
-) -> Option<(PathBuf, u64, bool)> {
+fn pop_coldest(index: &Mutex<Index>, scorer: &Arc<dyn Scorer>) -> Option<(PathBuf, u64, bool)> {
     let mut idx = index.lock().unwrap_or_else(|e| e.into_inner());
     let now = now_epoch();
     let pick = idx
@@ -1387,9 +1420,7 @@ fn apply_write(
         return;
     }
     let mut idx = index.lock().unwrap_or_else(|e| e.into_inner());
-    if idx.tomb.get(&key).is_some_and(|t| t.seq >= seq)
-        || epoch.load(Ordering::Relaxed) != gen
-    {
+    if idx.tomb.get(&key).is_some_and(|t| t.seq >= seq) || epoch.load(Ordering::Relaxed) != gen {
         // 写文件的窗口里该 key 被删了、或整区被 flush 了：删掉刚写的文件，不登记索引
         drop(idx);
         let _ = std::fs::remove_file(&path);
@@ -1449,10 +1480,7 @@ pub fn register_zones(zones: Vec<(String, DiskStore)>) {
 
 /// 全部启用磁盘层的区的 (名字, 句柄) 快照。
 pub fn snapshot() -> Vec<(String, DiskStore)> {
-    registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    registry().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// 后台维护入口：清扫每个区，返回本轮回收条数。
@@ -1521,16 +1549,17 @@ mod tests {
     fn tmpdir(name: &str) -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!(
-            "onrouter-disk-{}-{n}-{name}",
-            std::process::id()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("onrouter-disk-{}-{n}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
     }
 
     fn cfg(dir: PathBuf) -> DiskConfig {
-        DiskConfig { root: dir, ..Default::default() }
+        DiskConfig {
+            root: dir,
+            ..Default::default()
+        }
     }
 
     fn open(dir: PathBuf) -> DiskStore {
@@ -1565,7 +1594,11 @@ mod tests {
             b"IMPORTANT-NOT-CACHE-DATA",
             "别人文件的内容一格都不许被我们改写"
         );
-        assert_eq!(std::fs::read(&target).unwrap(), b"a-cache-entry", "条目照常原子落地");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"a-cache-entry",
+            "条目照常原子落地"
+        );
         assert!(!tmp.exists(), "用完的临时名不该留下");
     }
 
@@ -1666,7 +1699,10 @@ mod tests {
         s.forget("user:42");
         s.flush_pending();
         assert!(!s.has("user:42"));
-        assert!(walk_bins(&dir).is_empty(), "forget 必须真删文件，不能只删索引");
+        assert!(
+            walk_bins(&dir).is_empty(),
+            "forget 必须真删文件，不能只删索引"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1819,7 +1855,10 @@ mod tests {
         spill_sync(&s, "new", &"b".repeat(40), 9.0);
         assert_eq!(s.entries(), 2);
         // 第三条装不下：落盘路径只做判定，直接拒（不在这里逐出），但会派一个后台腾额度任务
-        assert!(!s.spill("third", "c".repeat(40).as_bytes(), None, 9.0), "满仓时不该在请求路径腾地方");
+        assert!(
+            !s.spill("third", "c".repeat(40).as_bytes(), None, 9.0),
+            "满仓时不该在请求路径腾地方"
+        );
         assert_eq!(s.stats().spill_skipped.load(Ordering::Relaxed) > 0, true);
         s.flush_pending();
         assert!(!s.has("old"), "后台 Trim 应已逐出分数最低的条目");
@@ -1860,14 +1899,23 @@ mod tests {
         // flush_all 落到冷层：索引被摘空，但 "a" 从没进过索引，墓碑无从登记
         assert_eq!(s.purge(), 0);
         s.flush_pending();
-        assert!(!s.has("a"), "flush_all 之后迟到的落盘不许把数据复活成冷条目");
+        assert!(
+            !s.has("a"),
+            "flush_all 之后迟到的落盘不许把数据复活成冷条目"
+        );
         assert_eq!(s.read("a", false).map(|v| v.value), None);
-        assert!(walk_bins(&dir).is_empty(), "被 flush 掉的那一代不许留下文件");
+        assert!(
+            walk_bins(&dir).is_empty(),
+            "被 flush 掉的那一代不许留下文件"
+        );
         assert_eq!(s.entries(), 0, "扫目录重建也读不到它（重启即消失）");
         // 新一代照常落盘
         spill_sync(&s, "b", b"B-VALUE", 5.0);
         assert!(s.has("b"), "flush 只作废它之前的那批排队任务");
-        assert_eq!(s.read("b", false).map(|v| v.value), Some(b"B-VALUE".to_vec()));
+        assert_eq!(
+            s.read("b", false).map(|v| v.value),
+            Some(b"B-VALUE".to_vec())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1967,8 +2015,16 @@ mod tests {
         s.flush_pending();
         s.sweep(); // 清扫会把账目重算成以索引为准
         let idx_bytes: u64 = s.lock().slots.values().map(|x| x.bytes).sum();
-        assert_eq!(s.bytes_used(), idx_bytes, "并发读写删之后账目必须与索引一致");
-        assert_eq!(s.stats().pending_jobs.load(Ordering::Relaxed), 0, "排空后不该有残留计价");
+        assert_eq!(
+            s.bytes_used(),
+            idx_bytes,
+            "并发读写删之后账目必须与索引一致"
+        );
+        assert_eq!(
+            s.stats().pending_jobs.load(Ordering::Relaxed),
+            0,
+            "排空后不该有残留计价"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1985,7 +2041,13 @@ mod tests {
         let mut c = cfg(dir.clone());
         c.spill_after = 0.0;
         let s = DiskStore::open(c, Some(Arc::new(Broken))).unwrap();
-        let f = Features { freq: 3.0, age_ms: 1000, value_len: 8, ttl_left: None, on_disk: false };
+        let f = Features {
+            freq: 3.0,
+            age_ms: 1000,
+            value_len: 8,
+            ttl_left: None,
+            on_disk: false,
+        };
         assert!(s.score(&f).is_finite(), "坏策略必须被兜底成有限值");
         assert_eq!(s.score(&f), ClockFrequency.score(&f), "兜底就是基线分数");
         assert!(s.spill("a", b"1", None, 1.0));
@@ -1999,7 +2061,9 @@ mod tests {
 
     #[test]
     fn sweep_all_and_registry_snapshot_survive_hot_replace() {
-        let _g = REGISTRY_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = REGISTRY_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tmpdir("registry");
         let s = open(dir.clone());
         spill_sync(&s, "zone-key", b"v", 9.0);
@@ -2008,7 +2072,9 @@ mod tests {
         // 只认自己的区：注册表是进程级全局，别的用例可能同时登记了区，
         // sweep_all/flush_all_pending 会一并处理它们，所以不能断言快照总数。
         assert!(
-            snapshot().iter().any(|(n, st)| n == "zone" && st.config().root == dir),
+            snapshot()
+                .iter()
+                .any(|(n, st)| n == "zone" && st.config().root == dir),
             "登记后快照里必须有本区"
         );
         assert_eq!(sweep_all(), 0, "健康条目不该被清扫掉");

@@ -1044,31 +1044,49 @@ return _M
 /// 这里对 `package`/`preload` 表做存在性兜底，避免个别精简运行时缺表时失败。
 pub fn install_modules(lua: &Lua) -> LuaResult<()> {
     let string_loader = lua.create_function(|lua, _: ()| {
-        lua.load(RESTY_STRING).set_name("resty.string").eval::<LuaValue>()
+        lua.load(RESTY_STRING)
+            .set_name("resty.string")
+            .eval::<LuaValue>()
     })?;
     let lock_loader = lua.create_function(|lua, _: ()| {
-        lua.load(RESTY_LOCK).set_name("resty.lock").eval::<LuaValue>()
+        lua.load(RESTY_LOCK)
+            .set_name("resty.lock")
+            .eval::<LuaValue>()
     })?;
     let http_loader = lua.create_function(|lua, _: ()| {
-        lua.load(RESTY_HTTP).set_name("resty.http").eval::<LuaValue>()
+        lua.load(RESTY_HTTP)
+            .set_name("resty.http")
+            .eval::<LuaValue>()
     })?;
     let redis_loader = lua.create_function(|lua, _: ()| {
-        lua.load(RESTY_REDIS).set_name("resty.redis").eval::<LuaValue>()
+        lua.load(RESTY_REDIS)
+            .set_name("resty.redis")
+            .eval::<LuaValue>()
     })?;
     let semaphore_loader = lua.create_function(|lua, _: ()| {
-        lua.load(NGX_SEMAPHORE).set_name("ngx.semaphore").eval::<LuaValue>()
+        lua.load(NGX_SEMAPHORE)
+            .set_name("ngx.semaphore")
+            .eval::<LuaValue>()
     })?;
     let cookie_loader = lua.create_function(|lua, _: ()| {
-        lua.load(RESTY_COOKIE).set_name("resty.cookie").eval::<LuaValue>()
+        lua.load(RESTY_COOKIE)
+            .set_name("resty.cookie")
+            .eval::<LuaValue>()
     })?;
     let limit_req_loader = lua.create_function(|lua, _: ()| {
-        lua.load(RESTY_LIMIT_REQ).set_name("resty.limit.req").eval::<LuaValue>()
+        lua.load(RESTY_LIMIT_REQ)
+            .set_name("resty.limit.req")
+            .eval::<LuaValue>()
     })?;
     let limit_count_loader = lua.create_function(|lua, _: ()| {
-        lua.load(RESTY_LIMIT_COUNT).set_name("resty.limit.count").eval::<LuaValue>()
+        lua.load(RESTY_LIMIT_COUNT)
+            .set_name("resty.limit.count")
+            .eval::<LuaValue>()
     })?;
     let limit_conn_loader = lua.create_function(|lua, _: ()| {
-        lua.load(RESTY_LIMIT_CONN).set_name("resty.limit.conn").eval::<LuaValue>()
+        lua.load(RESTY_LIMIT_CONN)
+            .set_name("resty.limit.conn")
+            .eval::<LuaValue>()
     })?;
 
     let globals = lua.globals();
@@ -1115,7 +1133,14 @@ mod tests {
             .unwrap();
         assert_eq!(hex, "4142");
         // require "resty.http" → 模块面对象具备公开方法
-        for name in ["new", "connect", "request", "set_timeout", "set_keepalive", "close"] {
+        for name in [
+            "new",
+            "connect",
+            "request",
+            "set_timeout",
+            "set_keepalive",
+            "close",
+        ] {
             let ok: bool = lua
                 .load(format!(
                     r#"local h = require "resty.http"; return type(h.{name}) == 'function'"#
@@ -1297,9 +1322,20 @@ mod tests {
         let lua = mlua::Lua::new();
         install_modules(&lua).unwrap();
         // require 与公开方法面
-        for name in ["new", "connect", "command", "set_timeout", "set_keepalive", "reconnect", "close", "pipeline"] {
+        for name in [
+            "new",
+            "connect",
+            "command",
+            "set_timeout",
+            "set_keepalive",
+            "reconnect",
+            "close",
+            "pipeline",
+        ] {
             let ok: bool = lua
-                .load(format!(r#"local r = require "resty.redis"; return type(r.{name}) == 'function'"#))
+                .load(format!(
+                    r#"local r = require "resty.redis"; return type(r.{name}) == 'function'"#
+                ))
                 .eval()
                 .unwrap();
             assert!(ok, "resty.redis missing method {name}");
@@ -1318,6 +1354,9 @@ mod tests {
             )
             .eval()
             .unwrap();
-        assert!(ok, "resty.redis __index leaked a command function for a state field");
+        assert!(
+            ok,
+            "resty.redis __index leaked a command function for a state field"
+        );
     }
 }

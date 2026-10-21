@@ -6,11 +6,11 @@
 //! - 单写线程负责时间戳、按级别落盘、按大小滚动、Warn 以上回显 stderr。
 //! - `reopen()` 支持外部 logrotate。
 
+use crossbeam_channel::{bounded, Sender, TrySendError};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use crossbeam_channel::{bounded, Sender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use onrouter_config::Config;
@@ -90,7 +90,13 @@ impl FileWriter {
     pub fn open(path: &PathBuf, max_size: u64, keep: usize) -> Option<Self> {
         let file = open_append(path)?;
         let bytes = file.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
-        Some(FileWriter { path: path.clone(), file, bytes, max_size, keep })
+        Some(FileWriter {
+            path: path.clone(),
+            file,
+            bytes,
+            max_size,
+            keep,
+        })
     }
 
     pub fn line(&mut self, line: &str) {
@@ -146,7 +152,11 @@ fn open_append(p: &Path) -> Option<BufWriter<std::fs::File>> {
     match OpenOptions::new().create(true).append(true).open(p) {
         Ok(f) => Some(BufWriter::new(f)),
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "[onrouter] error_log 打开失败 {}: {e}", p.display());
+            let _ = writeln!(
+                std::io::stderr(),
+                "[onrouter] error_log 打开失败 {}: {e}",
+                p.display()
+            );
             None
         }
     }

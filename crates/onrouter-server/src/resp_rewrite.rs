@@ -143,7 +143,9 @@ pub fn rewrite_cookie_attr(cookie: &str, cfg: &CookieRewrite, attr_name: &str) -
                             format!("{}{}", rule.replacement, &cur_val[old.len()..])
                         }
                     }
-                    MatchPattern::Regex(re) => re.replace_all(cur_val, rule.replacement.as_str()).into_owned(),
+                    MatchPattern::Regex(re) => re
+                        .replace_all(cur_val, rule.replacement.as_str())
+                        .into_owned(),
                 };
                 // 保留原段的分隔与空白风格，规范为 "; name=val"
                 *seg = format!(" {}={}", attr_name, new_val);
@@ -180,7 +182,10 @@ pub fn upstream_origin(proxy_pass: &str) -> Option<String> {
 /// pattern 里可能带正则前缀（`~`/`=` 等）——只取字面路径部分；无斜杠则补 `/`。
 pub fn public_prefix(pattern: &str) -> String {
     let p = pattern.trim();
-    let p = p.trim_start_matches('=').trim_start_matches("~*").trim_start_matches('^');
+    let p = p
+        .trim_start_matches('=')
+        .trim_start_matches("~*")
+        .trim_start_matches('^');
     if p.is_empty() || !p.starts_with('/') {
         "/".to_string()
     } else if p.ends_with('/') {
@@ -204,7 +209,10 @@ mod tests {
     use super::*;
 
     fn lit(prefix: &str, repl: &str) -> RedirectRule {
-        RedirectRule { m: MatchPattern::Literal(prefix.into()), replacement: repl.into() }
+        RedirectRule {
+            m: MatchPattern::Literal(prefix.into()),
+            replacement: repl.into(),
+        }
     }
 
     #[test]
@@ -230,13 +238,22 @@ mod tests {
 
         // default 合成：上游 origin → 对外前缀（产出相对路径）
         let d = default_redirect_rule("http://10.0.0.5:8080/api/", "/v1/").unwrap();
-        assert_eq!(apply_redirect(&[d], "http://10.0.0.5:8080/login").as_deref(), Some("/v1/login"));
+        assert_eq!(
+            apply_redirect(&[d], "http://10.0.0.5:8080/login").as_deref(),
+            Some("/v1/login")
+        );
     }
 
     #[test]
     fn public_prefix_and_origin_normalization() {
-        assert_eq!(upstream_origin("http://a.b:8080/path"), Some("http://a.b:8080".to_string()));
-        assert_eq!(upstream_origin("https://a.b"), Some("https://a.b".to_string()));
+        assert_eq!(
+            upstream_origin("http://a.b:8080/path"),
+            Some("http://a.b:8080".to_string())
+        );
+        assert_eq!(
+            upstream_origin("https://a.b"),
+            Some("https://a.b".to_string())
+        );
         assert_eq!(upstream_origin("grpc://a.b"), None);
         assert_eq!(public_prefix("/app"), "/app/");
         assert_eq!(public_prefix("/app/"), "/app/");
@@ -265,7 +282,10 @@ mod tests {
         let cookie = "sid=xyz; domain=backend.internal; path=/app/sub; HttpOnly; Secure";
         let d1 = rewrite_cookie_attr(cookie, &domain, "domain");
         assert!(d1.contains("domain=public.example"), "{d1}");
-        assert!(d1.contains("domain") && !d1.contains("backend.internal"), "{d1}");
+        assert!(
+            d1.contains("domain") && !d1.contains("backend.internal"),
+            "{d1}"
+        );
         let p1 = rewrite_cookie_attr(&d1, &path, "path");
         assert!(p1.contains("path=/gateway/sub"), "{p1}");
         // 其它属性原样保留
@@ -291,19 +311,37 @@ mod tests {
             replacement: "$1.example".into(),
             remove: false,
         };
-        let cfg = CookieRewrite { off: false, rules: vec![re] };
+        let cfg = CookieRewrite {
+            off: false,
+            rules: vec![re],
+        };
         let out = rewrite_cookie_attr("a=1; domain=.backend.internal", &cfg, "domain");
         assert!(out.contains("domain=backend.example"), "{out}");
     }
 
     #[test]
     fn cookie_off_is_noop_and_domain_case_insensitive() {
-        let cfg = CookieRewrite { off: true, rules: vec![CookieAttrRule {
-            m: MatchPattern::Literal("x".into()), replacement: "y".into(), remove: false }] };
-        assert_eq!(rewrite_cookie_attr("a=1; domain=x", &cfg, "domain"), "a=1; domain=x");
+        let cfg = CookieRewrite {
+            off: true,
+            rules: vec![CookieAttrRule {
+                m: MatchPattern::Literal("x".into()),
+                replacement: "y".into(),
+                remove: false,
+            }],
+        };
+        assert_eq!(
+            rewrite_cookie_attr("a=1; domain=x", &cfg, "domain"),
+            "a=1; domain=x"
+        );
 
-        let ci = CookieRewrite { off: false, rules: vec![CookieAttrRule {
-            m: MatchPattern::Literal(".BACKEND.INTERNAL".into()), replacement: "pub".into(), remove: false }] };
+        let ci = CookieRewrite {
+            off: false,
+            rules: vec![CookieAttrRule {
+                m: MatchPattern::Literal(".BACKEND.INTERNAL".into()),
+                replacement: "pub".into(),
+                remove: false,
+            }],
+        };
         let out = rewrite_cookie_attr("a=1; domain=backend.internal", &ci, "domain");
         assert!(out.contains("domain=pub"), "{out}");
     }

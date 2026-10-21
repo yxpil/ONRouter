@@ -226,7 +226,12 @@ impl DnsResolver {
     }
 
     /// 向单个名字服务器发一条查询并解析应答。
-    async fn query_one(&self, ns: SocketAddr, host: &str, qtype: u16) -> Result<Vec<IpAddr>, String> {
+    async fn query_one(
+        &self,
+        ns: SocketAddr,
+        host: &str,
+        qtype: u16,
+    ) -> Result<Vec<IpAddr>, String> {
         let id = self.take_id();
         let query = build_query(id, host, qtype);
         let bind = if ns.is_ipv4() {
@@ -352,7 +357,12 @@ fn read_name(msg: &[u8], offset: usize) -> Result<(String, usize), String> {
 }
 
 /// 解析应答，抽取匹配 qtype 的记录地址。校验事务 ID、QR 位与 RCODE。
-fn parse_response(msg: &[u8], want_id: u16, host: &str, _qtype: u16) -> Result<Vec<IpAddr>, String> {
+fn parse_response(
+    msg: &[u8],
+    want_id: u16,
+    host: &str,
+    _qtype: u16,
+) -> Result<Vec<IpAddr>, String> {
     if msg.len() < 12 {
         return Err("DNS 应答太短".into());
     }
@@ -467,7 +477,7 @@ mod tests {
         let (_, q) = sample_query("www.example.com", TYPE_A);
         assert_eq!(&q[0..2], &[0xAB, 0xCD]);
         assert_eq!(q[5], 1); // QDCOUNT = 1
-        // 末尾四个字节：label 结束 \0 + QTYPE(0,1) + QCLASS(0,1)
+                             // 末尾四个字节：label 结束 \0 + QTYPE(0,1) + QCLASS(0,1)
         assert_eq!(&q[q.len() - 5..], &[0x00, 0x00, 0x01, 0x00, 0x01][..]);
     }
 
@@ -660,9 +670,18 @@ mod tests {
 
     #[test]
     fn nameserver_parsing() {
-        assert_eq!(parse_nameserver("8.8.8.8"), Some("8.8.8.8:53".parse().unwrap()));
-        assert_eq!(parse_nameserver("127.0.0.1:5553"), Some("127.0.0.1:5553".parse().unwrap()));
-        assert_eq!(parse_nameserver("[::1]:53"), Some("[::1]:53".parse().unwrap()));
+        assert_eq!(
+            parse_nameserver("8.8.8.8"),
+            Some("8.8.8.8:53".parse().unwrap())
+        );
+        assert_eq!(
+            parse_nameserver("127.0.0.1:5553"),
+            Some("127.0.0.1:5553".parse().unwrap())
+        );
+        assert_eq!(
+            parse_nameserver("[::1]:53"),
+            Some("[::1]:53".parse().unwrap())
+        );
         assert_eq!(parse_nameserver("::1"), Some("[::1]:53".parse().unwrap()));
         assert_eq!(parse_nameserver("not-an-ip"), None);
     }

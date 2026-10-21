@@ -127,10 +127,7 @@ pub fn install(profiles: Vec<Arc<FrontProfile>>) {
 }
 
 pub fn snapshot() -> Vec<Arc<FrontProfile>> {
-    registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    registry().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 // ==================== 头部取值（各家的"格式方言"在这里收敛） ====================
@@ -204,7 +201,9 @@ fn token_ip(tok: &str) -> Option<IpAddr> {
     // Mirror of realip::parse_ip_chain's per-token branch (a token from split(',') cannot contain
     // further commas, so parse_ip_chain would always answer 0-or-1 elements — one heap allocation
     // to hold at most one IpAddr). Keep this branch in sync with realip::parse_ip_chain.
-    let pt = t.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '.' || c == '[' || c == ']'));
+    let pt = t.trim_matches(|c: char| {
+        !(c.is_ascii_alphanumeric() || c == ':' || c == '.' || c == '[' || c == ']')
+    });
     if let Ok(ip) = pt.parse::<IpAddr>() {
         return Some(ip);
     }
@@ -398,7 +397,13 @@ pub fn match_profile<'a>(
         let rank = (verified as u8, hits);
         // 严格大于：平级不替换，于是先声明的 profile 胜出
         if best.as_ref().map(|(r, _)| &rank > r).unwrap_or(true) {
-            best = Some((rank, Candidate { profile: p, verified }));
+            best = Some((
+                rank,
+                Candidate {
+                    profile: p,
+                    verified,
+                },
+            ));
         }
     }
     best.map(|(_, cand)| cand)
@@ -523,7 +528,9 @@ fn pick_ip(
         // 只有当 real_ip_header 根本不在本 profile 认可的头链里时才算不一致——
         // 在里面就说明两处配置说的是同一个来源，地址已经由 realip 正确落地。
         let agrees = realip.enabled
-            && p.ip_headers.iter().any(|h| h.eq_ignore_ascii_case(realip.header));
+            && p.ip_headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(realip.header));
         if !p.ip_headers.is_empty() && !agrees {
             d.blocked.get_or_insert(Blocked::AutoTrustOff);
             p.counters.ip_blocked.fetch_add(1, Ordering::Relaxed);
@@ -671,7 +678,10 @@ mod tests {
     fn profile(name: &str) -> FrontProfile {
         FrontProfile {
             name: name.to_string(),
-            probes: vec![Probe { header: "x-front-id".into(), substr: None }],
+            probes: vec![Probe {
+                header: "x-front-id".into(),
+                substr: None,
+            }],
             ip_headers: vec!["x-real-client".into(), "x-forwarded-for".into()],
             country_header: Some("x-front-country".into()),
             proto_header: Some("x-front-visitor".into()),
@@ -690,7 +700,12 @@ mod tests {
     }
 
     fn realip_off() -> RealIpState<'static> {
-        RealIpState { enabled: false, header: "x-real-ip", trusted: &[], recursive: false }
+        RealIpState {
+            enabled: false,
+            header: "x-real-ip",
+            trusted: &[],
+            recursive: false,
+        }
     }
 
     fn req() -> Vec<(String, String)> {
@@ -699,7 +714,10 @@ mod tests {
             hdr("X-Real-Client", "203.0.113.9"),
             hdr("X-Forwarded-For", "198.51.100.7, 203.0.113.9"),
             hdr("X-Front-Country", "cn"),
-            hdr("X-Front-Visitor", "{\"scheme\":\"https\",\"ssl_protocol\":\"TLSv1.3\"}"),
+            hdr(
+                "X-Front-Visitor",
+                "{\"scheme\":\"https\",\"ssl_protocol\":\"TLSv1.3\"}",
+            ),
             hdr("X-Forwarded-Host", "www.example.org:443"),
         ]
     }
@@ -712,7 +730,10 @@ mod tests {
         assert_eq!(d.profile.as_deref(), Some("edge"), "识别本身不要求可信");
         assert!(!d.verified);
         assert_eq!(d.real_ip, None);
-        assert_eq!(d.scheme, None, "协议头没采信，否则会生成 http:// 的跳转降级");
+        assert_eq!(
+            d.scheme, None,
+            "协议头没采信，否则会生成 http:// 的跳转降级"
+        );
         assert_eq!(d.host, None);
         assert_eq!(d.country, None);
         assert_eq!(d.blocked, Some(Blocked::Unverified));
@@ -751,7 +772,11 @@ mod tests {
         r[1] = hdr("X-Real-Client", "not-an-ip");
         let c = conf(vec![p], FrontProxyMode::Egress, true);
         let d = decide(&c, &r, Some(v4("192.0.2.5")), &realip_off());
-        assert_eq!(d.real_ip.as_deref(), Some("203.0.113.9"), "按链落到下一个候选头");
+        assert_eq!(
+            d.real_ip.as_deref(),
+            Some("203.0.113.9"),
+            "按链落到下一个候选头"
+        );
         assert_eq!(d.ip_source.as_deref(), Some("x-forwarded-for"));
     }
 
@@ -764,7 +789,11 @@ mod tests {
         ri.recursive = true;
         // 链里 198.51.100.7 也属于本 profile 网段（另一层代理），真实客户端是 203.0.113.9；
         // 首选头没有值，走 XFF 时必须跳过可信跳。
-        let r = vec![hdr("X-Front-Id", "1"), hdr("X-Real-Client", ""), hdr("X-Forwarded-For", "203.0.113.9, 198.51.100.7")];
+        let r = vec![
+            hdr("X-Front-Id", "1"),
+            hdr("X-Real-Client", ""),
+            hdr("X-Forwarded-For", "203.0.113.9, 198.51.100.7"),
+        ];
         let d = decide(&c, &r, Some(v4("192.0.2.5")), &ri);
         assert_eq!(d.real_ip.as_deref(), Some("203.0.113.9"));
     }
@@ -775,7 +804,12 @@ mod tests {
         let c = conf(vec![profile("edge")], FrontProxyMode::Egress, false);
         static NETS: std::sync::OnceLock<Vec<TrustedNet>> = std::sync::OnceLock::new();
         let nets = NETS.get_or_init(|| vec![net("192.0.2.0/24")]);
-        let ri = RealIpState { enabled: true, header: "x-forwarded-for", trusted: nets, recursive: false };
+        let ri = RealIpState {
+            enabled: true,
+            header: "x-forwarded-for",
+            trusted: nets,
+            recursive: false,
+        };
         let d = decide(&c, &req(), Some(v4("192.0.2.9")), &ri);
         assert!(d.verified);
         assert_eq!(d.scheme.as_deref(), Some("https"));
@@ -786,12 +820,21 @@ mod tests {
     #[test]
     fn profiles_are_compared_by_evidence_not_declaration_order() {
         let mut generic = profile("generic");
-        generic.probes = vec![Probe { header: "x-front-id".into(), substr: None }];
+        generic.probes = vec![Probe {
+            header: "x-front-id".into(),
+            substr: None,
+        }];
         generic.trust = vec![net("198.51.100.0/24")]; // 对端不在此段
         let mut specific = profile("specific");
         specific.probes = vec![
-            Probe { header: "x-front-id".into(), substr: None },
-            Probe { header: "x-front-country".into(), substr: Some("cn".into()) },
+            Probe {
+                header: "x-front-id".into(),
+                substr: None,
+            },
+            Probe {
+                header: "x-front-country".into(),
+                substr: Some("cn".into()),
+            },
         ];
         // 只有 1 个探针，但对端在它的网段里 ⇒ 证据更强，胜过 2 探针却验证不了的
         specific.trust = vec![net("192.0.2.0/24")];
@@ -805,8 +848,14 @@ mod tests {
     #[test]
     fn value_dialects_all_parse() {
         // 裸 IP / 逗号链 / ip:port / URL 编码 IPv6
-        assert_eq!(ip_from_value("203.0.113.9", &[], false), Some(v4("203.0.113.9")));
-        assert_eq!(ip_from_value("198.51.100.7:46532", &[], false), Some(v4("198.51.100.7")));
+        assert_eq!(
+            ip_from_value("203.0.113.9", &[], false),
+            Some(v4("203.0.113.9"))
+        );
+        assert_eq!(
+            ip_from_value("198.51.100.7:46532", &[], false),
+            Some(v4("198.51.100.7"))
+        );
         // 整段 URL 编码的 IPv6 + 端口：解码后 9 段不是合法地址，只有"尾段纯数字且前段合法"才剥端口
         assert_eq!(
             ip_from_value("2001%3A0db8%3A0%3A0%3A0%3A0%3A0%3A1%3A46532", &[], false)
@@ -828,7 +877,10 @@ mod tests {
         assert_eq!(country_from_value("cn").as_deref(), Some("CN"));
         assert_eq!(country_from_value("CN;evil"), None);
         assert_eq!(country_from_value(""), None);
-        assert_eq!(host_from_value("WWW.Example.ORG:443").as_deref(), Some("www.example.org"));
+        assert_eq!(
+            host_from_value("WWW.Example.ORG:443").as_deref(),
+            Some("www.example.org")
+        );
         assert_eq!(host_from_value("a\r\nSet-Cookie: x=1"), None);
         assert_eq!(host_from_value(""), None);
         assert_eq!(percent_decode("2001%3Adb8"), "2001:db8");
@@ -840,11 +892,17 @@ mod tests {
     fn cache_status_line_follows_rfc_9209_and_appends() {
         assert_eq!(cache_status_field("HIT"), "onrouter; detail=hit");
         assert_eq!(cache_status_field("STALE"), "onrouter; detail=stale");
-        assert_eq!(cache_status_field("revalidated"), "onrouter; detail=proxy-revalidated");
+        assert_eq!(
+            cache_status_field("revalidated"),
+            "onrouter; detail=proxy-revalidated"
+        );
         // 认不出的状态只报节点名，不编造 detail
         assert_eq!(cache_status_field(""), "onrouter");
         assert_eq!(cache_status_field("WTF"), "onrouter");
-        assert_eq!(append_cache_status(None, "onrouter; detail=hit"), "onrouter; detail=hit");
+        assert_eq!(
+            append_cache_status(None, "onrouter; detail=hit"),
+            "onrouter; detail=hit"
+        );
         assert_eq!(
             append_cache_status(Some("fastly; detail=miss"), "onrouter; detail=hit"),
             "fastly; detail=miss, onrouter; detail=hit"
@@ -885,12 +943,21 @@ mod tests {
         let mut p = profile("no-probe");
         p.probes.clear();
         let c = conf(vec![p], FrontProxyMode::Detect, true);
-        assert_eq!(decide(&c, &req(), Some(v4("192.0.2.5")), &realip_off()).profile, None);
+        assert_eq!(
+            decide(&c, &req(), Some(v4("192.0.2.5")), &realip_off()).profile,
+            None
+        );
         // substr 不匹配 ⇒ 整个 profile 不命中
         let mut q = profile("with-sub");
-        q.probes = vec![Probe { header: "x-front-id".into(), substr: Some("zzz".into()) }];
+        q.probes = vec![Probe {
+            header: "x-front-id".into(),
+            substr: Some("zzz".into()),
+        }];
         let cq = conf(vec![q], FrontProxyMode::Detect, true);
-        assert_eq!(decide(&cq, &req(), Some(v4("192.0.2.5")), &realip_off()).profile, None);
+        assert_eq!(
+            decide(&cq, &req(), Some(v4("192.0.2.5")), &realip_off()).profile,
+            None
+        );
     }
 
     // Author: yxpil
@@ -986,7 +1053,10 @@ mod tests {
         // returns Cow::Borrowed and must stay at zero.
         use alloccount::count;
         let (n, got) = count(|| ip_from_value("2001%3Adb8%3A%3A1", &[], false));
-        assert_eq!(n, 1, "encoded chain allocated {n} times, expected exactly 1");
+        assert_eq!(
+            n, 1,
+            "encoded chain allocated {n} times, expected exactly 1"
+        );
         assert_eq!(got, Some("2001:db8::1".parse().unwrap()));
 
         let (n, got) = count(|| percent_decode("203.0.113.9"));

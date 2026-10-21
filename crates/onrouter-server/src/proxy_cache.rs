@@ -281,7 +281,9 @@ impl ProxyCache {
             };
             for _ in 0..max_per_zone {
                 // BTreeMap iterates by tick order: first entry = least recently used.
-                let Some(key) = z.lru.values().next().cloned() else { break };
+                let Some(key) = z.lru.values().next().cloned() else {
+                    break;
+                };
                 if let Some(slot) = z.remove(&key) {
                     n += 1;
                     bytes += (slot.resp.body.len() + key.len()) as u64;
@@ -297,7 +299,10 @@ impl ProxyCache {
 
     #[cfg(test)]
     fn new() -> Arc<Self> {
-        Self::with_capacities(HashMap::new(), Arc::new(crate::learning::Learning::default()))
+        Self::with_capacities(
+            HashMap::new(),
+            Arc::new(crate::learning::Learning::default()),
+        )
     }
 
     #[cfg(test)]
@@ -1082,9 +1087,7 @@ pub fn upstream_directive(headers: &[(String, String)], now_unix: i64) -> Upstre
 /// "能不能缓存 / 缓存多久"。注意这只影响判定——存下来与回发给客户端的头仍是原始集合，
 /// nginx 的语义是"停止处理该头"，不是"删除该头"。
 pub fn header_counts_for_cache(name: &str, ignore: &[String]) -> bool {
-    !ignore
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case(name))
+    !ignore.iter().any(|t| t.eq_ignore_ascii_case(name))
 }
 
 /// 结合上游指示与 `proxy_cache_valid` 得到最终 TTL；None = 不缓存。
@@ -1114,14 +1117,28 @@ fn parse_http_date(v: &str) -> Option<i64> {
     }
     let day: i64 = parts[0].parse().ok()?;
     let month = match parts[1].to_ascii_lowercase().as_str() {
-        "jan" => 1, "feb" => 2, "mar" => 3, "apr" => 4, "may" => 5, "jun" => 6,
-        "jul" => 7, "aug" => 8, "sep" => 9, "oct" => 10, "nov" => 11, "dec" => 12,
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
         _ => return None,
     };
     let year: i64 = parts[2].parse().ok()?;
     // 时间 HH:MM:SS
     let t: Vec<i64> = parts[3].split(':').filter_map(|x| x.parse().ok()).collect();
-    let (h, mi, sec) = (t.first().copied().unwrap_or(0), t.get(1).copied().unwrap_or(0), t.get(2).copied().unwrap_or(0));
+    let (h, mi, sec) = (
+        t.first().copied().unwrap_or(0),
+        t.get(1).copied().unwrap_or(0),
+        t.get(2).copied().unwrap_or(0),
+    );
     // days-from-civil (Howard Hinnant) 计算公历日序，再换 Unix 秒
     let y = if month <= 2 { year - 1 } else { year };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
@@ -1169,10 +1186,19 @@ mod tests {
             Some(Duration::from_secs(60))
         );
         // 忽略项大小写不敏感（配置里已统一小写，这里防回归）
-        assert!(!header_counts_for_cache("set-cookie", &["Set-Cookie".to_string()]));
-        assert!(!header_counts_for_cache("Set-Cookie", &["set-cookie".to_string()]));
+        assert!(!header_counts_for_cache(
+            "set-cookie",
+            &["Set-Cookie".to_string()]
+        ));
+        assert!(!header_counts_for_cache(
+            "Set-Cookie",
+            &["set-cookie".to_string()]
+        ));
         // 未被点名的头一律保留
-        assert!(header_counts_for_cache("expires", &["cache-control".to_string()]));
+        assert!(header_counts_for_cache(
+            "expires",
+            &["cache-control".to_string()]
+        ));
     }
 
     #[test]
@@ -1229,14 +1255,21 @@ mod tests {
 
     #[test]
     fn upstream_directive_parses_cache_control() {
-        let hs = vec![("Cache-Control".to_string(), "public, max-age=120".to_string())];
+        let hs = vec![(
+            "Cache-Control".to_string(),
+            "public, max-age=120".to_string(),
+        )];
         assert_eq!(
             upstream_directive(&hs, 0),
             UpstreamDirective::Expire(Duration::from_secs(120))
         );
         for bad in ["no-store", "no-cache", "private", "max-age=0"] {
             let hs = vec![("Cache-Control".to_string(), bad.to_string())];
-            assert_eq!(upstream_directive(&hs, 0), UpstreamDirective::Forbid, "{bad}");
+            assert_eq!(
+                upstream_directive(&hs, 0),
+                UpstreamDirective::Forbid,
+                "{bad}"
+            );
         }
         let hs = vec![("Content-Type".to_string(), "text/plain".to_string())];
         assert_eq!(upstream_directive(&hs, 0), UpstreamDirective::NoHint);
@@ -1250,10 +1283,16 @@ mod tests {
         assert_eq!(effective_ttl(&valid, 200, &hs, 0), None);
         // 上游 max-age 覆盖 valid
         let hs = vec![("Cache-Control".to_string(), "max-age=5".to_string())];
-        assert_eq!(effective_ttl(&valid, 200, &hs, 0), Some(Duration::from_secs(5)));
+        assert_eq!(
+            effective_ttl(&valid, 200, &hs, 0),
+            Some(Duration::from_secs(5))
+        );
         // 上游无提示 → 回落到 valid
         let hs = vec![("Content-Type".to_string(), "text/plain".to_string())];
-        assert_eq!(effective_ttl(&valid, 200, &hs, 0), Some(Duration::from_secs(60)));
+        assert_eq!(
+            effective_ttl(&valid, 200, &hs, 0),
+            Some(Duration::from_secs(60))
+        );
         // 上游无提示且无匹配 valid → 不缓存
         assert_eq!(effective_ttl(&[], 500, &hs, 0), None);
     }
@@ -1261,7 +1300,10 @@ mod tests {
     #[test]
     fn ttl_from_expires_header_future() {
         // Wed, 21 Oct 2015 07:28:00 GMT == 1445412480；now 取 30 秒前 → Expire(30s)
-        let hs = vec![("Expires".to_string(), "Wed, 21 Oct 2015 07:28:00 GMT".to_string())];
+        let hs = vec![(
+            "Expires".to_string(),
+            "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+        )];
         let d = upstream_directive(&hs, 1_445_412_450);
         assert_eq!(d, UpstreamDirective::Expire(Duration::from_secs(30)));
     }
@@ -1334,7 +1376,11 @@ mod tests {
         let row = &c.learning_rows()[0];
         assert_eq!(row.zone, "z");
         assert_eq!(row.sketch_bytes, SK, "该区应确实持有草图");
-        assert!(row.admission_rejected >= 50, "准入拒绝要逐次计数，实际 {}", row.admission_rejected);
+        assert!(
+            row.admission_rejected >= 50,
+            "准入拒绝要逐次计数，实际 {}",
+            row.admission_rejected
+        );
         assert_eq!(row.evicted_cold, 0, "拒绝不是驱逐，没腾过位置");
     }
 
@@ -1356,7 +1402,11 @@ mod tests {
         c.store("z", "hot", entry(), Duration::from_secs(60));
         assert_eq!(c.len("z"), 2);
         assert_eq!(c.peek("z", "hot").0, CacheHit::Hit, "更热的新 key 应准入");
-        assert_eq!(c.peek("z", "b").0, CacheHit::Miss, "b 一次没被访问过，该它出局");
+        assert_eq!(
+            c.peek("z", "b").0,
+            CacheHit::Miss,
+            "b 一次没被访问过，该它出局"
+        );
         assert_eq!(c.peek("z", "a").0, CacheHit::Hit);
         let row = &c.learning_rows()[0];
         assert_eq!(row.evicted_cold, 1, "抢位驱逐计数");
@@ -1445,7 +1495,11 @@ mod tests {
         }
         assert_eq!(c.len("z"), 2);
         assert_eq!(c.peek("z", "a").0, CacheHit::Hit);
-        assert_eq!(c.learning_rows()[0].admission_rejected, 0, "覆盖写不该被准入拦下");
+        assert_eq!(
+            c.learning_rows()[0].admission_rejected,
+            0,
+            "覆盖写不该被准入拦下"
+        );
     }
 
     /// 关掉学习时不得有任何副作用：不建图、不计数、也不占用预算。
@@ -1463,10 +1517,22 @@ mod tests {
             c.store("z", &format!("k{i}"), entry(), Duration::from_secs(60));
         }
         let row = &c.learning_rows()[0];
-        assert_eq!((row.sketch_bytes, row.ages, row.admission_rejected, row.evicted_cold), (0, 0, 0, 0), "未学习区不得建图/计数");
+        assert_eq!(
+            (
+                row.sketch_bytes,
+                row.ages,
+                row.admission_rejected,
+                row.evicted_cold
+            ),
+            (0, 0, 0, 0),
+            "未学习区不得建图/计数"
+        );
         let (enabled, used, budget, denied) = c.learning_summary();
         assert!(!enabled);
-        assert_eq!((used, budget, denied), (0, crate::learning::DEFAULT_BUDGET, 0));
+        assert_eq!(
+            (used, budget, denied),
+            (0, crate::learning::DEFAULT_BUDGET, 0)
+        );
         // 行为回到纯 LRU：最新写入的两条留下，a 早被淘汰
         assert_eq!(c.peek("z", "a").0, CacheHit::Miss);
     }
@@ -1505,12 +1571,23 @@ mod tests {
         let notes = c.apply_learning(learning_of(&[("big", SK * 2), ("small", SK)], SK * 2));
         assert_eq!(c.learning_summary().1, SK, "占用必须收敛到新上限以内");
         assert!(
-            notes.iter().any(|n| n.contains("big") && n.contains("放掉")),
+            notes
+                .iter()
+                .any(|n| n.contains("big") && n.contains("放掉")),
             "应说明放掉的是哪个区，实际 {notes:?}"
         );
         let rows = c.learning_rows();
-        assert_eq!(rows.iter().find(|r| r.zone == "big").unwrap().sketch_bytes, 0);
-        assert_eq!(rows.iter().find(|r| r.zone == "small").unwrap().sketch_bytes, SK);
+        assert_eq!(
+            rows.iter().find(|r| r.zone == "big").unwrap().sketch_bytes,
+            0
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.zone == "small")
+                .unwrap()
+                .sketch_bytes,
+            SK
+        );
     }
 
     /// 申领不到的区要如实报告，并且**不在每个请求里重试**（否则拒绝计数会变成噪声）。
@@ -1522,15 +1599,17 @@ mod tests {
         );
         c.store("z", "a", entry(), Duration::from_secs(60));
         let notes = c.apply_learning(learning_of(&[("z", SK)], SK / 2));
-        assert!(
-            notes.iter().any(|n| n.contains("预算不足")),
-            "{notes:?}"
-        );
+        assert!(notes.iter().any(|n| n.contains("预算不足")), "{notes:?}");
         assert_eq!(c.learning_rows()[0].sketch_bytes, 0);
         for i in 0..100 {
             c.lookup("z", &format!("k{i}"));
         }
-        assert_eq!(c.learning_summary().3, 1, "拒绝只该记一次，实际 {}", c.learning_summary().3);
+        assert_eq!(
+            c.learning_summary().3,
+            1,
+            "拒绝只该记一次，实际 {}",
+            c.learning_summary().3
+        );
     }
 
     #[test]
@@ -1562,13 +1641,19 @@ mod tests {
         let both = vec![
             ("Content-Type".to_string(), "text/html".to_string()),
             ("ETag".to_string(), "\"abc\"".to_string()),
-            ("Last-Modified".to_string(), "Tue, 15 Nov 2021 08:12:01 GMT".to_string()),
+            (
+                "Last-Modified".to_string(),
+                "Tue, 15 Nov 2021 08:12:01 GMT".to_string(),
+            ),
         ];
         assert_eq!(
             revalidation_validators(&both),
             vec![
                 ("if-none-match".to_string(), "\"abc\"".to_string()),
-                ("if-modified-since".to_string(), "Tue, 15 Nov 2021 08:12:01 GMT".to_string()),
+                (
+                    "if-modified-since".to_string(),
+                    "Tue, 15 Nov 2021 08:12:01 GMT".to_string()
+                ),
             ],
             "两个都带上：上游可以任选其一判 304"
         );
@@ -1578,8 +1663,13 @@ mod tests {
             vec![("if-modified-since".to_string(), "x".to_string())]
         );
         let etag_blank = vec![("etag".to_string(), "   ".to_string())];
-        assert!(revalidation_validators(&etag_blank).is_empty(), "空值不能当校验器发出去");
-        assert!(revalidation_validators(&[("content-type".to_string(), "text".to_string())]).is_empty());
+        assert!(
+            revalidation_validators(&etag_blank).is_empty(),
+            "空值不能当校验器发出去"
+        );
+        assert!(
+            revalidation_validators(&[("content-type".to_string(), "text".to_string())]).is_empty()
+        );
     }
 
     #[test]
@@ -1592,7 +1682,10 @@ mod tests {
         // 304 常见形态：只带新的有效期与缓存相关头，没有 content-type
         let fresh = vec![
             ("Cache-Control".to_string(), "max-age=60".to_string()),
-            ("date".to_string(), "Wed, 21 Oct 2026 12:00:00 GMT".to_string()),
+            (
+                "date".to_string(),
+                "Wed, 21 Oct 2026 12:00:00 GMT".to_string(),
+            ),
         ];
         let merged = merge_revalidated(&stored, &fresh);
         assert_eq!(
@@ -1601,7 +1694,10 @@ mod tests {
                 ("content-type".to_string(), "text/html".to_string()),
                 ("cache-control".to_string(), "max-age=60".to_string()),
                 ("etag".to_string(), "\"v1\"".to_string()),
-                ("date".to_string(), "Wed, 21 Oct 2026 12:00:00 GMT".to_string()),
+                (
+                    "date".to_string(),
+                    "Wed, 21 Oct 2026 12:00:00 GMT".to_string()
+                ),
             ],
             "304 里出现过的名字覆盖旧值，其余原样保留，新的追加在尾部"
         );
@@ -1614,7 +1710,10 @@ mod tests {
         let l2 = c.cache_lock("z", "k");
         assert!(Arc::ptr_eq(&l1, &l2), "同 key 必须拿到同一把锁");
         let guard = l1.clone().lock_owned().await;
-        assert!(l1.clone().try_lock_owned().is_err(), "leader 持锁期间 waiter 必须等待");
+        assert!(
+            l1.clone().try_lock_owned().is_err(),
+            "leader 持锁期间 waiter 必须等待"
+        );
         drop(guard);
         assert!(l2.try_lock_owned().is_ok());
         // 不同 key 互不影响
@@ -1629,10 +1728,8 @@ mod tests {
     fn tmpdir(name: &str) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!(
-            "onrouter-pcache-{}-{n}-{name}",
-            std::process::id()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("onrouter-pcache-{}-{n}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
     }
@@ -1657,7 +1754,10 @@ mod tests {
     }
 
     /// 一个容量只有 `cap` 条、并且挂了冷层的缓存；返回的 store 供测试读账目。
-    fn cache_with_tier(cap: usize, cfg: crate::disk_cache::DiskConfig) -> (Arc<ProxyCache>, DiskStore) {
+    fn cache_with_tier(
+        cap: usize,
+        cfg: crate::disk_cache::DiskConfig,
+    ) -> (Arc<ProxyCache>, DiskStore) {
         let store = DiskStore::open(cfg, None).expect("冷层应能打开");
         let mut disks = HashMap::new();
         disks.insert("z".to_string(), store.clone());
@@ -1818,7 +1918,10 @@ mod tests {
         store.flush_pending();
         assert!(store.has("a"), "前置条件：a 已在冷层");
         c.invalidate("z", "a");
-        assert!(!store.has("a"), "失效必须连冷层一起摘，否则下一条请求会把它读回来");
+        assert!(
+            !store.has("a"),
+            "失效必须连冷层一起摘，否则下一条请求会把它读回来"
+        );
         let (hit, _, _, _) = c.lookup("z", "a");
         assert_eq!(hit, CacheHit::Miss);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1845,7 +1948,11 @@ mod tests {
         let c = ProxyCache::with_capacities(caps, Arc::new(crate::learning::Learning::default()));
         c.attach_disks(disks);
         let (hit, resp, _, from_disk) = c.lookup("z", "a");
-        assert_eq!(hit, CacheHit::Hit, "上一个进程落盘的响应，新进程仍不该打后端");
+        assert_eq!(
+            hit,
+            CacheHit::Hit,
+            "上一个进程落盘的响应，新进程仍不该打后端"
+        );
         assert!(from_disk);
         assert_eq!(&resp.expect("重启后仍能读到原 body").body[..], b"AAA");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1857,16 +1964,27 @@ mod tests {
         let cfg = tier(dir.clone(), 0.0);
         // 先造一条内容坏掉的冷层条目（合法外壳 + 无法解析的 payload）
         let store = DiskStore::open(cfg, None).unwrap();
-        assert!(store.spill("a", b"not-a-response-payload", Some(crate::disk_cache::epoch_now() + 60.0), 1.0));
+        assert!(store.spill(
+            "a",
+            b"not-a-response-payload",
+            Some(crate::disk_cache::epoch_now() + 60.0),
+            1.0
+        ));
         store.flush_pending();
         let mut disks = HashMap::new();
         disks.insert("z".to_string(), store.clone());
-        let c = ProxyCache::with_capacities(HashMap::new(), Arc::new(crate::learning::Learning::default()));
+        let c = ProxyCache::with_capacities(
+            HashMap::new(),
+            Arc::new(crate::learning::Learning::default()),
+        );
         c.attach_disks(disks);
         let (hit, _, _, from_disk) = c.lookup("z", "a");
         assert_eq!(hit, CacheHit::Miss, "解析不出来的条目不能当成命中发出去");
         assert!(!from_disk);
-        assert!(!store.has("a"), "坏条目应被顺手摘掉，免得每次都重付一次读+失败");
+        assert!(
+            !store.has("a"),
+            "坏条目应被顺手摘掉，免得每次都重付一次读+失败"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -407,10 +407,9 @@ mod tests {
 
     #[test]
     fn parses_worker_threads_and_affinity() {
-        let cfg = Config::parse(
-            "worker_threads 6; worker_cpu_affinity 00000001 00000002 00000004;",
-        )
-        .unwrap();
+        let cfg =
+            Config::parse("worker_threads 6; worker_cpu_affinity 00000001 00000002 00000004;")
+                .unwrap();
         let (s, warnings) = Settings::from_config(&cfg);
         assert_eq!(s.worker_threads, Some(6));
         assert_eq!(

@@ -294,7 +294,10 @@ impl StillOnline {
         names
             .into_iter()
             .map(|n| {
-                let (entries, used) = zones.get(n).map(|z| (z.entries.len(), z.used)).unwrap_or((0, 0));
+                let (entries, used) = zones
+                    .get(n)
+                    .map(|z| (z.entries.len(), z.used))
+                    .unwrap_or((0, 0));
                 let budget = budgets.get(n).copied().unwrap_or(0);
                 (n.clone(), entries, used, budget)
             })
@@ -411,9 +414,9 @@ pub fn strip_for_replay(headers: &[(String, String)]) -> Vec<(String, String)> {
 
 /// 请求侧凭证头检测（硬规则 3）。用 ASCII 大小写无关比较，不复制头值。
 pub fn request_has_credentials(req_headers: &[(String, String)]) -> bool {
-    req_headers.iter().any(|(k, _)| {
-        k.eq_ignore_ascii_case("cookie") || k.eq_ignore_ascii_case("authorization")
-    })
+    req_headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("cookie") || k.eq_ignore_ascii_case("authorization"))
 }
 
 /// 响应侧凭证头检测（硬规则 1）。
@@ -469,10 +472,7 @@ mod tests {
     use bytes::Bytes;
 
     fn budgets(entries: &[(&str, usize)]) -> HashMap<String, usize> {
-        entries
-            .iter()
-            .map(|(n, b)| (n.to_string(), *b))
-            .collect()
+        entries.iter().map(|(n, b)| (n.to_string(), *b)).collect()
     }
 
     fn snap(body: &str, uri: &str) -> Snapshot {
@@ -601,13 +601,19 @@ mod tests {
 
     #[test]
     fn credential_detection_is_case_insensitive_and_value_free() {
-        assert!(request_has_credentials(&[("Cookie".into(), "sid=1".into())]));
+        assert!(request_has_credentials(&[(
+            "Cookie".into(),
+            "sid=1".into()
+        )]));
         assert!(request_has_credentials(&[(
             "authorization".into(),
             "Bearer x".into()
         )]));
         assert!(!request_has_credentials(&[("accept".into(), "*/*".into())]));
-        assert!(response_has_set_cookie(&[("SET-COOKIE".into(), "a=1".into())]));
+        assert!(response_has_set_cookie(&[(
+            "SET-COOKIE".into(),
+            "a=1".into()
+        )]));
         assert!(!response_has_set_cookie(&[("cookie".into(), "a=1".into())]));
     }
 
@@ -622,10 +628,7 @@ mod tests {
             vec![("Vary".into(), "Accept-Encoding, X-Api-Key".into())],
             vec![("Vary".into(), "*".into())],
         ] {
-            assert!(
-                response_forbids_copy(&bad).is_some(),
-                "必须拒绝：{bad:?}"
-            );
+            assert!(response_forbids_copy(&bad).is_some(), "必须拒绝：{bad:?}");
         }
     }
 

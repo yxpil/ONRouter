@@ -133,7 +133,14 @@ impl Entry {
     }
 
     /// 提升回内存的条目要带走冷层记录的热度历史，否则"热→冷→热"每轮都从零开始计数
-    fn promoted(value: Vec<u8>, expires_at: Option<f64>, last_used: u64, cost: usize, now: f64, freq: f32) -> Self {
+    fn promoted(
+        value: Vec<u8>,
+        expires_at: Option<f64>,
+        last_used: u64,
+        cost: usize,
+        now: f64,
+        freq: f32,
+    ) -> Self {
         let mut e = Entry::new(value, expires_at, last_used, cost, now);
         e.freq = freq.max(1.0);
         e
@@ -624,12 +631,7 @@ impl SharedZone {
         // 检查空间（add 不淘汰，直接失败）
         let net = cost.saturating_sub(old_cost);
         if self.inner.capacity > 0
-            && self
-                .inner
-                .used
-                .load(Ordering::Relaxed)
-                .saturating_add(net)
-                > self.inner.capacity
+            && self.inner.used.load(Ordering::Relaxed).saturating_add(net) > self.inner.capacity
         {
             return Err("no memory".to_string());
         }
@@ -746,10 +748,7 @@ impl SharedZone {
         if let Some(r) = self.inner.add_into(&mut map, key, delta, now, "incr") {
             return r;
         }
-        if let Some(prev) = map.insert(
-            key.to_string(),
-            Entry::new(val, None, tick, cost, now),
-        ) {
+        if let Some(prev) = map.insert(key.to_string(), Entry::new(val, None, tick, cost, now)) {
             self.inner.release(prev.cost); // 覆盖的是过期项
         }
         self.inner.used.fetch_add(cost, Ordering::Relaxed);
@@ -868,15 +867,8 @@ impl SharedZone {
 
     /// 总条目数（含过期）：内存 + 冷层
     pub fn num(&self) -> usize {
-        let n: usize = (0..SHARDS)
-            .map(|i| self.inner.lock_slot(i).len())
-            .sum();
-        n + self
-            .inner
-            .disk
-            .as_ref()
-            .map(|d| d.entries())
-            .unwrap_or(0)
+        let n: usize = (0..SHARDS).map(|i| self.inner.lock_slot(i).len()).sum();
+        n + self.inner.disk.as_ref().map(|d| d.entries()).unwrap_or(0)
     }
 
     /// 容量上限（字节）——**只算内存层**，见模块头的兼容性偏离说明
@@ -1007,7 +999,9 @@ impl SharedZone {
         e.last_used = self.inner.tick();
         e.note_hit(now);
         if new_cost >= old_cost {
-            self.inner.used.fetch_add(new_cost - old_cost, Ordering::Relaxed);
+            self.inner
+                .used
+                .fetch_add(new_cost - old_cost, Ordering::Relaxed);
         } else {
             self.inner.release(old_cost - new_cost);
         }
@@ -1053,13 +1047,11 @@ impl SharedDicts {
             let name = d
                 .arg(0)
                 .ok_or_else(|| AppError::Other("lua_shared_dict 缺少名称".into()))?;
-            let size_str = d
-                .arg(1)
-                .ok_or_else(|| {
-                    AppError::Other(format!(
-                        "lua_shared_dict {name} 缺少容量大小（如 1m / 10k）"
-                    ))
-                })?;
+            let size_str = d.arg(1).ok_or_else(|| {
+                AppError::Other(format!(
+                    "lua_shared_dict {name} 缺少容量大小（如 1m / 10k）"
+                ))
+            })?;
             let capacity = parse_size(size_str).ok_or_else(|| {
                 AppError::Other(format!(
                     "lua_shared_dict {name}: 非法的容量大小 '{size_str}'"
@@ -1191,9 +1183,11 @@ impl SharedDicts {
 
         let mut zones = HashMap::new();
         for (name, capacity, cfg) in specs {
-            let store = cfg
-                .as_ref()
-                .and_then(|_| cold.iter().find(|(n, _)| *n == name).map(|(_, s)| s.clone()));
+            let store = cfg.as_ref().and_then(|_| {
+                cold.iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, s)| s.clone())
+            });
             zones.insert(name.clone(), SharedZone::new(capacity, store));
         }
         let dicts = SharedDicts { zones };
@@ -1227,7 +1221,9 @@ pub fn governor_zone(name: &str) -> Option<SharedZone> {
 /// How many declared zones carry a `disk=` cold tier — the `-t` input for the
 /// "deep sleep tier but nothing can actually be demoted" advisory.
 pub fn governor_disk_zone_count() -> usize {
-    let Some(lock) = GOV_ZONES.get() else { return 0 };
+    let Some(lock) = GOV_ZONES.get() else {
+        return 0;
+    };
     lock.read()
         .unwrap_or_else(|e| e.into_inner())
         .values()
@@ -1334,8 +1330,12 @@ mod tests {
         assert!(z.get("b").is_some());
         assert!(z.get("c").is_some());
         // 再塞一个大条目（cost=64+1+40=105），208+105>300，触发一次近似 LRU 淘汰
-        z.set("d", b"this_is_a_longer_value_to_force_eviction".to_vec(), None)
-            .unwrap();
+        z.set(
+            "d",
+            b"this_is_a_longer_value_to_force_eviction".to_vec(),
+            None,
+        )
+        .unwrap();
         // 近似 LRU 淘汰目标不确定，但新写入的 d 一定在，且总占用被压回容量以内
         assert!(z.get("d").is_some());
         assert!(z.num() <= 3);
@@ -1417,7 +1417,7 @@ mod tests {
     #[test]
     fn force_set_oversized_is_best_effort() {
         let z = zone(10); // 单项 cost 远超容量
-        // force_set 不报错、也不落库（对标 force 语义）
+                          // force_set 不报错、也不落库（对标 force 语义）
         assert!(z.force_set("big", vec![0u8; 100], None).is_ok());
         assert!(!z.key_present("big"));
     }
@@ -1490,8 +1490,8 @@ mod tests {
         // 当需要淘汰时，b 应该先被选中（last_used 更小）
         // 这个测试是概率性的（采样 8 个），但在只有 2 个 entry 的小字典里几乎确定
         z.set("c", vec![0u8; 200], None).unwrap(); // 可能触发淘汰
-        // b 可能被淘汰，a 更可能保留
-        // 不做硬断言，只验证不 panic
+                                                   // b 可能被淘汰，a 更可能保留
+                                                   // 不做硬断言，只验证不 panic
     }
 
     #[test]
@@ -1499,11 +1499,18 @@ mod tests {
         let z = zone(1024);
         z.set("forever", b"v".to_vec(), Some(0.0)).unwrap();
         assert!(z.key_present("forever"));
-        assert_eq!(z.ttl("forever"), Some(-1.0), "exptime=0 对标 OpenResty：永不过期");
+        assert_eq!(
+            z.ttl("forever"),
+            Some(-1.0),
+            "exptime=0 对标 OpenResty：永不过期"
+        );
 
         z.set("dead", b"v".to_vec(), Some(-1.0)).unwrap();
         assert!(!z.key_present("dead"), "负 exptime 应立即过期");
-        assert!(z.get_stale_flagged("dead").1, "过期项仍可 get_stale 读取并标记 stale");
+        assert!(
+            z.get_stale_flagged("dead").1,
+            "过期项仍可 get_stale 读取并标记 stale"
+        );
 
         assert_eq!(z.add("forever", b"new".to_vec(), None), Ok(false));
         assert_eq!(z.get("forever"), Some(b"v".to_vec()), "未过期项 add 应失败");
@@ -1517,10 +1524,8 @@ mod tests {
     fn tmpdir(name: &str) -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!(
-            "onrouter-dict-{}-{n}-{name}",
-            std::process::id()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("onrouter-dict-{}-{n}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
     }
@@ -1599,11 +1604,24 @@ mod tests {
             "each record carries the reclaimed byte count for the governor"
         );
         s.flush_pending();
-        assert_eq!(z.num(), 2, "after demotion the entries live in the cold tier");
-        assert!(s.has("a") && s.has("b"), "forced spill must not hit the frequency gate");
-        assert!(z.governor_prewarm("a"), "pre-warm must bring the cold entry back");
+        assert_eq!(
+            z.num(),
+            2,
+            "after demotion the entries live in the cold tier"
+        );
+        assert!(
+            s.has("a") && s.has("b"),
+            "forced spill must not hit the frequency gate"
+        );
+        assert!(
+            z.governor_prewarm("a"),
+            "pre-warm must bring the cold entry back"
+        );
         assert_eq!(z.get("a"), Some(V_A.to_vec()));
-        assert!(!z.governor_prewarm("never-existed"), "absent keys answer false");
+        assert!(
+            !z.governor_prewarm("never-existed"),
+            "absent keys answer false"
+        );
         s.flush_pending();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1625,9 +1643,16 @@ mod tests {
         // 默认阈值 3：只写过一次的 key（freq=1）落盘没有意义
         let (z, s) = disk_zone(dir.clone(), 3.0);
         spill_one(&z, &s);
-        assert!(!s.has("a"), "低频一次性数据淘汰即丢弃，否则磁盘会被垃圾写满");
+        assert!(
+            !s.has("a"),
+            "低频一次性数据淘汰即丢弃，否则磁盘会被垃圾写满"
+        );
         assert_eq!(s.stats().spilled.load(Ordering::Relaxed), 0);
-        assert_eq!(z.get("a"), None, "没落盘就是真没了，内存语义与不配 disk= 一致");
+        assert_eq!(
+            z.get("a"),
+            None,
+            "没落盘就是真没了，内存语义与不配 disk= 一致"
+        );
         assert_eq!(
             s.stats().spill_skipped.load(Ordering::Relaxed),
             1,
@@ -1666,7 +1691,11 @@ mod tests {
         assert_eq!(z.size(), 12, "size 含冷层存活 value");
         assert!(z.key_present("a"), "key_present 要能答冷层的 key");
         assert_eq!(z.ttl("a"), Some(-1.0), "冷层 TTL 只查索引");
-        assert_eq!(z.capacity(), 130, "capacity/free_space 保持 OpenResty 的内存层语义");
+        assert_eq!(
+            z.capacity(),
+            130,
+            "capacity/free_space 保持 OpenResty 的内存层语义"
+        );
         assert_eq!(z.free_space(), 130 - 71);
         let (mut keys, more) = z.get_keys(10);
         assert!(!more);
@@ -1682,7 +1711,10 @@ mod tests {
         let (z, s) = disk_zone(dir.clone(), 0.0);
         spill_one(&z, &s);
         z.delete("a");
-        assert!(!s.has("a"), "delete 必须连冷层一起注销，否则删掉的 key 还能读回来");
+        assert!(
+            !s.has("a"),
+            "delete 必须连冷层一起注销，否则删掉的 key 还能读回来"
+        );
         assert_eq!(z.get("a"), None);
         // "b" 在 delete 后仍占内存，再写两条把它挤下盘
         z.set("c", V_A.to_vec(), None).unwrap();
@@ -1713,7 +1745,11 @@ mod tests {
         s.flush_pending();
         assert!(s.has("e"));
         std::thread::sleep(std::time::Duration::from_millis(320));
-        assert_eq!(z.flush_expired(), 1, "过期的冷条目也要被 flush_expired 收走");
+        assert_eq!(
+            z.flush_expired(),
+            1,
+            "过期的冷条目也要被 flush_expired 收走"
+        );
         assert!(!s.has("e"));
         assert_eq!(s.entries(), 0, "过期的冷条目要真的从索引里摘掉");
         assert!(z.get("f").is_some(), "没过期的一条不能陪葬");
@@ -1754,7 +1790,10 @@ mod tests {
         let (z, s) = disk_zone(dir.clone(), 0.0);
         spill_one(&z, &s);
         assert!(s.has("a"));
-        assert!(z.expire("a", 60.0), "对住在冷层的 key 调 expire 不能静默失效");
+        assert!(
+            z.expire("a", 60.0),
+            "对住在冷层的 key 调 expire 不能静默失效"
+        );
         assert!(z.ttl("a").unwrap() > 50.0);
         assert!(!s.has("a"), "expire 走提升路径，冷层副本应当随之注销");
         s.flush_pending();
@@ -1795,7 +1834,11 @@ mod tests {
         z.set("m", b"0".to_vec(), None).unwrap();
         s.flush_pending();
         assert!(s.has("n"), "先确认 n 已被挤进冷层");
-        assert_eq!(z.incr("n", 1, Some(0)).unwrap(), 42, "磁盘上的计数也要接着数");
+        assert_eq!(
+            z.incr("n", 1, Some(0)).unwrap(),
+            42,
+            "磁盘上的计数也要接着数"
+        );
         assert!(!s.has("n"), "提升后冷层副本注销");
         assert_eq!(z.incr("fresh", 3, Some(10)).unwrap(), 13);
         assert!(
@@ -1814,7 +1857,11 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = tmpdir("parse");
         let base = dir.parent().unwrap().to_path_buf();
-        let rel = dir.file_name().unwrap().to_string_lossy().replace('\\', "/");
+        let rel = dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         let ok = format!(
             "lua_shared_dict hot 1m disk={rel} max_disk=1m levels=1:2 inactive=5m spill_after=2 max_value=8k;\nlua_shared_dict plain 1m;\n"
         );
@@ -1828,14 +1875,18 @@ mod tests {
         );
         let snap = disk_cache::snapshot();
         assert!(
-            snap.iter().any(|(n, st)| n == "hot" && st.config().max_bytes == 1024 * 1024),
+            snap.iter()
+                .any(|(n, st)| n == "hot" && st.config().max_bytes == 1024 * 1024),
             "只有写了 disk= 的区进冷层登记，参数要按配置生效"
         );
         assert!(!snap.iter().any(|(n, _)| n == "plain"));
         for (bad, needle) in [
             ("lua_shared_dict x 1m disk=;", "需要冷层根目录路径"),
             ("lua_shared_dict x 1m disk=a/b max_disk=0;", "max_disk=0"),
-            ("lua_shared_dict a 1m disk=dup;\nlua_shared_dict b 1m disk=./dup;", "根目录"),
+            (
+                "lua_shared_dict a 1m disk=dup;\nlua_shared_dict b 1m disk=./dup;",
+                "根目录",
+            ),
             ("lua_shared_dict x 1m disk=a/b bogus=1;", "未知参数"),
             ("lua_shared_dict x 1m max_disk=1m;", "需要先写 disk="),
             ("lua_shared_dict x 1m 512m;", "多余参数"),
@@ -1846,7 +1897,10 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("{bad} 应启动失败"));
             let msg = err.to_string();
-            assert!(msg.contains(needle), "{bad} 的报错该含 {needle}，实际：{msg}");
+            assert!(
+                msg.contains(needle),
+                "{bad} 的报错该含 {needle}，实际：{msg}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

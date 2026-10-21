@@ -26,8 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use onrouter_config::Directive;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{log_error, log_info, log_warn};
 use crate::AppError;
+use crate::{log_error, log_info, log_warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadBalance {
@@ -470,7 +470,9 @@ impl Upstream {
         if let Some(interval) = self.lazy_rejoin {
             if let Some(idx) = self.pick_lazy_probe(now, tried, interval) {
                 self.servers[idx].lazy_last_ms.store(now, Ordering::Relaxed);
-                self.servers[idx].lazy_probes.fetch_add(1, Ordering::Relaxed);
+                self.servers[idx]
+                    .lazy_probes
+                    .fetch_add(1, Ordering::Relaxed);
                 self.servers[idx].conns.fetch_add(1, Ordering::Relaxed);
                 return Some(UpstreamGuard {
                     upstream: Arc::clone(self),
@@ -578,9 +580,7 @@ impl Upstream {
         (0..self.servers.len())
             .filter(|i| self.servers[*i].backup == backup_group)
             .filter(|i| !tried.contains(i))
-            .filter(|i| {
-                self.servers[*i].selectable(self.circuit.as_ref(), now)
-            })
+            .filter(|i| self.servers[*i].selectable(self.circuit.as_ref(), now))
             .collect()
     }
 
@@ -918,18 +918,15 @@ impl Upstream {
 
 /// 一次探测：TCP 必须连通；配了 `uri=` 还要在同一连接上读完状态行并要求 2xx/3xx
 async fn probe(addr: &str, hc: &HealthCheck) -> bool {
-    let connected =
-        tokio::time::timeout(hc.timeout, tokio::net::TcpStream::connect(addr)).await;
+    let connected = tokio::time::timeout(hc.timeout, tokio::net::TcpStream::connect(addr)).await;
     let Ok(Ok(stream)) = connected else {
         return false;
     };
     match hc.uri.as_deref() {
         None => true,
-        Some(uri) => {
-            tokio::time::timeout(hc.timeout, http_probe(stream, addr, uri))
-                .await
-                .unwrap_or(false)
-        }
+        Some(uri) => tokio::time::timeout(hc.timeout, http_probe(stream, addr, uri))
+            .await
+            .unwrap_or(false),
     }
 }
 
@@ -1077,12 +1074,13 @@ impl UpstreamPool {
                     let v = child.arg(0).ok_or_else(|| {
                         AppError::Other(format!("upstream {name}: keepalive 需要一个正整数参数"))
                     })?;
-                    keepalive.max_idle =
-                        Some(strict_positive(v, &name, "keepalive")?);
+                    keepalive.max_idle = Some(strict_positive(v, &name, "keepalive")?);
                 }
                 "keepalive_timeout" => {
                     let v = child.arg(0).ok_or_else(|| {
-                        AppError::Other(format!("upstream {name}: keepalive_timeout 需要一个时长参数"))
+                        AppError::Other(format!(
+                            "upstream {name}: keepalive_timeout 需要一个时长参数"
+                        ))
                     })?;
                     keepalive.idle_timeout = Some(parse_duration(v).ok_or_else(|| {
                         AppError::Other(format!("upstream {name}: keepalive_timeout={v} 非法"))
@@ -1091,7 +1089,9 @@ impl UpstreamPool {
                 "server" => {
                     let addr = child
                         .arg(0)
-                        .ok_or_else(|| AppError::Other(format!("upstream {name} 的 server 缺少地址")))?
+                        .ok_or_else(|| {
+                            AppError::Other(format!("upstream {name} 的 server 缺少地址"))
+                        })?
                         .to_string();
                     let mut weight = 1usize;
                     let mut max_fails = 1usize;
@@ -1113,17 +1113,20 @@ impl UpstreamPool {
                                     )));
                                 }
                             }
-                            ("max_fails", Some(v)) => max_fails = strict_positive(v, &name, "max_fails")?,
+                            ("max_fails", Some(v)) => {
+                                max_fails = strict_positive(v, &name, "max_fails")?
+                            }
                             ("fail_timeout", Some(v)) => {
-                                fail_timeout = parse_seconds(v)
-                                    .filter(|x| *x > 0.0)
-                                    .ok_or_else(|| {
+                                fail_timeout =
+                                    parse_seconds(v).filter(|x| *x > 0.0).ok_or_else(|| {
                                         AppError::Other(format!(
                                             "upstream {name}: fail_timeout={v} 非法"
                                         ))
                                     })?
                             }
-                            ("max_conns", Some(v)) => max_conns = strict_positive(v, &name, "max_conns")?,
+                            ("max_conns", Some(v)) => {
+                                max_conns = strict_positive(v, &name, "max_conns")?
+                            }
                             ("backup", None) => backup = true,
                             ("down", None) => down = true,
                             _ => {
@@ -1269,11 +1272,7 @@ fn strict_positive(v: &str, up: &str, key: &str) -> Result<usize, AppError> {
         .parse::<usize>()
         .ok()
         .filter(|n| *n > 0)
-        .ok_or_else(|| {
-            AppError::Other(format!(
-                "upstream {up}: {key}={v} 必须是正整数"
-            ))
-        })
+        .ok_or_else(|| AppError::Other(format!("upstream {up}: {key}={v} 必须是正整数")))
 }
 
 /// 接受 `10s` / `10` / `500ms` / `1m`
@@ -1297,10 +1296,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
         .map(Duration::from_secs_f64)
 }
 
-fn parse_circuit_breaker(
-    d: &Directive,
-    up_name: &str,
-) -> Result<Option<CircuitBreaker>, AppError> {
+fn parse_circuit_breaker(d: &Directive, up_name: &str) -> Result<Option<CircuitBreaker>, AppError> {
     match (d.args.len(), d.arg(0)) {
         (1, Some(v)) if v.eq_ignore_ascii_case("off") => return Ok(None),
         (0, _) => return Ok(Some(CircuitBreaker::default())),
@@ -1375,14 +1371,24 @@ fn parse_health_check(d: &Directive, up_name: &str) -> Result<HealthCheck, AppEr
                 })?
             }
             ("fails", v) => {
-                hc.fails = v.trim().parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
-                    AppError::Other(format!("upstream {up_name}: fails={v} 必须是正整数"))
-                })?
+                hc.fails = v
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        AppError::Other(format!("upstream {up_name}: fails={v} 必须是正整数"))
+                    })?
             }
             ("rises", v) => {
-                hc.rises = v.trim().parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
-                    AppError::Other(format!("upstream {up_name}: rises={v} 必须是正整数"))
-                })?
+                hc.rises = v
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        AppError::Other(format!("upstream {up_name}: rises={v} 必须是正整数"))
+                    })?
             }
             ("uri", v) => {
                 if !v.starts_with('/') {
@@ -1445,9 +1451,7 @@ mod tests {
     #[test]
     fn swrr_reproduces_nginx_weighted_sequence() {
         // weight=5/1/1：SWRR 的轨迹是 a a b a c a a，一轮之后 current_weight 全部归零
-        let up = upstream(
-            "server a weight=5; server b weight=1; server c weight=1; ",
-        );
+        let up = upstream("server a weight=5; server b weight=1; server c weight=1; ");
         let seq: Vec<String> = (0..7).map(|_| pick_release(&up)).collect();
         assert_eq!(
             seq,
@@ -1460,7 +1464,11 @@ mod tests {
         // 等权重的两台必须严格交替
         let up = upstream("server a; server b; ");
         let alt: Vec<String> = (0..6).map(|_| pick_release(&up)).collect();
-        assert_eq!(alt, vec!["a", "b", "a", "b", "a", "b"], "等权重应交替: {alt:?}");
+        assert_eq!(
+            alt,
+            vec!["a", "b", "a", "b", "a", "b"],
+            "等权重应交替: {alt:?}"
+        );
     }
 
     /// 强制选中某个下标的节点（把它以外的都标成已试过），用来精确制造失败
@@ -1487,7 +1495,10 @@ mod tests {
         // fail_timeout 到期后 a 带着完整权重回来
         std::thread::sleep(Duration::from_millis(80));
         let seen: Vec<String> = (0..4).map(|_| pick_release(&up)).collect();
-        assert!(seen.contains(&"a".to_string()), "摘除期过后 a 应重新参与: {seen:?}");
+        assert!(
+            seen.contains(&"a".to_string()),
+            "摘除期过后 a 应重新参与: {seen:?}"
+        );
     }
 
     #[test]
@@ -1502,7 +1513,10 @@ mod tests {
         up.report(0, true);
         assert_eq!(up.servers[0].effective(), 1);
         let seen: Vec<String> = (0..4).map(|_| pick_release(&up)).collect();
-        assert!(seen.contains(&"a".to_string()), "成功后应立刻恢复: {seen:?}");
+        assert!(
+            seen.contains(&"a".to_string()),
+            "成功后应立刻恢复: {seen:?}"
+        );
     }
 
     // ---- circuit_breaker / lazy_rejoin ----
@@ -1520,7 +1534,10 @@ mod tests {
             "第一次失败未到阈值"
         );
         fail_on(&up, 0);
-        assert_eq!(up.servers[0].circuit_state(now_millis()), CircuitState::Open);
+        assert_eq!(
+            up.servers[0].circuit_state(now_millis()),
+            CircuitState::Open
+        );
         assert_eq!(up.servers[0].circuit_trips(), 1);
         assert!(
             up.acquire("10.0.0.1", &[]).is_none(),
@@ -1541,7 +1558,10 @@ mod tests {
             CircuitState::Closed,
             "探针成功应闭合"
         );
-        assert!(up.acquire("10.0.0.1", &[]).is_some(), "闭合后应恢复正常放行");
+        assert!(
+            up.acquire("10.0.0.1", &[]).is_some(),
+            "闭合后应恢复正常放行"
+        );
     }
 
     #[test]
@@ -1551,7 +1571,10 @@ mod tests {
              circuit_breaker errors=1 window=60s open=0.05s; ",
         );
         fail_on(&up, 0);
-        assert_eq!(up.servers[0].circuit_state(now_millis()), CircuitState::Open);
+        assert_eq!(
+            up.servers[0].circuit_state(now_millis()),
+            CircuitState::Open
+        );
         std::thread::sleep(Duration::from_millis(70));
         let probe = up.acquire("10.0.0.1", &[]).expect("半开应放行探针");
         probe.note_failure();
@@ -1600,9 +1623,7 @@ mod tests {
 
     #[test]
     fn config_parses_circuit_breaker_and_lazy_rejoin() {
-        let up = upstream(
-            "server a; circuit_breaker errors=3 window=5s open=7s; lazy_rejoin 5s; ",
-        );
+        let up = upstream("server a; circuit_breaker errors=3 window=5s open=7s; lazy_rejoin 5s; ");
         let cb = up.circuit.clone().expect("应解析出熔断配置");
         assert_eq!(cb.errors, 3);
         assert_eq!(cb.window, Duration::from_secs(5));
@@ -1618,8 +1639,12 @@ mod tests {
         let up = upstream("server a; circuit_breaker; ");
         assert_eq!(up.circuit.clone().unwrap(), CircuitBreaker::default());
         assert!(up.lazy_rejoin.is_none());
-        assert!(upstream("server a; circuit_breaker off; ").circuit.is_none());
-        assert!(upstream("server a; lazy_rejoin off; ").lazy_rejoin.is_none());
+        assert!(upstream("server a; circuit_breaker off; ")
+            .circuit
+            .is_none());
+        assert!(upstream("server a; lazy_rejoin off; ")
+            .lazy_rejoin
+            .is_none());
         assert!(upstream("server a; ").resilience_desc().is_none());
 
         for conf in [
@@ -1679,19 +1704,30 @@ mod tests {
         drop(a);
         // 租约释放后 a 回来
         let seen: Vec<String> = (0..4).map(|_| pick_release(&up)).collect();
-        assert!(seen.contains(&"a".to_string()), "释放额度后应重新参与: {seen:?}");
+        assert!(
+            seen.contains(&"a".to_string()),
+            "释放额度后应重新参与: {seen:?}"
+        );
         // 主组额度满但还有 backup：换节点重试应切到备组，而不是 502
         let up = upstream("server a max_conns=1; server b backup; ");
         let held = up.acquire("10.0.0.1", &[]).unwrap();
         assert_eq!(&*held, "a");
-        let fallback = up.acquire("10.0.0.1", &[0]).expect("主组没额度时应落到 backup");
+        let fallback = up
+            .acquire("10.0.0.1", &[0])
+            .expect("主组没额度时应落到 backup");
         assert_eq!(&*fallback, "b");
         drop((held, fallback));
         // 两组都没有可选节点才返回 None
         let up = upstream("server a max_conns=1; ");
         let held = up.acquire("10.0.0.1", &[]).unwrap();
-        assert!(up.acquire("10.0.0.1", &[0]).is_none(), "唯一节点已试过应无可选");
-        assert!(up.acquire("10.0.0.1", &[]).is_none(), "唯一节点额度已满，不该硬塞");
+        assert!(
+            up.acquire("10.0.0.1", &[0]).is_none(),
+            "唯一节点已试过应无可选"
+        );
+        assert!(
+            up.acquire("10.0.0.1", &[]).is_none(),
+            "唯一节点额度已满，不该硬塞"
+        );
         drop(held);
         assert_eq!(
             up.acquire("10.0.0.1", &[]).map(|g| (*g).clone()),
@@ -1734,13 +1770,19 @@ mod tests {
         s.apply_probe(&hc, false);
         s.apply_probe(&hc, true);
         s.apply_probe(&hc, true);
-        assert!(!s.healthy.load(Ordering::Relaxed), "成功计数被失败打断，未达 rises 不该恢复");
+        assert!(
+            !s.healthy.load(Ordering::Relaxed),
+            "成功计数被失败打断，未达 rises 不该恢复"
+        );
         s.apply_probe(&hc, true);
         assert!(s.healthy.load(Ordering::Relaxed), "连续 3 次成功应恢复");
         assert!(up.acquire("10.0.0.1", &[]).is_some());
         s.apply_probe(&hc, false);
         s.apply_probe(&hc, false);
-        assert!(up.acquire("10.0.0.1", &[]).is_none(), "探测失败期间不该有可选节点");
+        assert!(
+            up.acquire("10.0.0.1", &[]).is_none(),
+            "探测失败期间不该有可选节点"
+        );
     }
 
     #[tokio::test]
@@ -1819,8 +1861,14 @@ mod tests {
         assert_eq!(up2.keepalive.max_idle, None);
         assert_eq!(up2.keepalive.idle_timeout, None);
         // 非法值必须报错，而不是猜一个默认
-        assert!(pool("server a; keepalive; ").is_err(), "keepalive 缺参数应拒绝");
-        assert!(pool("server a; keepalive 0; ").is_err(), "keepalive 必须正整数");
+        assert!(
+            pool("server a; keepalive; ").is_err(),
+            "keepalive 缺参数应拒绝"
+        );
+        assert!(
+            pool("server a; keepalive 0; ").is_err(),
+            "keepalive 必须正整数"
+        );
         assert!(pool("server a; keepalive abc; ").is_err());
         assert!(
             pool("server a; keepalive_timeout abc; ").is_err(),
@@ -1854,15 +1902,18 @@ mod tests {
             "least_time; server a; server b; ",
             "least_time_window; least_time on; server a; server b; ",
         ] {
-            assert!(
-                pool(conf).is_err(),
-                "应当拒绝这份配置: {conf}"
-            );
+            assert!(pool(conf).is_err(), "应当拒绝这份配置: {conf}");
         }
-        assert!(pool("server a; health_check; ").is_ok(), "health_check 允许无参");
+        assert!(
+            pool("server a; health_check; ").is_ok(),
+            "health_check 允许无参"
+        );
         // least_time 与 least_conn/rr 都能搭；单节点池只告警（没有可比的对象，不是错误）
         assert!(pool("least_time on; least_conn; server a; server b; ").is_ok());
-        assert!(pool("least_time on; server a; ").is_ok(), "单节点池应告警而非报错");
+        assert!(
+            pool("least_time on; server a; ").is_ok(),
+            "单节点池应告警而非报错"
+        );
     }
 
     // ---- least_time：自适应上游选择 ----
@@ -1875,7 +1926,11 @@ mod tests {
         assert_eq!(up.servers[0].ewma_seconds(), 0.0, "off 档不该记住任何时延");
         assert_eq!(up.least_time_counters(), (0, 0, 0, 0));
         let seq: Vec<String> = (0..6).map(|_| pick_release(&up)).collect();
-        assert_eq!(seq, vec!["a", "b", "a", "b", "a", "b"], "off 档仍是纯 SWRR: {seq:?}");
+        assert_eq!(
+            seq,
+            vec!["a", "b", "a", "b", "a", "b"],
+            "off 档仍是纯 SWRR: {seq:?}"
+        );
         assert!(up.least_time_desc().is_none(), "off 档不该出现在 -t 输出里");
     }
 
@@ -1947,12 +2002,19 @@ mod tests {
         obs.note_latency(2, 0.002);
         let a: Vec<String> = (0..21).map(|_| pick_release(&off)).collect();
         let b: Vec<String> = (0..21).map(|_| pick_release(&obs)).collect();
-        assert_eq!(a, b, "observe 档的选点必须与 off 完全一致: off={a:?} obs={b:?}");
+        assert_eq!(
+            a, b,
+            "observe 档的选点必须与 off 完全一致: off={a:?} obs={b:?}"
+        );
         let (sampled, picked, would_differ, _cold) = obs.least_time_counters();
         assert_eq!(sampled, 2, "observe 档照常入样");
         assert_eq!(picked, 0, "observe 档不能由分数选点");
         assert!(would_differ > 0, "本会改判的次数就是证据期的产出");
-        assert_eq!(off.least_time_counters(), (0, 0, 0, 0), "off 档一个计数都不写");
+        assert_eq!(
+            off.least_time_counters(),
+            (0, 0, 0, 0),
+            "off 档一个计数都不写"
+        );
     }
 
     #[test]
@@ -1965,7 +2027,10 @@ mod tests {
             up.servers[0].ewma_seconds()
         );
         up.note_latency(1, 0.0);
-        assert!(up.servers[1].ewma_seconds() > 0.0, "0 秒样本不能撞成\"没有样本\"");
+        assert!(
+            up.servers[1].ewma_seconds() > 0.0,
+            "0 秒样本不能撞成\"没有样本\""
+        );
     }
 
     #[test]
@@ -1993,12 +2058,18 @@ mod tests {
         // 单节点池：告警进 warnings 列表（-t 直接打印，启动再落一次 error log），不是错误
         let single = pool("least_time on; server a; ").unwrap();
         assert!(
-            single.warnings.iter().any(|w| w.contains("只有一个可选节点")),
+            single
+                .warnings
+                .iter()
+                .any(|w| w.contains("只有一个可选节点")),
             "单节点池应有告警: {:?}",
             single.warnings
         );
         assert!(
-            pool("least_time on; server a; server b; ").unwrap().warnings.is_empty(),
+            pool("least_time on; server a; server b; ")
+                .unwrap()
+                .warnings
+                .is_empty(),
             "有可比对象时不该出声"
         );
     }

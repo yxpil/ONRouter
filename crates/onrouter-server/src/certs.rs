@@ -38,7 +38,12 @@ pub enum TlsVersion {
 }
 
 impl TlsVersion {
-    const ALL: [TlsVersion; 4] = [TlsVersion::Tls10, TlsVersion::Tls11, TlsVersion::Tls12, TlsVersion::Tls13];
+    const ALL: [TlsVersion; 4] = [
+        TlsVersion::Tls10,
+        TlsVersion::Tls11,
+        TlsVersion::Tls12,
+        TlsVersion::Tls13,
+    ];
 
     /// nginx `ssl_protocols` 里的写法（小写 token）。
     pub fn from_nginx_token(tok: &str) -> Option<TlsVersion> {
@@ -210,8 +215,8 @@ impl SniResolver {
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let f = std::fs::File::open(path)
-        .map_err(|e| format!("打开证书 {} 失败: {e}", path.display()))?;
+    let f =
+        std::fs::File::open(path).map_err(|e| format!("打开证书 {} 失败: {e}", path.display()))?;
     let mut reader = std::io::BufReader::new(f);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
         .collect::<Result<_, _>>()
@@ -223,8 +228,8 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
-    let f = std::fs::File::open(path)
-        .map_err(|e| format!("打开私钥 {} 失败: {e}", path.display()))?;
+    let f =
+        std::fs::File::open(path).map_err(|e| format!("打开私钥 {} 失败: {e}", path.display()))?;
     let mut reader = std::io::BufReader::new(f);
     rustls_pemfile::private_key(&mut reader)
         .map_err(|e| format!("解析私钥 {} 失败: {e}", path.display()))?
@@ -303,7 +308,10 @@ fn parse_der_key(der: Vec<u8>) -> Result<PrivateKeyDer<'static>, String> {
 
 /// ngx.ssl.set_cert_and_key 的落地点：DER 证书链 + DER 私钥 → CertifiedKey。
 /// 同时校验私钥与首张证书匹配，让脚本里的错误在握手中立即暴露。
-pub fn certified_key_from_der(cert_chain: Vec<Vec<u8>>, key_der: Vec<u8>) -> Result<CertifiedKey, String> {
+pub fn certified_key_from_der(
+    cert_chain: Vec<Vec<u8>>,
+    key_der: Vec<u8>,
+) -> Result<CertifiedKey, String> {
     if cert_chain.is_empty() {
         return Err("证书链为空".to_string());
     }
@@ -399,9 +407,10 @@ mod tests {
     use super::*;
 
     fn write_pair(dir: &Path, names: &[&str]) -> (PathBuf, PathBuf) {
-        let cert =
-            rcgen::generate_simple_self_signed(names.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-                .expect("rcgen 生成证书");
+        let cert = rcgen::generate_simple_self_signed(
+            names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .expect("rcgen 生成证书");
         let cp = dir.join(format!("{}-cert.pem", names[0].replace('*', "wild")));
         let kp = dir.join(format!("{}-key.pem", names[0].replace('*', "wild")));
         std::fs::write(&cp, cert.cert.pem()).unwrap();
@@ -470,10 +479,16 @@ mod tests {
             &resolver.choose(Some("API.SPEC.IO")).unwrap()
         ));
         // 通配不覆盖主域本身：spec.io 回落默认
-        assert!(Arc::ptr_eq(&default, &resolver.choose(Some("spec.io")).unwrap()));
+        assert!(Arc::ptr_eq(
+            &default,
+            &resolver.choose(Some("spec.io")).unwrap()
+        ));
         // 无 SNI / 未知 SNI 都用默认证书，而不是让握手失败
         assert!(Arc::ptr_eq(&default, &resolver.choose(None).unwrap()));
-        assert!(Arc::ptr_eq(&default, &resolver.choose(Some("nope.net")).unwrap()));
+        assert!(Arc::ptr_eq(
+            &default,
+            &resolver.choose(Some("nope.net")).unwrap()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -504,7 +519,10 @@ mod tests {
             session: SessionOptions::default(),
         })
         .unwrap();
-        assert_eq!(h2.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        assert_eq!(
+            h2.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
 
         let h1 = build_server_config(&TlsOptions {
             specs: vec![spec],
@@ -558,7 +576,8 @@ mod tests {
 
     #[test]
     fn legacy_only_protocols_rejected_by_rustls_backend() {
-        let dir = std::env::temp_dir().join(format!("onrouter-certs-legacy-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("onrouter-certs-legacy-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (c, k) = write_pair(&dir, &["localhost"]);
         let err = build_server_config(&TlsOptions {
@@ -573,13 +592,17 @@ mod tests {
             },
             session: SessionOptions::default(),
         });
-        assert!(err.is_err(), "仅 TLS1.0/1.1 时 rustls 后端应明确拒绝而非静默降级");
+        assert!(
+            err.is_err(),
+            "仅 TLS1.0/1.1 时 rustls 后端应明确拒绝而非静默降级"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn session_cache_modes_and_ticketer_are_wired() {
-        let dir = std::env::temp_dir().join(format!("onrouter-certs-session-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("onrouter-certs-session-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (c, k) = write_pair(&dir, &["localhost"]);
         let spec = CertSpec {
@@ -657,7 +680,10 @@ mod tests {
             certified_key_from_der(chain.clone(), other.key_pair.serialize_der()).is_err(),
             "私钥错配必须被拒绝"
         );
-        assert!(certified_key_from_der(Vec::new(), key.clone()).is_err(), "空证书链必须拒绝");
+        assert!(
+            certified_key_from_der(Vec::new(), key.clone()).is_err(),
+            "空证书链必须拒绝"
+        );
         // 缓存键随内容变化
         assert_ne!(cert_pair_id(&chain, &key), cert_pair_id(&chain, b"other"));
     }

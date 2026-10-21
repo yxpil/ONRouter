@@ -11,10 +11,10 @@
 //! - `$apr1$<salt>$<hash>`（Apache 变体 MD5-crypt）
 //! crypt(3) 的 DES 与 bcrypt（`$2y$`）暂不支持，见 README roadmap。
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::collections::HashMap;
 use std::time::SystemTime;
 
 // ==================== htpasswd 文件缓存 ====================
@@ -116,9 +116,15 @@ impl IpNet {
     /// `IpNet::all_v4()` / `all_v6()`：匹配对应协议族的任意地址。
     fn any_for(family_v4: bool) -> IpNet {
         if family_v4 {
-            IpNet { addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), bits: 0 }
+            IpNet {
+                addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                bits: 0,
+            }
         } else {
-            IpNet { addr: IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), bits: 0 }
+            IpNet {
+                addr: IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                bits: 0,
+            }
         }
     }
 
@@ -133,7 +139,11 @@ impl IpNet {
         let mut i = 0usize;
         while i < 16 && remaining > 0 {
             let take = if remaining >= 8 { 8 } else { remaining };
-            let mask = if take == 8 { 0xFFu8 } else { (0xFFu8 << (8 - take)) & 0xFF };
+            let mask = if take == 8 {
+                0xFFu8
+            } else {
+                (0xFFu8 << (8 - take)) & 0xFF
+            };
             if (a[i] & mask) != (b[i] & mask) {
                 return false;
             }
@@ -343,8 +353,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 // ==================== base64（标准字母表，容忍填充/换行）====================
 
-const B64_ALPHA: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn b64_decode(input: &str) -> Option<Vec<u8>> {
     // 建反查表
@@ -400,7 +409,6 @@ fn b64_encode(input: &[u8]) -> String {
     }
     out
 }
-
 
 // ==================== SHA-1（RFC 3121）====================
 
@@ -529,10 +537,7 @@ fn md5_digest(msg: &[u8]) -> [u8; 16] {
                 32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
                 _ => (c ^ (b | (!d)), (7 * i) % 16),
             };
-            let f = f
-                .wrapping_add(a)
-                .wrapping_add(MD5_K[i])
-                .wrapping_add(m[g]);
+            let f = f.wrapping_add(a).wrapping_add(MD5_K[i]).wrapping_add(m[g]);
             a = d;
             d = c;
             c = b;
@@ -615,8 +620,7 @@ pub fn md5crypt(password: &[u8], salt: &[u8], magic: &str) -> Option<String> {
     }
 
     // 定长编码：自定义字母表 + 固定字节置换
-    const ITER64: &[u8; 64] =
-        b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const ITER64: &[u8; 64] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let mut hash = String::new();
     let append24 = |hash: &mut String, a: u8, b: u8, c: u8, count: usize| {
         let w = ((a as u32) << 16) | ((b as u32) << 8) | (c as u32);
@@ -632,7 +636,12 @@ pub fn md5crypt(password: &[u8], salt: &[u8], magic: &str) -> Option<String> {
     append24(&mut hash, da[4], da[10], da[5], 4);
     append24(&mut hash, 0, 0, da[11], 2);
 
-    Some(format!("{}{}${}", magic, std::str::from_utf8(salt).ok()?, hash))
+    Some(format!(
+        "{}{}${}",
+        magic,
+        std::str::from_utf8(salt).ok()?,
+        hash
+    ))
 }
 
 #[cfg(test)]
@@ -655,8 +664,14 @@ mod tests {
     #[test]
     fn access_first_match_wins_default_allow() {
         let rules = vec![
-            AccessRule { allow: true, nets: vec![IpNet::parse("127.0.0.1/32").unwrap()] },
-            AccessRule { allow: false, nets: vec![IpNet::any_for(true), IpNet::any_for(false)] },
+            AccessRule {
+                allow: true,
+                nets: vec![IpNet::parse("127.0.0.1/32").unwrap()],
+            },
+            AccessRule {
+                allow: false,
+                nets: vec![IpNet::any_for(true), IpNet::any_for(false)],
+            },
         ];
         assert!(check_access(&rules, "127.0.0.1".parse().unwrap()));
         assert!(!check_access(&rules, "8.8.8.8".parse().unwrap()));
@@ -675,8 +690,7 @@ mod tests {
     fn sha1_known_vector() {
         // RFC 3121: sha1("abc") = a9993e36 4706816a ba3e2571 7850c26c 9cd0d89d
         let got = sha1(b"abc");
-        let expect =
-            hex::decode_bytes("a9993e364706816aba3e25717850c26c9cd0d89d");
+        let expect = hex::decode_bytes("a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(got, expect);
     }
 
@@ -706,12 +720,27 @@ mod tests {
         assert!(verify_password("secret", "secret"));
         assert!(!verify_password("secret", "wrong"));
         // {SHA} base64(sha1("secret")) —— 与 openssl/python 生成的一致
-        assert!(verify_password("{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ=", "secret"));
-        assert!(!verify_password("{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ=", "wrong"));
+        assert!(verify_password(
+            "{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ=",
+            "secret"
+        ));
+        assert!(!verify_password(
+            "{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ=",
+            "wrong"
+        ));
         // md5crypt
-        assert!(verify_password("$1$abcdef12$toTUGmcmirn3PFj.vEnTe1", "secret"));
-        assert!(verify_password("$apr1$abcdef12$OApeybNqWgw1NMEqIdbvf1", "secret"));
-        assert!(!verify_password("$apr1$abcdef12$OApeybNqWgw1NMEqIdbvf1", "wrong"));
+        assert!(verify_password(
+            "$1$abcdef12$toTUGmcmirn3PFj.vEnTe1",
+            "secret"
+        ));
+        assert!(verify_password(
+            "$apr1$abcdef12$OApeybNqWgw1NMEqIdbvf1",
+            "secret"
+        ));
+        assert!(!verify_password(
+            "$apr1$abcdef12$OApeybNqWgw1NMEqIdbvf1",
+            "wrong"
+        ));
     }
 
     #[test]

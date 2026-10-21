@@ -37,7 +37,11 @@ pub struct RealIpConf {
 
 impl Default for RealIpConf {
     fn default() -> Self {
-        RealIpConf { header: "x-real-ip".to_string(), trusted: Vec::new(), recursive: false }
+        RealIpConf {
+            header: "x-real-ip".to_string(),
+            trusted: Vec::new(),
+            recursive: false,
+        }
     }
 }
 
@@ -101,7 +105,9 @@ pub fn parse_ip_chain(value: &str) -> Vec<IpAddr> {
     value
         .split(',')
         .filter_map(|tok| {
-            let t = tok.trim().trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '.' || c == '[' || c == ']'));
+            let t = tok.trim().trim_matches(|c: char| {
+                !(c.is_ascii_alphanumeric() || c == ':' || c == '.' || c == '[' || c == ']')
+            });
             // 先直接尝试裸 IP
             if let Ok(ip) = t.parse::<IpAddr>() {
                 return Some(ip);
@@ -229,7 +235,11 @@ mod tests {
             recursive: false,
         };
         // 可信对端 → 信任头部
-        assert_eq!(conf.resolve(v4("127.0.0.1"), Some("203.0.113.9")).map(|s| s.to_string()), Some("203.0.113.9".into()));
+        assert_eq!(
+            conf.resolve(v4("127.0.0.1"), Some("203.0.113.9"))
+                .map(|s| s.to_string()),
+            Some("203.0.113.9".into())
+        );
         // 不可信对端（外部直连伪造头）→ 保持对端，不改写
         assert_eq!(conf.resolve(v4("8.8.8.8"), Some("1.1.1.1")), None);
     }
@@ -242,14 +252,27 @@ mod tests {
             trusted: trusted.clone(),
             recursive: false,
         };
-        let on = RealIpConf { header: "x-forwarded-for".into(), trusted, recursive: true };
+        let on = RealIpConf {
+            header: "x-forwarded-for".into(),
+            trusted,
+            recursive: true,
+        };
         // 真实客户端 203.0.113.1 → 两跳可信代理 10.0.0.1、10.0.0.2
         let chain = "203.0.113.1, 10.0.0.1, 10.0.0.2";
-        assert_eq!(off.resolve(v4("10.0.0.2"), Some(chain)), Some(v4("10.0.0.2")));
-        assert_eq!(on.resolve(v4("10.0.0.2"), Some(chain)), Some(v4("203.0.113.1")));
+        assert_eq!(
+            off.resolve(v4("10.0.0.2"), Some(chain)),
+            Some(v4("10.0.0.2"))
+        );
+        assert_eq!(
+            on.resolve(v4("10.0.0.2"), Some(chain)),
+            Some(v4("203.0.113.1"))
+        );
         // 整条链都可信 → recursive on 落到最左
         let all_trusted = "10.1.1.1, 10.2.2.2";
-        assert_eq!(on.resolve(v4("10.2.2.2"), Some(all_trusted)), Some(v4("10.1.1.1")));
+        assert_eq!(
+            on.resolve(v4("10.2.2.2"), Some(all_trusted)),
+            Some(v4("10.1.1.1"))
+        );
     }
 
     #[test]
@@ -260,6 +283,9 @@ mod tests {
         conf.trusted = vec![net("127.0.0.0/8")];
         let headers = vec![("X-Real-IP".to_string(), "203.0.113.7".to_string())];
         // 大小写不敏感命中头部（key 存的是 "X-Real-IP"，conf.header 是 "x-real-ip"）
-        assert_eq!(conf.apply(v4("127.0.0.1"), &headers).as_deref(), Some("203.0.113.7"));
+        assert_eq!(
+            conf.apply(v4("127.0.0.1"), &headers).as_deref(),
+            Some("203.0.113.7")
+        );
     }
 }

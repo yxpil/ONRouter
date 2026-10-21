@@ -14,10 +14,10 @@
 //!   （无界通道在日志盘慢时会把内存吃穿）。
 //! - 文件按大小滚动，`reopen()` 兼容外部 logrotate。
 
-use std::path::PathBuf;
-use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use crossbeam_channel::{bounded, Sender, TrySendError};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -167,7 +167,11 @@ impl LogRecord {
                 u.status.to_string(),
                 format!("{:.3}", u.header_time),
             ),
-            Some(u) => (format!("\"{}\"", field(&u.addr)), "-".to_string(), "-".to_string()),
+            Some(u) => (
+                format!("\"{}\"", field(&u.addr)),
+                "-".to_string(),
+                "-".to_string(),
+            ),
             None => ("-".to_string(), "-".to_string(), "-".to_string()),
         };
         format!(
@@ -431,6 +435,9 @@ mod tests {
         );
         rec.set_status(200);
         let line = rec.line();
-        assert!(line.ends_with(" - - -"), "无上游时末尾应为三个占位符: {line}");
+        assert!(
+            line.ends_with(" - - -"),
+            "无上游时末尾应为三个占位符: {line}"
+        );
     }
 }

@@ -183,30 +183,48 @@ pub fn parse_governor(config: &Config) -> Result<(GovernorConf, Vec<String>), St
     }
     if let Some(d) = config.find("cache_governor_low") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
-        conf.low_rps = raw
-            .parse::<f64>()
-            .map_err(|_| format!("line {}: cache_governor_low {raw:?} is not a number (requests per second)", d.line))?;
+        conf.low_rps = raw.parse::<f64>().map_err(|_| {
+            format!(
+                "line {}: cache_governor_low {raw:?} is not a number (requests per second)",
+                d.line
+            )
+        })?;
         if !(0.0..=1_000_000.0).contains(&conf.low_rps) {
-            return Err(format!("line {}: cache_governor_low {raw} out of range 0..1e6", d.line));
+            return Err(format!(
+                "line {}: cache_governor_low {raw} out of range 0..1e6",
+                d.line
+            ));
         }
     }
     if let Some(d) = config.find("cache_governor_high") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
-        conf.high_rps = raw
-            .parse::<f64>()
-            .map_err(|_| format!("line {}: cache_governor_high {raw:?} is not a number (requests per second)", d.line))?;
+        conf.high_rps = raw.parse::<f64>().map_err(|_| {
+            format!(
+                "line {}: cache_governor_high {raw:?} is not a number (requests per second)",
+                d.line
+            )
+        })?;
         if !(0.0..=1_000_000.0).contains(&conf.high_rps) {
-            return Err(format!("line {}: cache_governor_high {raw} out of range 0..1e6", d.line));
+            return Err(format!(
+                "line {}: cache_governor_high {raw} out of range 0..1e6",
+                d.line
+            ));
         }
     }
 
     if let Some(d) = config.find("cache_governor_hold") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
-        let secs: u64 = raw
-            .parse()
-            .map_err(|_| format!("line {}: cache_governor_hold {raw:?} is not a number of seconds", d.line))?;
+        let secs: u64 = raw.parse().map_err(|_| {
+            format!(
+                "line {}: cache_governor_hold {raw:?} is not a number of seconds",
+                d.line
+            )
+        })?;
         if secs == 0 || secs > 86_400 {
-            return Err(format!("line {}: cache_governor_hold {raw} out of range 1..86400 seconds", d.line));
+            return Err(format!(
+                "line {}: cache_governor_hold {raw} out of range 1..86400 seconds",
+                d.line
+            ));
         }
         conf.hold = Duration::from_secs(secs);
     }
@@ -258,11 +276,17 @@ pub fn parse_governor(config: &Config) -> Result<(GovernorConf, Vec<String>), St
 
     if let Some(d) = config.find("cache_governor_lead") {
         let raw = d.args.first().map(String::as_str).unwrap_or("");
-        let secs: u64 = raw
-            .parse()
-            .map_err(|_| format!("line {}: cache_governor_lead {raw:?} is not a number of seconds", d.line))?;
+        let secs: u64 = raw.parse().map_err(|_| {
+            format!(
+                "line {}: cache_governor_lead {raw:?} is not a number of seconds",
+                d.line
+            )
+        })?;
         if secs > 3600 {
-            return Err(format!("line {}: cache_governor_lead {raw} out of range 0..3600 seconds", d.line));
+            return Err(format!(
+                "line {}: cache_governor_lead {raw} out of range 0..3600 seconds",
+                d.line
+            ));
         }
         conf.lead = Duration::from_secs(secs);
     }
@@ -335,9 +359,7 @@ impl DayProfile {
     /// At most one fold per natural minute (see [`Self::last_minute`]).
     fn observe(&self, unix_ms: i64, rps: f64) {
         let minute = unix_ms.div_euclid(60_000);
-        let prev = self
-            .last_minute
-            .swap(minute as u64, Ordering::Relaxed);
+        let prev = self.last_minute.swap(minute as u64, Ordering::Relaxed);
         if prev == minute as u64 {
             return;
         }
@@ -362,7 +384,10 @@ impl DayProfile {
     /// Minutes the governor has actually observed — the honest answer to "has it
     /// learned enough to predict yet".
     fn coverage(&self) -> usize {
-        self.seen.iter().map(|s| (s.load(Ordering::Relaxed) > 0) as usize).sum()
+        self.seen
+            .iter()
+            .map(|s| (s.load(Ordering::Relaxed) > 0) as usize)
+            .sum()
     }
 }
 
@@ -472,20 +497,12 @@ impl Governor {
     /// phase machine (startup spawn or a previous reload).
     pub fn mark_task_started(&self) -> bool {
         self.task_started
-            .compare_exchange(
-                false,
-                true,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
     fn conf_clone(&self) -> GovernorConf {
-        self.conf
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.conf.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn enabled(&self) -> bool {
@@ -629,8 +646,7 @@ impl Governor {
         // Prediction first: the calendar-shaped memory beats the live meter when
         // they disagree, because the whole point is to be early.
         if c.learn && c.lead.as_millis() > 0 {
-            let ahead_minute =
-                DayProfile::minute_of_day(now_ms as i64 + c.lead.as_millis() as i64);
+            let ahead_minute = DayProfile::minute_of_day(now_ms as i64 + c.lead.as_millis() as i64);
             let ahead = self.profile.at(ahead_minute);
             if ahead >= c.high_rps && from != Phase::Boost {
                 return Some(self.switch(from, Phase::Boost, Cause::Predicted, now_ms));
@@ -697,8 +713,10 @@ impl Governor {
         self.phase.store(to as u8, Ordering::Relaxed);
         self.phase_since.store(now_ms, Ordering::Relaxed);
         self.boost_streak.store(0, Ordering::Relaxed);
-        self.boost_predicted
-            .store(to == Phase::Boost && cause == Cause::Predicted, Ordering::Relaxed);
+        self.boost_predicted.store(
+            to == Phase::Boost && cause == Cause::Predicted,
+            Ordering::Relaxed,
+        );
         self.counters.switches.fetch_add(1, Ordering::Relaxed);
         if cause == Cause::Predicted {
             self.counters.predicted.fetch_add(1, Ordering::Relaxed);
@@ -838,7 +856,10 @@ mod tests {
         assert_eq!(g.phase(), Phase::Normal);
         // Tick 2: streak satisfies BOOST_STREAK_TICKS → boost.
         let r = g.advance(t0 + 500);
-        assert!(matches!(r, Some((Phase::Normal, Phase::Boost, Cause::Load, Action::EnterBoost))));
+        assert!(matches!(
+            r,
+            Some((Phase::Normal, Phase::Boost, Cause::Load, Action::EnterBoost))
+        ));
         assert_eq!(g.phase(), Phase::Boost);
     }
 
@@ -857,7 +878,15 @@ mod tests {
         // Drop to 20 rps → below 40 → normal.
         stamp(&g, t0 + 1_500, 20);
         let r = g.advance(t0 + 1_500);
-        assert!(matches!(r, Some((Phase::Boost, Phase::Normal, Cause::Load, Action::EnterNormal))));
+        assert!(matches!(
+            r,
+            Some((
+                Phase::Boost,
+                Phase::Normal,
+                Cause::Load,
+                Action::EnterNormal
+            ))
+        ));
     }
 
     #[test]
@@ -873,9 +902,16 @@ mod tests {
             t += 500;
         }
         let r = g.advance(t);
-        assert!(matches!(r, Some((Phase::Normal, Phase::Sleep, Cause::Load, Action::EnterSleep))));
+        assert!(matches!(
+            r,
+            Some((Phase::Normal, Phase::Sleep, Cause::Load, Action::EnterSleep))
+        ));
         assert_eq!(g.phase(), Phase::Sleep);
-        assert_eq!(g.sweep_interval(), Duration::from_secs(600), "sleep stretches the sweep");
+        assert_eq!(
+            g.sweep_interval(),
+            Duration::from_secs(600),
+            "sleep stretches the sweep"
+        );
     }
 
     #[test]
@@ -895,8 +931,15 @@ mod tests {
         // phase may stay, but the background loop must go back to the stock cadence.
         g.apply(conf(GovernorMode::Observe));
         assert!(g.enabled() && !g.acting());
-        assert_eq!(g.sweep_interval(), Duration::from_secs(60), "observe touches nothing");
-        assert!(!g.should_skip_sweep(), "observe must not skip the sweep either");
+        assert_eq!(
+            g.sweep_interval(),
+            Duration::from_secs(60),
+            "observe touches nothing"
+        );
+        assert!(
+            !g.should_skip_sweep(),
+            "observe must not skip the sweep either"
+        );
     }
 
     #[test]
@@ -915,7 +958,10 @@ mod tests {
         assert_eq!(g.phase(), Phase::Sleep, "exit hysteresis must hold");
         // 10 rps → wake.
         stamp(&g, t + 500, 10);
-        assert!(matches!(g.advance(t + 500), Some((Phase::Sleep, Phase::Normal, _, Action::EnterNormal))));
+        assert!(matches!(
+            g.advance(t + 500),
+            Some((Phase::Sleep, Phase::Normal, _, Action::EnterNormal))
+        ));
     }
 
     #[test]
@@ -927,7 +973,11 @@ mod tests {
         assert_eq!(g.counters.demoted.load(Ordering::Relaxed), 300);
         // Ring capped at 256: the oldest 44 were dropped.
         let batch = g.take_prewarm_batch(1000);
-        assert_eq!(batch.len(), 128, "only on_cold records are pre-warmed, ring cap 256");
+        assert_eq!(
+            batch.len(),
+            128,
+            "only on_cold records are pre-warmed, ring cap 256"
+        );
         assert!(batch.iter().all(|k| k.on_cold));
         assert!(g.take_prewarm_batch(10).is_empty(), "drain-on-read");
     }
@@ -944,17 +994,26 @@ mod tests {
         // Teach the profile across eight different days: one fold per natural
         // minute, so the same minute-of-day needs a new day to fold again.
         for d in 0..8i64 {
-            g.profile.observe(
-                (busy_minute as i64 + d * 1440) * 60_000,
-                100.0,
-            );
+            g.profile
+                .observe((busy_minute as i64 + d * 1440) * 60_000, 100.0);
         }
-        assert!(g.profile.at(busy_minute) >= 50.0, "profile slot learned the busy minute");
+        assert!(
+            g.profile.at(busy_minute) >= 50.0,
+            "profile slot learned the busy minute"
+        );
         // Current load is quiet — only the prediction can move the phase.
         stamp(&g, now_ms, 1);
         let r = g.advance(now_ms);
         assert!(
-            matches!(r, Some((Phase::Normal, Phase::Boost, Cause::Predicted, Action::EnterBoost))),
+            matches!(
+                r,
+                Some((
+                    Phase::Normal,
+                    Phase::Boost,
+                    Cause::Predicted,
+                    Action::EnterBoost
+                ))
+            ),
             "profile said busy ahead; got {r:?}"
         );
         assert_eq!(g.counters.predicted.load(Ordering::Relaxed), 1);
@@ -972,7 +1031,12 @@ mod tests {
         let exit = g.advance(now_ms + 8 * 500);
         assert_eq!(
             exit,
-            Some((Phase::Boost, Phase::Normal, Cause::Load, Action::EnterNormal)),
+            Some((
+                Phase::Boost,
+                Phase::Normal,
+                Cause::Load,
+                Action::EnterNormal
+            )),
             "after hold the quiet meter wins and boost exits"
         );
     }
@@ -990,7 +1054,8 @@ mod tests {
 
     #[test]
     fn parse_rejects_inverted_thresholds_and_orphan_learn() {
-        let src = "events {}\ncache_governor auto;\ncache_governor_low 30;\ncache_governor_high 10;\n";
+        let src =
+            "events {}\ncache_governor auto;\ncache_governor_low 30;\ncache_governor_high 10;\n";
         let cfg = Config::parse(src).unwrap();
         let err = parse_governor(&cfg).unwrap_err();
         assert!(err.contains("must be below"), "{err}");
@@ -1002,7 +1067,9 @@ mod tests {
 
         let src = "events {}\ncache_governor turbo;\n";
         let cfg = Config::parse(src).unwrap();
-        assert!(parse_governor(&cfg).unwrap_err().contains("off | observe | auto"));
+        assert!(parse_governor(&cfg)
+            .unwrap_err()
+            .contains("off | observe | auto"));
     }
 
     #[test]

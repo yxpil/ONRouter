@@ -19,15 +19,17 @@ fn main() {
         sans
     };
 
-    let cert = rcgen::generate_simple_self_signed(subjects.clone())
-        .unwrap_or_else(|e| {
-            eprintln!("[orr-gencert] 生成证书失败: {e}");
-            std::process::exit(1);
-        });
+    let cert = rcgen::generate_simple_self_signed(subjects.clone()).unwrap_or_else(|e| {
+        eprintln!("[orr-gencert] 生成证书失败: {e}");
+        std::process::exit(1);
+    });
 
     write(&cert_path, cert.cert.pem());
     write(&key_path, cert.key_pair.serialize_pem());
-    println!("[orr-gencert] 已生成: {cert_path} + {key_path} (SAN: {})", subjects.join(", "));
+    println!(
+        "[orr-gencert] 已生成: {cert_path} + {key_path} (SAN: {})",
+        subjects.join(", ")
+    );
 }
 
 fn write(path: &str, content: String) {

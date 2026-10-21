@@ -133,11 +133,7 @@ impl Vip {
 
     /// 实占字节（按槽取整）：申领时就把取整差额还了回去，所以与 `claimed` 相等。
     pub fn bytes(&self) -> usize {
-        self.slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
-            * SLOT_BYTES
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).len() * SLOT_BYTES
     }
 
     /// 申领给账本的字节：归还必须用这个数，否则账会越还越乱。
@@ -167,7 +163,9 @@ impl Vip {
             if s.tag != 0 {
                 // 老住户按已经静默的时长折算当前分数；还有分就不许顶
                 let gap = now32.wrapping_sub(s.last_ms) as u64;
-                let rested = s.score.saturating_sub((gap / self.cfg.decay_ms.max(1)) as u8);
+                let rested = s
+                    .score
+                    .saturating_sub((gap / self.cfg.decay_ms.max(1)) as u8);
                 if rested > 0 {
                     self.ev_collision.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -358,7 +356,12 @@ mod tests {
         // 每 100ms 一个请求：都没超限，8 次后晋升
         for i in 0..8u64 {
             v.note("1.2.3.4", Outcome::Passed, (i * 100) as i64);
-            assert_eq!(v.is_vip("1.2.3.4"), i >= 7, "第 {i} 次后的分数 {}", v.score("1.2.3.4"));
+            assert_eq!(
+                v.is_vip("1.2.3.4"),
+                i >= 7,
+                "第 {i} 次后的分数 {}",
+                v.score("1.2.3.4")
+            );
         }
         assert_eq!(v.snapshot().promoted, 1);
         // 攻击者同样打 8 个：一次都没加分，全是拒绝
@@ -430,7 +433,11 @@ mod tests {
         assert_eq!(v.score("a"), 2, "老住户的分数一格不许动");
         assert!(v.is_vip("a"), "一个陌生地址的一个请求不该拆掉 VIP");
         assert_eq!(v.score(&other), 0, "认输的是新来的，也不给它编分数");
-        assert_eq!(v.snapshot().collision, 1, "让路要留计数，看板才看得出表太挤");
+        assert_eq!(
+            v.snapshot().collision,
+            1,
+            "让路要留计数，看板才看得出表太挤"
+        );
     }
 
     /// 老住户彻底静默到 0 分之后，槽位照常可以易主——表不会被历史住户占死。
@@ -459,7 +466,11 @@ mod tests {
         };
         let v = Vip::new(VipConfig::default(), &learning).expect("默认表正好占满预算");
         assert_eq!(budget.used(), v.claimed_bytes());
-        assert_eq!(v.bytes(), v.claimed_bytes(), "按槽取整的差额要还给账本：记的就是实占");
+        assert_eq!(
+            v.bytes(),
+            v.claimed_bytes(),
+            "按槽取整的差额要还给账本：记的就是实占"
+        );
         learning.release_bytes(v.claimed_bytes());
         assert_eq!(budget.used(), 0);
         // 预算不够时不建表：调用方据此把"没学信誉"如实反映到看板上
@@ -475,10 +486,9 @@ mod tests {
     /// 写错的参数只告警并退回默认值，不能让整份配置失效。
     #[test]
     fn directive_parses_every_parameter_and_warns_instead_of_failing() {
-        let cfg = onrouter_config::Config::parse(
-            "learning on; vip_learning table=16k min=9 decay=2m;",
-        )
-        .unwrap();
+        let cfg =
+            onrouter_config::Config::parse("learning on; vip_learning table=16k min=9 decay=2m;")
+                .unwrap();
         let l = Learning::parse_all(&cfg);
         assert!(l.warnings.is_empty(), "{:?}", l.warnings);
         let v = l.vip_cfg().expect("声明了就要解析出来");

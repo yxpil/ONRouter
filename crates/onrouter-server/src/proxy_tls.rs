@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use http::Uri;
-use hyper_util::client::legacy::connect::{Connection, Connected};
+use hyper_util::client::legacy::connect::{Connected, Connection};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -55,7 +55,10 @@ impl ProxyStream {
         }
     }
 
-    fn tls(stream: tokio_rustls::client::TlsStream<TcpStream>, send_timeout: Option<Duration>) -> Self {
+    fn tls(
+        stream: tokio_rustls::client::TlsStream<TcpStream>,
+        send_timeout: Option<Duration>,
+    ) -> Self {
         ProxyStream {
             inner: ProxyStreamInner::Tls(Box::new(stream)),
             send_timeout,
@@ -316,7 +319,9 @@ impl TlsPolicy {
                 let mut kcur = key_data.as_slice();
                 let key = rustls_pemfile::private_key(&mut kcur)
                     .map_err(|e| format!("解析客户端私钥 PEM 失败: {e}"))?
-                    .ok_or_else(|| "proxy_ssl_certificate_key 未含可用私钥（PKCS8/RSA/EC）".to_string())?;
+                    .ok_or_else(|| {
+                        "proxy_ssl_certificate_key 未含可用私钥（PKCS8/RSA/EC）".to_string()
+                    })?;
                 wants_cert
                     .with_client_auth_cert(certs, key)
                     .map_err(|e| format!("配置客户端证书失败: {e}"))?
@@ -397,15 +402,18 @@ pub fn verify_client_config(ca_pem_path: &str) -> Result<Arc<ClientConfig>, Stri
         .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
         .map_err(|e| format!("TLS 协议版本配置失败: {e}"))?;
     let mut store = RootCertStore::empty();
-    let data = std::fs::read(ca_pem_path)
-        .map_err(|e| format!("读取 CA PEM {ca_pem_path} 失败: {e}"))?;
+    let data =
+        std::fs::read(ca_pem_path).map_err(|e| format!("读取 CA PEM {ca_pem_path} 失败: {e}"))?;
     let mut cur = data.as_slice();
     for c in rustls_pemfile::certs(&mut cur) {
         let c = c.map_err(|e| format!("解析 CA PEM 失败: {e}"))?;
         store.add_parsable_certificates([c]);
     }
     if store.is_empty() {
-        return Err("verify=true 需要有效 ca 证书束（本构建为纯 Rust 离线，未链接系统根证书库）".to_string());
+        return Err(
+            "verify=true 需要有效 ca 证书束（本构建为纯 Rust 离线，未链接系统根证书库）"
+                .to_string(),
+        );
     }
     let cfg = builder.with_root_certificates(store).with_no_client_auth();
     Ok(Arc::new(cfg))
@@ -481,18 +489,20 @@ impl tower_service::Service<Uri> for ProxyConnector {
             // 注：proxy_ssl_server_name off 在本实现里是"接受但无效"——纯 Rust rustls 客户端总会发
             //     SNI；需要连 IP 型 https 后端时请用 hostname（README 已注明该限制）。
             let name = ServerName::try_from(sni_host.clone())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("非法 SNI 主机名 {sni_host}: {e}")))?
-                .to_owned();
-            let connector = TlsConnector::from(cfg);
-            let stream = connector
-                .connect(name, tcp)
-                .await
                 .map_err(|e| {
                     io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        format!("后端 TLS 握手失败 {sni_host}: {e}"),
+                        io::ErrorKind::InvalidInput,
+                        format!("非法 SNI 主机名 {sni_host}: {e}"),
                     )
-                })?;
+                })?
+                .to_owned();
+            let connector = TlsConnector::from(cfg);
+            let stream = connector.connect(name, tcp).await.map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("后端 TLS 握手失败 {sni_host}: {e}"),
+                )
+            })?;
             Ok(ProxyStream::tls(stream, send_timeout))
         })
     }
@@ -533,7 +543,10 @@ mod tests {
             client_key: Some(kp.clone()),
             ..Default::default()
         };
-        assert!(policy.build_client_config().is_ok(), "mTLS 客户端配置应构建成功");
+        assert!(
+            policy.build_client_config().is_ok(),
+            "mTLS 客户端配置应构建成功"
+        );
 
         // 仅差客户端证书的策略，指纹必须不同（否则会串池）
         let plain = TlsPolicy {

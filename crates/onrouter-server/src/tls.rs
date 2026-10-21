@@ -114,10 +114,7 @@ fn alpn_is_h2(s: &tokio_rustls::server::TlsStream<TcpStream>) -> bool {
 
 /// 按 SNI 选 server 块的脚本：精确名 > `*.suffix` 通配 > 首个（默认 server）。
 /// 没有 SNI 时和 nginx 一样落到默认 server。
-fn select_script<'a>(
-    scripts: &'a [SslCertScript],
-    sni: Option<&str>,
-) -> Option<&'a SslCertScript> {
+fn select_script<'a>(scripts: &'a [SslCertScript], sni: Option<&str>) -> Option<&'a SslCertScript> {
     let Some(sni) = sni.map(|s| s.to_ascii_lowercase()) else {
         return scripts.first();
     };
@@ -158,12 +155,7 @@ impl RustlsAcceptor {
         {
             return Err(format!("{} 执行失败: {e}", script.directive));
         }
-        let state = shared
-            .lock()
-            .unwrap()
-            .ssl
-            .take()
-            .unwrap_or_default();
+        let state = shared.lock().unwrap().ssl.take().unwrap_or_default();
         if state.aborted {
             return Err(format!(
                 "{} 中止握手（ngx.exit 传入错误码）",
@@ -179,10 +171,7 @@ impl RustlsAcceptor {
                 let ck = certs::certified_key_from_der(chain, key)
                     .map_err(|e| format!("{} 设置的证书无效: {e}", script.directive))?;
                 let resolver = Arc::new(certs::StaticResolver(Arc::new(ck)));
-                let cfg = Arc::new(certs::build_server_config_with(
-                    &self.opts,
-                    resolver,
-                )?);
+                let cfg = Arc::new(certs::build_server_config_with(&self.opts, resolver)?);
                 let mut cache = self.dynamic.lock().unwrap();
                 if cache.len() >= DYNAMIC_CONFIG_CACHE_MAX {
                     cache.clear();
@@ -406,7 +395,9 @@ impl TlsRegistry {
                 if known_quic.contains(&l.addr) {
                     match make_quic_server_config(opts, max_streams) {
                         Ok(cfg) => quic_updates.push((l.addr, cfg)),
-                        Err(e) => crate::log_error!("{} QUIC 热刷新失败，继续使用旧配置: {e}", l.addr),
+                        Err(e) => {
+                            crate::log_error!("{} QUIC 热刷新失败，继续使用旧配置: {e}", l.addr)
+                        }
                     }
                 } else {
                     crate::log_warn!("{} 新增的 QUIC 监听无法在运行期绑定：需重启", l.addr);
@@ -449,8 +440,10 @@ fn build_native(opts: &TlsOptions) -> Result<tokio_native_tls::TlsAcceptor, Stri
         .specs
         .first()
         .ok_or("native TLS：该监听没有配置任何证书")?;
-    let cert = std::fs::read(&spec.cert).map_err(|e| format!("读取证书 {} 失败: {e}", spec.cert.display()))?;
-    let key = std::fs::read(&spec.key).map_err(|e| format!("读取私钥 {} 失败: {e}", spec.key.display()))?;
+    let cert = std::fs::read(&spec.cert)
+        .map_err(|e| format!("读取证书 {} 失败: {e}", spec.cert.display()))?;
+    let key = std::fs::read(&spec.key)
+        .map_err(|e| format!("读取私钥 {} 失败: {e}", spec.key.display()))?;
     let identity = Identity::from_pkcs8(&cert, &key)
         .map_err(|e| format!("native-tls 载入证书/私钥失败（需 PKCS8 PEM）: {e}"))?;
 
@@ -508,7 +501,10 @@ mod tests {
             select_script(&scripts, Some("nope.test")).unwrap().names[0],
             "default.test"
         );
-        assert_eq!(select_script(&scripts, None).unwrap().names[0], "default.test");
+        assert_eq!(
+            select_script(&scripts, None).unwrap().names[0],
+            "default.test"
+        );
         assert!(select_script(&[], Some("x.test")).is_none());
     }
 }

@@ -238,8 +238,12 @@ impl WasmPlugin {
     ) -> Result<Self, String> {
         let bytes = std::fs::read(path)
             .map_err(|e| format!("wasm_plugin {name}: 读取 {} 失败: {e}", path.display()))?;
-        let wasm = decode_source(path, &bytes)
-            .map_err(|e| format!("wasm_plugin {name}: {} 既不是合法 .wasm 也不是 .wat: {e}", path.display()))?;
+        let wasm = decode_source(path, &bytes).map_err(|e| {
+            format!(
+                "wasm_plugin {name}: {} 既不是合法 .wasm 也不是 .wat: {e}",
+                path.display()
+            )
+        })?;
         Self::compile(name, path.to_path_buf(), &wasm, fuel, memory_limit, stats)
     }
 
@@ -332,7 +336,11 @@ impl WasmPlugin {
         let rc = func.call(&mut store, ()).map_err(|e| {
             let fuel = matches!(e.trap_code(), Some(TrapCode::OutOfFuel));
             WasmError {
-                kind: if fuel { WasmErrorKind::Fuel } else { WasmErrorKind::Trap },
+                kind: if fuel {
+                    WasmErrorKind::Fuel
+                } else {
+                    WasmErrorKind::Trap
+                },
                 message: format!(
                     "wasm_plugin {} 在 {} 阶段{}: {e}",
                     self.name,
@@ -346,9 +354,9 @@ impl WasmPlugin {
             }
         })?;
         let flow = match (phase, rc) {
-             (_, 0) => WasmFlow::Continue,
-             (WasmPhase::Access, 1) => WasmFlow::Respond,
-             (WasmPhase::HeaderFilter | WasmPhase::BodyFilter, 1) => WasmFlow::DropBody,
+            (_, 0) => WasmFlow::Continue,
+            (WasmPhase::Access, 1) => WasmFlow::Respond,
+            (WasmPhase::HeaderFilter | WasmPhase::BodyFilter, 1) => WasmFlow::DropBody,
             (_, other) => {
                 return Err(WasmError {
                     kind: WasmErrorKind::Trap,
@@ -458,7 +466,10 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
             true
         }
     });
-    if let Some(slot) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+    if let Some(slot) = headers
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+    {
         slot.1 = value.to_string();
     } else {
         headers.push((name.to_string(), value.to_string()));
@@ -710,7 +721,11 @@ pub fn describe() -> Vec<String> {
 
 // ---------- 请求期入口 ----------
 
-fn apply_headers(ctx_headers: &mut Vec<(String, String)>, set: &[(String, String)], del: &[String]) {
+fn apply_headers(
+    ctx_headers: &mut Vec<(String, String)>,
+    set: &[(String, String)],
+    del: &[String],
+) {
     for name in del {
         del_header(ctx_headers, name);
     }
@@ -747,7 +762,11 @@ pub fn filter(
     if let Some(status) = out.status {
         ctx.status = status;
     }
-    apply_headers(&mut ctx.resp_headers, &out.resp_headers_set, &out.resp_headers_del);
+    apply_headers(
+        &mut ctx.resp_headers,
+        &out.resp_headers_set,
+        &out.resp_headers_del,
+    );
     if let Some(body) = out.body {
         ctx.body = Some(body);
     }
@@ -864,7 +883,8 @@ mod tests {
         );
         let mut ctx = RequestCtx::default();
         ctx.status = 200;
-        ctx.resp_headers.push(("content-type".into(), "text/plain".into()));
+        ctx.resp_headers
+            .push(("content-type".into(), "text/plain".into()));
         ctx.body = Some(b"original".to_vec());
         filter(&hf, WasmPhase::HeaderFilter, &mut ctx).expect("头过滤应成功");
         filter(&bf, WasmPhase::BodyFilter, &mut ctx).expect("体过滤应成功");

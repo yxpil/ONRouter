@@ -197,12 +197,10 @@ impl Budget {
                 self.denied.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
-            match self.used.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .used
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return true,
                 Err(c) => cur = c,
             }
@@ -214,12 +212,10 @@ impl Budget {
         let mut cur = self.used.load(Ordering::Relaxed);
         loop {
             let next = cur.saturating_sub(n);
-            match self.used.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .used
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return,
                 Err(c) => cur = c,
             }
@@ -348,7 +344,9 @@ impl Learning {
         if !self.enabled {
             return None;
         }
-        self.learn_zones.get(zone).map(|s| s.unwrap_or(self.sketch_bytes))
+        self.learn_zones
+            .get(zone)
+            .map(|s| s.unwrap_or(self.sketch_bytes))
     }
 
     /// 该 limit_req 区是否要学突发形状（返回应申领的表字节；None = 不学）。
@@ -521,13 +519,13 @@ fn parse_learning_zone(
     warnings: &mut Vec<String>,
 ) -> Option<(String, Option<usize>)> {
     let Some(zone) = d.arg(0).filter(|s| !s.is_empty()) else {
-        warnings.push(format!(
-            "{directive}（第 {} 行）缺少区名，已忽略",
-            d.line
-        ));
+        warnings.push(format!("{directive}（第 {} 行）缺少区名，已忽略", d.line));
         return None;
     };
-    let raw = d.args.iter().find_map(|a| a.strip_prefix(&format!("{keyword}=")));
+    let raw = d
+        .args
+        .iter()
+        .find_map(|a| a.strip_prefix(&format!("{keyword}=")));
     let size = raw.and_then(parse_size);
     if raw.is_some() && size.is_none() {
         warnings.push(format!(
@@ -742,20 +740,24 @@ mod tests {
 
     #[test]
     fn describe_lists_declared_zones() {
-        let l = Learning::parse_all(&cfg(
-            "learning on;
+        let l = Learning::parse_all(&cfg("learning on;
              learning_memory_budget 1m;
              proxy_cache_learning b sketch=512k;
-             proxy_cache_learning a;",
-        ));
+             proxy_cache_learning a;"));
         let d = l.describe();
         assert_eq!(d.len(), 3, "一行总览 + 两个区，实际 {d:?}");
         assert!(d[0].contains("预算 1048576 B"), "{}", d[0]);
         // 区名排序输出：日志与 -t 摘要必须逐次可比对
         assert!(d[1].contains("zone=a") && d[2].contains("zone=b"), "{d:?}");
-        assert!(d[1].contains(&DEFAULT_SKETCH_BYTES.to_string()), "未写 sketch 用默认");
+        assert!(
+            d[1].contains(&DEFAULT_SKETCH_BYTES.to_string()),
+            "未写 sketch 用默认"
+        );
         assert!(d[2].contains("524288"), "写了 sketch 用声明值");
-        assert!(Learning::default().describe().is_empty(), "默认关闭不占日志");
+        assert!(
+            Learning::default().describe().is_empty(),
+            "默认关闭不占日志"
+        );
     }
 
     /// 账本跨重载延续是硬要求：新配置若换一本新账，在世草图会被重复申领，
@@ -788,12 +790,10 @@ mod tests {
 
     #[test]
     fn parse_enables_declared_learning_zones() {
-        let l = Learning::parse_all(&cfg(
-            "learning on;
+        let l = Learning::parse_all(&cfg("learning on;
              learning_memory_budget 2m;
              proxy_cache_learning c1;
-             proxy_cache_learning c2 sketch=512k;",
-        ));
+             proxy_cache_learning c2 sketch=512k;"));
         assert!(l.enabled);
         assert_eq!(l.budget.total(), 2 * 1024 * 1024);
         assert_eq!(l.zone_wants_learning("c1"), Some(DEFAULT_SKETCH_BYTES));
@@ -811,13 +811,11 @@ mod tests {
 
     #[test]
     fn parse_warns_on_bad_forms_but_still_learns() {
-        let l = Learning::parse_all(&cfg(
-            "learning maybe;
+        let l = Learning::parse_all(&cfg("learning maybe;
              learning on;
              learning_memory_budget banana;
              proxy_cache_learning c1 sketch=also-banana;
-             proxy_cache_learning;",
-        ));
+             proxy_cache_learning;"));
         // `learning maybe` 非法按 off，后面的 `learning on` 仍生效（后写覆盖，与 nginx 一致）
         assert!(l.enabled);
         assert_eq!(l.budget.total(), DEFAULT_BUDGET, "非法预算回落默认");
@@ -838,11 +836,9 @@ mod tests {
 
     #[test]
     fn parse_clamps_oversized_sketch_and_warns() {
-        let l = Learning::parse_all(&cfg(
-            "learning on;
+        let l = Learning::parse_all(&cfg("learning on;
              learning_memory_budget 1m;
-             proxy_cache_learning big sketch=32m;",
-        ));
+             proxy_cache_learning big sketch=32m;"));
         assert!(
             l.warnings.iter().any(|w| w.contains("单区硬顶")),
             "{:?}",
@@ -860,8 +856,14 @@ mod tests {
 
     #[test]
     fn budget_clamped_to_hard_ceiling() {
-        let l = Learning::parse_all(&cfg("learning on; proxy_cache_learning z; learning_memory_budget 64m;"));
+        let l = Learning::parse_all(&cfg(
+            "learning on; proxy_cache_learning z; learning_memory_budget 64m;",
+        ));
         assert_eq!(l.budget.total(), MAX_BUDGET, "超过硬顶要夹住");
-        assert!(l.warnings.iter().any(|w| w.contains("超出可用范围")), "{:?}", l.warnings);
+        assert!(
+            l.warnings.iter().any(|w| w.contains("超出可用范围")),
+            "{:?}",
+            l.warnings
+        );
     }
 }

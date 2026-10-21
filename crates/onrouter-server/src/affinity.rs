@@ -43,9 +43,7 @@ impl AffinityPlan {
                          线程会轮换共享核心（建议 worker_threads <= {cpus}）"
                     ));
                 }
-                (0..workers)
-                    .map(|i| 1u64 << (i % cpus.min(64)))
-                    .collect()
+                (0..workers).map(|i| 1u64 << (i % cpus.min(64))).collect()
             }
             CpuAffinity::Masks(v) => v.clone(),
         };
@@ -65,7 +63,14 @@ impl AffinityPlan {
             }
             *m = if clamped == 0 { 1 } else { clamped };
         }
-        (AffinityPlan { masks, cpus, workers }, warnings)
+        (
+            AffinityPlan {
+                masks,
+                cpus,
+                workers,
+            },
+            warnings,
+        )
     }
 
     /// 第 `idx` 个 worker 线程使用的掩码（显式列表按声明顺序轮换）。
@@ -169,11 +174,7 @@ fn set_current_thread_affinity(mask: u64) -> Result<(), String> {
                 libc::CPU_SET(i, &mut set);
             }
         }
-        let rc = libc::sched_setaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &set,
-        );
+        let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
         if rc == 0 {
             Ok(())
         } else {
@@ -213,7 +214,11 @@ mod tests {
         assert_eq!(plan.mask_for(1), 0b100);
         assert_eq!(plan.mask_for(2), plan.mask_for(2) & valid_mask(plan.cpus));
         assert_eq!(plan.mask_for(3), 0b11, "不足时按声明顺序轮换");
-        assert!(plan.describe().contains("3=[0,1]"), "计划必须展开到最后一个线程：{}", plan.describe());
+        assert!(
+            plan.describe().contains("3=[0,1]"),
+            "计划必须展开到最后一个线程：{}",
+            plan.describe()
+        );
     }
 
     #[test]
