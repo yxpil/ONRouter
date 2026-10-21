@@ -26,12 +26,12 @@ use std::sync::{Arc, Mutex, Weak};
 use bytes::Bytes;
 use mlua::prelude::*;
 use mlua::{AnyUserData, Function, RegistryKey, Thread, ThreadStatus, Variadic};
-use std::pin::Pin;
 use rustls::pki_types::ServerName;
+use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio_rustls::TlsConnector;
 use tokio::sync::{mpsc, oneshot};
+use tokio_rustls::TlsConnector;
 
 use onrouter_config::Config;
 
@@ -56,7 +56,6 @@ pub fn worker_exiting() -> bool {
 /// 请求句柄 userdata：Lua 里所有 ngx.* 都通过它操作当前请求
 #[derive(Clone)]
 struct CtxHandle(Arc<Mutex<RequestCtx>>);
-
 
 impl LuaUserData for CtxHandle {}
 
@@ -312,10 +311,13 @@ fn load_file_cached(p: &PathBuf) -> Result<Arc<str>, AppError> {
         return Ok(Arc::clone(&cached.content));
     }
     let (content, mtime) = read_lua_file(p)?;
-    cache
-        .write()
-        .unwrap()
-        .insert(p.clone(), CachedLua { content: Arc::clone(&content), mtime });
+    cache.write().unwrap().insert(
+        p.clone(),
+        CachedLua {
+            content: Arc::clone(&content),
+            mtime,
+        },
+    );
     Ok(content)
 }
 
@@ -412,13 +414,19 @@ impl AsyncWrite for CosStream {
             CosStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             CosStream::Plain(s) => Pin::new(s).poll_flush(cx),
             CosStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             CosStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
             CosStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
@@ -454,7 +462,10 @@ enum RecvPat {
 }
 
 impl Cosocket {
-    fn new(ev_tx: mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>, op_counter: Arc<AtomicU64>) -> Self {
+    fn new(
+        ev_tx: mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>,
+        op_counter: Arc<AtomicU64>,
+    ) -> Self {
         Cosocket {
             stream: Arc::new(tokio::sync::Mutex::new(None)),
             buf: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -634,51 +645,57 @@ impl LuaUserData for Cosocket {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
         // _start_connect(host, port) -> op id；成功唤醒值 [1]，失败 [nil, err]
         // 优先复用 keepalive 池里同 host:port 的未超时空闲连接（对标 OpenResty setkeepalive 复用）。
-        methods.add_method("_start_connect", |lua, this, (host, port): (String, LuaValue)| {
-            let port = to_u16(lua, &port)?;
-            let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
-            let ev = this.ev_tx.clone();
-            let stream = Arc::clone(&this.stream);
-            let buf = Arc::clone(&this.buf);
-            let peer = Arc::clone(&this.peer);
-            let reused = Arc::clone(&this.reused);
-            let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
-            let key = format!("{host}:{port}");
-            if let Some((s, leftover)) = crate::sockpool::take(&key) {
-                // 命中池：接管已连接流与其残留缓冲，记录 peer，无需握手。
-                reused.store(1, Ordering::Relaxed);
-                let payload = vec![
-                    ResumeVal::Int(1),
-                    ResumeVal::Str("reused".into()),
-                ];
+        methods.add_method(
+            "_start_connect",
+            |lua, this, (host, port): (String, LuaValue)| {
+                let port = to_u16(lua, &port)?;
+                let id = this.op_counter.fetch_add(1, Ordering::Relaxed);
+                let ev = this.ev_tx.clone();
+                let stream = Arc::clone(&this.stream);
+                let buf = Arc::clone(&this.buf);
+                let peer = Arc::clone(&this.peer);
+                let reused = Arc::clone(&this.reused);
+                let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
+                let key = format!("{host}:{port}");
+                if let Some((s, leftover)) = crate::sockpool::take(&key) {
+                    // 命中池：接管已连接流与其残留缓冲，记录 peer，无需握手。
+                    reused.store(1, Ordering::Relaxed);
+                    let payload = vec![ResumeVal::Int(1), ResumeVal::Str("reused".into())];
+                    tokio::spawn(async move {
+                        *stream.lock().await = Some(CosStream::Plain(s));
+                        *buf.lock().await = leftover;
+                        if let Ok(mut p) = peer.lock() {
+                            *p = Some((host, port));
+                        }
+                        let _ = ev.send((id, payload));
+                    });
+                    return Ok(id);
+                }
+                reused.store(0, Ordering::Relaxed);
+                let host2 = host.clone();
                 tokio::spawn(async move {
-                    *stream.lock().await = Some(CosStream::Plain(s));
-                    *buf.lock().await = leftover;
-                    if let Ok(mut p) = peer.lock() {
-                        *p = Some((host, port));
-                    }
+                    let payload =
+                        match tokio::time::timeout(dur, TcpStream::connect((host.as_str(), port)))
+                            .await
+                        {
+                            Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
+                            Ok(Err(e)) => vec![
+                                ResumeVal::Nil,
+                                ResumeVal::Str(format!("connect failed: {e}")),
+                            ],
+                            Ok(Ok(s)) => {
+                                *stream.lock().await = Some(CosStream::Plain(s));
+                                if let Ok(mut p) = peer.lock() {
+                                    *p = Some((host2, port));
+                                }
+                                vec![ResumeVal::Int(1)]
+                            }
+                        };
                     let _ = ev.send((id, payload));
                 });
-                return Ok(id);
-            }
-            reused.store(0, Ordering::Relaxed);
-            let host2 = host.clone();
-            tokio::spawn(async move {
-                let payload = match tokio::time::timeout(dur, TcpStream::connect((host.as_str(), port))).await {
-                    Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
-                    Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("connect failed: {e}"))],
-                    Ok(Ok(s)) => {
-                        *stream.lock().await = Some(CosStream::Plain(s));
-                        if let Ok(mut p) = peer.lock() {
-                            *p = Some((host2, port));
-                        }
-                        vec![ResumeVal::Int(1)]
-                    }
-                };
-                let _ = ev.send((id, payload));
-            });
-            Ok(id)
-        });
+                Ok(id)
+            },
+        );
 
         // _start_send(data) -> op id；成功 [bytes]，失败 [nil, err]
         methods.add_method("_start_send", |lua, this, data: LuaString| {
@@ -694,7 +711,9 @@ impl LuaUserData for Cosocket {
                     None => vec![ResumeVal::Nil, ResumeVal::Str("closed".into())],
                     Some(s) => match tokio::time::timeout(dur, s.write_all(&bytes)).await {
                         Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
-                        Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("send error: {e}"))],
+                        Ok(Err(e)) => {
+                            vec![ResumeVal::Nil, ResumeVal::Str(format!("send error: {e}"))]
+                        }
                         Ok(Ok(())) => vec![ResumeVal::Int(bytes.len() as i64)],
                     },
                 };
@@ -717,24 +736,26 @@ impl LuaUserData for Cosocket {
                 let mut sg = stream.lock().await;
                 let s = match sg.as_mut() {
                     None => {
-                        let _ = ev.send((id, vec![ResumeVal::Nil, ResumeVal::Str("closed".into())]));
+                        let _ =
+                            ev.send((id, vec![ResumeVal::Nil, ResumeVal::Str("closed".into())]));
                         return;
                     }
                     Some(s) => s,
                 };
                 let mut bg = buf.lock().await;
-                let payload = match tokio::time::timeout(dur, recv_into(s, &mut bg, &pat, cap)).await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        // 超时：把已缓冲部分作为 partial 回传
-                        let partial = bg.clone();
-                        vec![
-                            ResumeVal::Nil,
-                            ResumeVal::Str("timeout".into()),
-                            ResumeVal::Bytes(partial),
-                        ]
-                    }
-                };
+                let payload =
+                    match tokio::time::timeout(dur, recv_into(s, &mut bg, &pat, cap)).await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            // 超时：把已缓冲部分作为 partial 回传
+                            let partial = bg.clone();
+                            vec![
+                                ResumeVal::Nil,
+                                ResumeVal::Str("timeout".into()),
+                                ResumeVal::Bytes(partial),
+                            ]
+                        }
+                    };
                 drop(bg);
                 drop(sg);
                 let _ = ev.send((id, payload));
@@ -791,8 +812,8 @@ impl LuaUserData for Cosocket {
                     let mut sg = stream.lock().await;
                     let s = match sg.as_mut() {
                         None => {
-                            let _ =
-                                ev.send((id, vec![ResumeVal::Nil, ResumeVal::Str("closed".into())]));
+                            let _ = ev
+                                .send((id, vec![ResumeVal::Nil, ResumeVal::Str("closed".into())]));
                             return;
                         }
                         Some(s) => s,
@@ -839,19 +860,18 @@ impl LuaUserData for Cosocket {
                     Some(s) => s,
                 };
                 let mut bg = buf.lock().await;
-                let payload = match tokio::time::timeout(dur, recv_until_into(s, &mut bg, &needle))
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(_) => {
-                        let partial = bg.clone();
-                        vec![
-                            ResumeVal::Nil,
-                            ResumeVal::Str("timeout".into()),
-                            ResumeVal::Bytes(partial),
-                        ]
-                    }
-                };
+                let payload =
+                    match tokio::time::timeout(dur, recv_until_into(s, &mut bg, &needle)).await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            let partial = bg.clone();
+                            vec![
+                                ResumeVal::Nil,
+                                ResumeVal::Str("timeout".into()),
+                                ResumeVal::Bytes(partial),
+                            ]
+                        }
+                    };
                 drop(bg);
                 drop(sg);
                 let _ = ev.send((id, payload));
@@ -889,7 +909,9 @@ impl LuaUserData for Cosocket {
                         None => vec![ResumeVal::Nil, ResumeVal::Str("closed".into())],
                         Some(s) => match s.shutdown().await {
                             Ok(()) => vec![ResumeVal::Int(1)],
-                            Err(e) => vec![ResumeVal::Nil, ResumeVal::Str(format!("shutdown: {e}"))],
+                            Err(e) => {
+                                vec![ResumeVal::Nil, ResumeVal::Str(format!("shutdown: {e}"))]
+                            }
                         },
                     };
                     drop(sg);
@@ -913,7 +935,11 @@ impl LuaUserData for Cosocket {
                             ))
                         }
                     },
-                    Err(p) => p.into_inner().as_ref().map(|(h, p)| format!("{h}:{p}")).unwrap_or_default(),
+                    Err(p) => p
+                        .into_inner()
+                        .as_ref()
+                        .map(|(h, p)| format!("{h}:{p}"))
+                        .unwrap_or_default(),
                 };
                 if key.is_empty() {
                     return Ok((
@@ -928,7 +954,9 @@ impl LuaUserData for Cosocket {
                         Some(CosStream::Tls(_)) => {
                             return Ok((
                                 LuaValue::Nil,
-                                LuaValue::String(lua.create_string("tls connections are not pooled")?),
+                                LuaValue::String(
+                                    lua.create_string("tls connections are not pooled")?,
+                                ),
                             ))
                         }
                         None => {
@@ -959,7 +987,9 @@ impl LuaUserData for Cosocket {
                     // OpenResty 拒绝保有待读数据的连接；连接随 s drop 关闭。
                     return Ok((
                         LuaValue::Nil,
-                        LuaValue::String(lua.create_string("pool supports not keeping pending read data")?),
+                        LuaValue::String(
+                            lua.create_string("pool supports not keeping pending read data")?,
+                        ),
                     ));
                 }
                 crate::sockpool::put(
@@ -985,7 +1015,10 @@ impl LuaUserData for Cosocket {
                 let dur = op_timeout(this.timeout_ms.load(Ordering::Relaxed));
                 // 默认 SNI：取已记录的 peer 主机名。
                 let sni = sni.or_else(|| {
-                    this.peer.lock().ok().and_then(|p| p.as_ref().map(|(h, _)| h.clone()))
+                    this.peer
+                        .lock()
+                        .ok()
+                        .and_then(|p| p.as_ref().map(|(h, _)| h.clone()))
                 });
                 let verify = verify.unwrap_or(false);
                 let ca_present = ca.clone();
@@ -1001,10 +1034,8 @@ impl LuaUserData for Cosocket {
                             return;
                         }
                         None => {
-                            let _ = ev.send((
-                                id,
-                                vec![ResumeVal::Nil, ResumeVal::Str("closed".into())],
-                            ));
+                            let _ = ev
+                                .send((id, vec![ResumeVal::Nil, ResumeVal::Str("closed".into())]));
                             return;
                         }
                     };
@@ -1013,15 +1044,19 @@ impl LuaUserData for Cosocket {
                         None => {
                             let _ = ev.send((
                                 id,
-                                vec![ResumeVal::Nil, ResumeVal::Str("no server name for SNI".into())],
+                                vec![
+                                    ResumeVal::Nil,
+                                    ResumeVal::Str("no server name for SNI".into()),
+                                ],
                             ));
                             return;
                         }
                     };
                     let cfg_res = if verify {
                         match ca_present.as_deref() {
-                            Some(path) => crate::proxy_tls::verify_client_config(path)
-                                .map_err(|e| e),
+                            Some(path) => {
+                                crate::proxy_tls::verify_client_config(path).map_err(|e| e)
+                            }
                             None => Err("verify=true 需要 ca 证书束路径".to_string()),
                         }
                     } else {
@@ -1055,7 +1090,10 @@ impl LuaUserData for Cosocket {
                     let payload = match tokio::time::timeout(dur, fut).await {
                         Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
                         Ok(Err(e)) => {
-                            vec![ResumeVal::Nil, ResumeVal::Str(format!("tls handshake failed: {e}"))]
+                            vec![
+                                ResumeVal::Nil,
+                                ResumeVal::Str(format!("tls handshake failed: {e}")),
+                            ]
                         }
                         Ok(Ok(tls)) => {
                             *sg = Some(CosStream::Tls(Box::new(tls)));
@@ -1080,7 +1118,10 @@ pub struct UdpCosocket {
 }
 
 impl UdpCosocket {
-    fn new(ev_tx: mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>, op_counter: Arc<AtomicU64>) -> Self {
+    fn new(
+        ev_tx: mpsc::UnboundedSender<(u64, Vec<ResumeVal>)>,
+        op_counter: Arc<AtomicU64>,
+    ) -> Self {
         UdpCosocket {
             sock: Arc::new(tokio::sync::Mutex::new(None)),
             timeout_ms: Arc::new(AtomicU64::new(5000)),
@@ -1110,7 +1151,10 @@ impl LuaUserData for UdpCosocket {
                     .await
                     {
                         Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
-                        Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("setpeername failed: {e}"))],
+                        Ok(Err(e)) => vec![
+                            ResumeVal::Nil,
+                            ResumeVal::Str(format!("setpeername failed: {e}")),
+                        ],
                         Ok(Ok(s)) => {
                             *sock.lock().await = Some(s);
                             vec![ResumeVal::Int(1)]
@@ -1136,7 +1180,9 @@ impl LuaUserData for UdpCosocket {
                     None => vec![ResumeVal::Nil, ResumeVal::Str("closed".into())],
                     Some(s) => match tokio::time::timeout(dur, s.send(&bytes)).await {
                         Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
-                        Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("send error: {e}"))],
+                        Ok(Err(e)) => {
+                            vec![ResumeVal::Nil, ResumeVal::Str(format!("send error: {e}"))]
+                        }
                         Ok(Ok(n)) => vec![ResumeVal::Int(n as i64)],
                     },
                 };
@@ -1164,7 +1210,9 @@ impl LuaUserData for UdpCosocket {
                         let mut v = vec![0u8; max];
                         match tokio::time::timeout(dur, s.recv(&mut v)).await {
                             Err(_) => vec![ResumeVal::Nil, ResumeVal::Str("timeout".into())],
-                            Ok(Err(e)) => vec![ResumeVal::Nil, ResumeVal::Str(format!("recv error: {e}"))],
+                            Ok(Err(e)) => {
+                                vec![ResumeVal::Nil, ResumeVal::Str(format!("recv error: {e}"))]
+                            }
                             Ok(Ok(n)) => vec![ResumeVal::Bytes(v[..n].to_vec())],
                         }
                     }
@@ -1520,7 +1568,11 @@ const B64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(B64_ALPHABET[(n >> 18 & 63) as usize] as char);
         out.push(B64_ALPHABET[(n >> 12 & 63) as usize] as char);
@@ -1549,7 +1601,10 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    let bytes: Vec<u8> = s.bytes().filter(|&c| c != b'=' && c != b'\r' && c != b'\n').collect();
+    let bytes: Vec<u8> = s
+        .bytes()
+        .filter(|&c| c != b'=' && c != b'\r' && c != b'\n')
+        .collect();
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
     for chunk in bytes.chunks(4) {
         let mut n: u32 = 0;
@@ -1645,10 +1700,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// MD5 摘要核心（纯 Rust，教科书 RFC1321；ring 不提供 MD5，故自实现）。
 fn md5_bytes(data: &[u8]) -> [u8; 16] {
     const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
     let k: [u32; 64] =
         std::array::from_fn(|i| (2f64.powi(32) * ((i as f64 + 1.0).sin().abs())) as u32);
@@ -1661,8 +1715,12 @@ fn md5_bytes(data: &[u8]) -> [u8; 16] {
     }
     msg.extend_from_slice(&bitlen.to_le_bytes());
 
-    let (mut a0, mut b0, mut c0, mut d0) =
-        (0x6745_2301u32, 0xefcd_ab89u32, 0x98ba_dcfeu32, 0x1032_5476u32);
+    let (mut a0, mut b0, mut c0, mut d0) = (
+        0x6745_2301u32,
+        0xefcd_ab89u32,
+        0x98ba_dcfeu32,
+        0x1032_5476u32,
+    );
 
     for chunk in msg.chunks(64) {
         let mut m = [0u32; 16];
@@ -1739,7 +1797,11 @@ fn crc32(data: &[u8]) -> u32 {
         for (i, e) in tab.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *e = c;
         }
@@ -1762,7 +1824,8 @@ fn cookie_time(ts: i64) -> String {
 }
 
 /// ngx.http_time(ts) —— IMF (RFC1123) 时间串 "Wdy, DD Mon YYYY HH:MM:SS GMT"
-fn http_time(ts: i64) -> String {
+/// 也是 `expires` 落 `Expires:` 用的同一种格式（router 那边复用，免得两处日期格式漂移）。
+pub(crate) fn http_time(ts: i64) -> String {
     use chrono::{TimeZone, Utc};
     Utc.timestamp_opt(ts, 0)
         .single()
@@ -1789,7 +1852,6 @@ fn set_request_content_length(ctx: &mut crate::engine::RequestCtx, len: usize) {
     ctx.req_headers
         .push(("content-length".to_string(), len.to_string()));
 }
-
 
 /// 参数值：字符串或布尔标志
 pub enum LuaArgValue {
@@ -1912,7 +1974,8 @@ impl LuaEngine {
                 kills: Vec::new(),
             }));
             {
-                let mut guard = vm.try_lock()
+                let mut guard = vm
+                    .try_lock()
                     .map_err(|_| AppError::Other("Lua VM 启动时被占用".to_string()))?;
                 Self::install_api(
                     &mut guard,
@@ -1976,9 +2039,7 @@ impl LuaEngine {
                 names.join(", ")
             );
         }
-        println!(
-            "[onrouter] Lua VM 池就绪：{n} 个实例（每核心一个，VM 内协程并发多条在途请求）"
-        );
+        println!("[onrouter] Lua VM 池就绪：{n} 个实例（每核心一个，VM 内协程并发多条在途请求）");
         Ok(LuaEngine {
             vms,
             counter: AtomicUsize::new(0),
@@ -2062,7 +2123,11 @@ impl LuaEngine {
                         LuaValue::Integer(n) => n.to_string().into_bytes(),
                         LuaValue::Number(n) => n.to_string().into_bytes(),
                         LuaValue::Boolean(b) => {
-                            if *b { b"true".to_vec() } else { b"false".to_vec() }
+                            if *b {
+                                b"true".to_vec()
+                            } else {
+                                b"false".to_vec()
+                            }
                         }
                         LuaValue::Nil => b"nil".to_vec(),
                         other => format!("{other:?}").into_bytes(),
@@ -2133,19 +2198,19 @@ impl LuaEngine {
                 LuaValue::Integer(n) => {
                     // 数字级别：对齐 OpenResty ngx.STDERR/EMERG/.../DEBUG 常量取值
                     let lvl = match *n {
-                        -1 => crate::log::Level::Debug, // STDERR：当作最详细级落盘
+                        -1 => crate::log::Level::Debug,   // STDERR：当作最详细级落盘
                         0..=2 => crate::log::Level::Crit, // EMERG/ALERT/CRIT
-                        3 => crate::log::Level::Error,  // ERROR
-                        4 => crate::log::Level::Warn,   // WARN
-                        5 => crate::log::Level::Notice, // NOTICE
-                        6 => crate::log::Level::Info,   // INFO
-                        _ => crate::log::Level::Debug,  // DEBUG 及以上
+                        3 => crate::log::Level::Error,    // ERROR
+                        4 => crate::log::Level::Warn,     // WARN
+                        5 => crate::log::Level::Notice,   // NOTICE
+                        6 => crate::log::Level::Info,     // INFO
+                        _ => crate::log::Level::Debug,    // DEBUG 及以上
                     };
                     (lvl, 1)
                 }
                 _ => (crate::log::Level::Info, 0), // 没有级别参数，从第一条开始
             };
-            
+
             let msg = args[start_idx..]
                 .iter()
                 .map(|v| match v {
@@ -2159,7 +2224,7 @@ impl LuaEngine {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            
+
             crate::log::with_log(level, msg);
             Ok(())
         })?;
@@ -2438,73 +2503,87 @@ impl LuaEngine {
         {
             let running = Arc::clone(timer_running);
             let pending = Arc::clone(timer_pending);
-            timer.set("running_count", lua.create_function(move |_, ()| Ok(running.load(Ordering::SeqCst)))?)?;
-            timer.set("pending_count", lua.create_function(move |_, ()| Ok(pending.load(Ordering::SeqCst)))?)?;
+            timer.set(
+                "running_count",
+                lua.create_function(move |_, ()| Ok(running.load(Ordering::SeqCst)))?,
+            )?;
+            timer.set(
+                "pending_count",
+                lua.create_function(move |_, ()| Ok(pending.load(Ordering::SeqCst)))?,
+            )?;
         }
         ngx.set("timer", timer)?;
 
         // ngx.time() / ngx.now()
         let time = lua.create_function(|_, ()| Ok(chrono::Utc::now().timestamp()))?;
         ngx.set("time", time)?;
-        let now = lua.create_function(|_, ()| Ok(chrono::Utc::now().timestamp_millis() as f64 / 1000.0))?;
+        let now =
+            lua.create_function(|_, ()| Ok(chrono::Utc::now().timestamp_millis() as f64 / 1000.0))?;
         ngx.set("now", now)?;
 
         // ngx.header —— 响应头（ngx.header["X"] = "v"；读请求头用 ngx.req）
         let header = lua.create_table()?;
-        let header_set = lua.create_function(move |lua, (name, value): (String, Option<LuaValue>)| {
-            let h = get_ctx(lua)?;
-            let mut ctx = h.0.lock().unwrap();
-            let key = name.to_lowercase();
-            ctx.resp_headers.retain(|(k, _)| k.to_lowercase() != key);
-            match value {
-                Some(LuaValue::String(s)) => {
-                    ctx.resp_headers.push((key, s.to_string_lossy().to_string()));
-                }
-                Some(LuaValue::Integer(n)) => ctx.resp_headers.push((key, n.to_string())),
-                Some(LuaValue::Table(t)) => {
-                    // 表值 = 同名多行（典型：多条 Set-Cookie）
-                    for v in t.sequence_values::<LuaValue>() {
-                        let v = v?;
-                        let bs = lua_value_to_bytes(&v).unwrap_or_default();
+        let header_set =
+            lua.create_function(move |lua, (name, value): (String, Option<LuaValue>)| {
+                let h = get_ctx(lua)?;
+                let mut ctx = h.0.lock().unwrap();
+                let key = name.to_lowercase();
+                ctx.resp_headers.retain(|(k, _)| k.to_lowercase() != key);
+                match value {
+                    Some(LuaValue::String(s)) => {
                         ctx.resp_headers
-                            .push((key.clone(), String::from_utf8_lossy(&bs).into_owned()));
+                            .push((key, s.to_string_lossy().to_string()));
                     }
+                    Some(LuaValue::Integer(n)) => ctx.resp_headers.push((key, n.to_string())),
+                    Some(LuaValue::Table(t)) => {
+                        // 表值 = 同名多行（典型：多条 Set-Cookie）
+                        for v in t.sequence_values::<LuaValue>() {
+                            let v = v?;
+                            let bs = lua_value_to_bytes(&v).unwrap_or_default();
+                            ctx.resp_headers
+                                .push((key.clone(), String::from_utf8_lossy(&bs).into_owned()));
+                        }
+                    }
+                    _ => {} // nil = 删除
                 }
-                _ => {} // nil = 删除
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
         header.set("set", header_set)?;
 
         // ngx.header 元表：让 `ngx.header["X"] = v` / `local v = ngx.header["X"]` 直接读写
         // 响应头（对标 ngx_lua）——赋值路由进 ctx.resp_headers，读取按大小写不敏感回查。
         let header_mt = lua.create_table()?;
-        let header_newindex = lua.create_function(move |lua, (_t, name, value): (LuaTable, String, LuaValue)| {
-            let h = get_ctx(lua)?;
-            let mut ctx = h.0.lock().unwrap();
-            let key = name.to_lowercase();
-            ctx.resp_headers.retain(|(k, _)| k.to_lowercase() != key);
-            match value {
-                LuaValue::String(s) => ctx.resp_headers.push((key, s.to_string_lossy().to_string())),
-                LuaValue::Integer(n) => ctx.resp_headers.push((key, n.to_string())),
-                LuaValue::Number(n) => ctx.resp_headers.push((key, n.to_string())),
-                LuaValue::Boolean(b) => ctx.resp_headers.push((key, b.to_string())),
-                LuaValue::Nil => {} // nil = 删除
-                LuaValue::Table(t) => {
-                    // 表值 = 同名多行（典型：多条 Set-Cookie）
-                    for v in t.sequence_values::<LuaValue>() {
-                        let bs = lua_value_to_bytes(&v?).unwrap_or_default();
+        let header_newindex = lua.create_function(
+            move |lua, (_t, name, value): (LuaTable, String, LuaValue)| {
+                let h = get_ctx(lua)?;
+                let mut ctx = h.0.lock().unwrap();
+                let key = name.to_lowercase();
+                ctx.resp_headers.retain(|(k, _)| k.to_lowercase() != key);
+                match value {
+                    LuaValue::String(s) => ctx
+                        .resp_headers
+                        .push((key, s.to_string_lossy().to_string())),
+                    LuaValue::Integer(n) => ctx.resp_headers.push((key, n.to_string())),
+                    LuaValue::Number(n) => ctx.resp_headers.push((key, n.to_string())),
+                    LuaValue::Boolean(b) => ctx.resp_headers.push((key, b.to_string())),
+                    LuaValue::Nil => {} // nil = 删除
+                    LuaValue::Table(t) => {
+                        // 表值 = 同名多行（典型：多条 Set-Cookie）
+                        for v in t.sequence_values::<LuaValue>() {
+                            let bs = lua_value_to_bytes(&v?).unwrap_or_default();
+                            ctx.resp_headers
+                                .push((key.clone(), String::from_utf8_lossy(&bs).into_owned()));
+                        }
+                    }
+                    other => {
+                        let bs = lua_value_to_bytes(&other).unwrap_or_default();
                         ctx.resp_headers
-                            .push((key.clone(), String::from_utf8_lossy(&bs).into_owned()));
+                            .push((key, String::from_utf8_lossy(&bs).into_owned()));
                     }
                 }
-                other => {
-                    let bs = lua_value_to_bytes(&other).unwrap_or_default();
-                    ctx.resp_headers.push((key, String::from_utf8_lossy(&bs).into_owned()));
-                }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            },
+        )?;
         let header_index = lua.create_function(move |lua, (_t, name): (LuaTable, String)| {
             let h = get_ctx(lua)?;
             let ctx = h.0.lock().unwrap();
@@ -2555,30 +2634,31 @@ impl LuaEngine {
                 _ => Ok(LuaValue::Nil),
             }
         })?;
-        let arg_set = lua.create_function(move |lua, (_, idx, value): (LuaTable, usize, LuaValue)| {
-            let h = get_ctx(lua)?;
-            let mut ctx = h.0.lock().unwrap();
-            match idx {
-                1 => {
-                    // 设置修改后的 chunk
-                    match value {
-                        LuaValue::String(s) => {
-                            ctx.filter_chunk = Some(s.as_bytes().to_vec());
+        let arg_set =
+            lua.create_function(move |lua, (_, idx, value): (LuaTable, usize, LuaValue)| {
+                let h = get_ctx(lua)?;
+                let mut ctx = h.0.lock().unwrap();
+                match idx {
+                    1 => {
+                        // 设置修改后的 chunk
+                        match value {
+                            LuaValue::String(s) => {
+                                ctx.filter_chunk = Some(s.as_bytes().to_vec());
+                            }
+                            LuaValue::Nil => {
+                                ctx.filter_chunk = None;
+                            }
+                            _ => {}
                         }
-                        LuaValue::Nil => {
-                            ctx.filter_chunk = None;
-                        }
-                        _ => {}
                     }
+                    2 => {
+                        // eof 只读，不允许修改
+                        eprintln!("[lua] ngx.arg[2] (eof) is read-only");
+                    }
+                    _ => {}
                 }
-                2 => {
-                    // eof 只读，不允许修改
-                    eprintln!("[lua] ngx.arg[2] (eof) is read-only");
-                }
-                _ => {}
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
         let mt = lua.create_table()?;
         mt.set("__index", arg_get)?;
         mt.set("__newindex", arg_set)?;
@@ -2713,32 +2793,42 @@ impl LuaEngine {
             let ev_tx = ev_tx.clone();
             let counter = Arc::clone(op_counter);
             let slot = Arc::clone(subreq_slot);
-            let capture_start = lua.create_function(move |lua, (uri, method, body): (String, String, Option<LuaString>)| {
-                let h = get_ctx(lua)?;
-                let parent = h.0.lock().unwrap().clone();
-                let id = counter.fetch_add(1, Ordering::Relaxed);
-                let ev = ev_tx.clone();
-                let slot = Arc::clone(&slot);
-                let body = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
-                tokio::spawn(async move {
-                    let payload = match slot.get().and_then(|w| w.upgrade()) {
-                        None => vec![ResumeVal::Nil, ResumeVal::Str("subrequests unavailable".into())],
-                        Some(state) => {
-                            match crate::server::run_capture(&state, &parent, &uri, &method, &body).await {
-                                Ok(r) => vec![ResumeVal::SubReq {
-                                    status: r.status,
-                                    headers: r.headers,
-                                    body: r.body,
-                                }],
-                                Err(e) => vec![ResumeVal::Nil, ResumeVal::Str(e)],
+            let capture_start = lua.create_function(
+                move |lua, (uri, method, body): (String, String, Option<LuaString>)| {
+                    let h = get_ctx(lua)?;
+                    let parent = h.0.lock().unwrap().clone();
+                    let id = counter.fetch_add(1, Ordering::Relaxed);
+                    let ev = ev_tx.clone();
+                    let slot = Arc::clone(&slot);
+                    let body = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
+                    tokio::spawn(async move {
+                        let payload = match slot.get().and_then(|w| w.upgrade()) {
+                            None => vec![
+                                ResumeVal::Nil,
+                                ResumeVal::Str("subrequests unavailable".into()),
+                            ],
+                            Some(state) => {
+                                match crate::server::run_capture(
+                                    &state, &parent, &uri, &method, &body,
+                                )
+                                .await
+                                {
+                                    Ok(r) => vec![ResumeVal::SubReq {
+                                        status: r.status,
+                                        headers: r.headers,
+                                        body: r.body,
+                                    }],
+                                    Err(e) => vec![ResumeVal::Nil, ResumeVal::Str(e)],
+                                }
                             }
-                        }
-                    };
-                    let _ = ev.send((id, payload));
-                });
-                Ok(id)
-            })?;
-            lua.globals().set("_onrouter_capture_start", capture_start)?;
+                        };
+                        let _ = ev.send((id, payload));
+                    });
+                    Ok(id)
+                },
+            )?;
+            lua.globals()
+                .set("_onrouter_capture_start", capture_start)?;
         }
         let location_mod: LuaFunction = lua
             .load(
@@ -2834,30 +2924,31 @@ impl LuaEngine {
         {
             let ctl = Arc::clone(sched_ctl);
             let counter = Arc::clone(co_counter);
-            let spawn = lua.create_function(move |lua_ctx, (func, args): (LuaFunction, LuaTable)| {
-                let owner = lua_ctx
-                    .named_registry_value::<i64>("__cur_owner")
-                    .map(|v| v as u64)
-                    .unwrap_or(0);
-                if owner == 0 {
-                    return Err(mlua::Error::external(
-                        "ngx.thread.spawn 只能在请求协程内调用（无所属请求）",
-                    ));
-                }
-                let tid = counter.fetch_add(1, Ordering::Relaxed);
-                let body: LuaFunction = lua_ctx
-                    .globals()
-                    .get::<LuaFunction>("__thread_body")?
-                    .call((func, args, tid as i64))?;
-                let co = lua_ctx.create_thread(body)?;
-                let thread_key = lua_ctx.create_registry_value(co)?;
-                ctl.lock().unwrap().spawns.push(SpawnReq {
-                    tid,
-                    owner,
-                    thread_key,
-                });
-                Ok(tid as i64)
-            })?;
+            let spawn =
+                lua.create_function(move |lua_ctx, (func, args): (LuaFunction, LuaTable)| {
+                    let owner = lua_ctx
+                        .named_registry_value::<i64>("__cur_owner")
+                        .map(|v| v as u64)
+                        .unwrap_or(0);
+                    if owner == 0 {
+                        return Err(mlua::Error::external(
+                            "ngx.thread.spawn 只能在请求协程内调用（无所属请求）",
+                        ));
+                    }
+                    let tid = counter.fetch_add(1, Ordering::Relaxed);
+                    let body: LuaFunction = lua_ctx
+                        .globals()
+                        .get::<LuaFunction>("__thread_body")?
+                        .call((func, args, tid as i64))?;
+                    let co = lua_ctx.create_thread(body)?;
+                    let thread_key = lua_ctx.create_registry_value(co)?;
+                    ctl.lock().unwrap().spawns.push(SpawnReq {
+                        tid,
+                        owner,
+                        thread_key,
+                    });
+                    Ok(tid as i64)
+                })?;
             lua.globals().set("_onrouter_thread_spawn", spawn)?;
         }
         // _onrouter_thread_wait(tids) -> op：登记等待意图，返回让出用的 op id。
@@ -2950,7 +3041,10 @@ impl LuaEngine {
         {
             let on_abort = lua.create_function(move |lua_ctx, f: LuaValue| {
                 if !matches!(f, LuaValue::Function(_)) {
-                    return Ok((LuaValue::Nil, LuaValue::String(lua_ctx.create_string("invalid callback type")?)));
+                    return Ok((
+                        LuaValue::Nil,
+                        LuaValue::String(lua_ctx.create_string("invalid callback type")?),
+                    ));
                 }
                 let ct = match lua_ctx.globals().get::<LuaTable>("ngx")?.raw_get("ctx")? {
                     LuaValue::Table(t) => t,
@@ -3035,7 +3129,8 @@ impl LuaEngine {
             value: Option<String>,
             vals: Option<Vec<String>>,
         ) {
-            ctx.req_headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+            ctx.req_headers
+                .retain(|(k, _)| !k.eq_ignore_ascii_case(name));
             if let Some(list) = vals {
                 for v in list {
                     ctx.req_headers.push((name.to_string(), v));
@@ -3072,36 +3167,38 @@ impl LuaEngine {
         })?;
         req.set("set_header", set_header)?;
 
-        let set_raw_header = lua.create_function(move |lua, (name, value): (String, LuaValue)| {
-            let h = get_ctx(lua)?;
-            let mut ctx = h.0.lock().unwrap();
-            match &value {
-                LuaValue::Nil => apply_header(&mut ctx, &name, None, None),
-                LuaValue::Table(t) => {
-                    let mut list = Vec::new();
-                    for i in 1..=t.raw_len() {
-                        if let Ok(item) = t.raw_get::<LuaValue>(i) {
-                            if let Some(s) = hdr_to_str(lua, &item) {
-                                list.push(s);
+        let set_raw_header =
+            lua.create_function(move |lua, (name, value): (String, LuaValue)| {
+                let h = get_ctx(lua)?;
+                let mut ctx = h.0.lock().unwrap();
+                match &value {
+                    LuaValue::Nil => apply_header(&mut ctx, &name, None, None),
+                    LuaValue::Table(t) => {
+                        let mut list = Vec::new();
+                        for i in 1..=t.raw_len() {
+                            if let Ok(item) = t.raw_get::<LuaValue>(i) {
+                                if let Some(s) = hdr_to_str(lua, &item) {
+                                    list.push(s);
+                                }
                             }
                         }
+                        apply_header(&mut ctx, &name, None, Some(list));
                     }
-                    apply_header(&mut ctx, &name, None, Some(list));
-                }
-                other => {
-                    if let Some(s) = hdr_to_str(lua, other) {
-                        apply_header(&mut ctx, &name, Some(s), None);
+                    other => {
+                        if let Some(s) = hdr_to_str(lua, other) {
+                            apply_header(&mut ctx, &name, Some(s), None);
+                        }
                     }
                 }
-            }
-            Ok(true)
-        })?;
+                Ok(true)
+            })?;
         req.set("set_raw_header", set_raw_header)?;
 
         let clear_header = lua.create_function(move |lua, name: String| {
             let h = get_ctx(lua)?;
             let mut ctx = h.0.lock().unwrap();
-            ctx.req_headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
+            ctx.req_headers
+                .retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
             Ok(true)
         })?;
         req.set("clear_header", clear_header)?;
@@ -3330,7 +3427,11 @@ impl LuaEngine {
         }
 
         // 把一次 captures 结果转成 OpenResty 的 cap 表：cap[0]=整体、cap[N]=第 N 组、cap.name=命名组
-        fn caps_to_table(lua: &mlua::Lua, re: &regex::Regex, caps: &regex::Captures) -> LuaResult<LuaTable> {
+        fn caps_to_table(
+            lua: &mlua::Lua,
+            re: &regex::Regex,
+            caps: &regex::Captures,
+        ) -> LuaResult<LuaTable> {
             let t = lua.create_table()?;
             for i in 0..caps.len() {
                 if let Some(m) = caps.get(i) {
@@ -3380,68 +3481,75 @@ impl LuaEngine {
         }
 
         // ngx.re.match(s, pattern, flags?) -> {cap1, cap2, ...} | nil
-        let re_match = lua.create_function(move |lua, (s, pattern, flags): (String, String, Option<String>)| {
-            let re = build_regex_cached(&pattern, flags.as_deref())?;
-            let Some(caps) = re.captures(&s) else {
-                return Ok(LuaValue::Nil);
-            };
-            let t = lua.create_table()?;
-            // 对齐 OpenResty：cap[0] 是整体匹配，捕获组从 1 开始
-            for i in 0..caps.len() {
-                if let Some(m) = caps.get(i) {
-                    t.raw_set(i as i64, m.as_str())?;
+        let re_match = lua.create_function(
+            move |lua, (s, pattern, flags): (String, String, Option<String>)| {
+                let re = build_regex_cached(&pattern, flags.as_deref())?;
+                let Some(caps) = re.captures(&s) else {
+                    return Ok(LuaValue::Nil);
+                };
+                let t = lua.create_table()?;
+                // 对齐 OpenResty：cap[0] 是整体匹配，捕获组从 1 开始
+                for i in 0..caps.len() {
+                    if let Some(m) = caps.get(i) {
+                        t.raw_set(i as i64, m.as_str())?;
+                    }
                 }
-            }
-            Ok(LuaValue::Table(t))
-        })?;
+                Ok(LuaValue::Table(t))
+            },
+        )?;
         re.set("match", re_match)?;
 
         // ngx.re.find(s, pattern, flags?) -> from, to（1-based；无匹配返回 nil）
-        let re_find = lua.create_function(move |_, (s, pattern, flags): (String, String, Option<String>)| {
-            let re = build_regex_cached(&pattern, flags.as_deref())?;
-            match re.find(&s) {
-                Some(m) => Ok((Some(m.start() as i64 + 1), Some(m.end() as i64))),
-                None => Ok((None, None)),
-            }
-        })?;
+        let re_find = lua.create_function(
+            move |_, (s, pattern, flags): (String, String, Option<String>)| {
+                let re = build_regex_cached(&pattern, flags.as_deref())?;
+                match re.find(&s) {
+                    Some(m) => Ok((Some(m.start() as i64 + 1), Some(m.end() as i64))),
+                    None => Ok((None, None)),
+                }
+            },
+        )?;
         re.set("find", re_find)?;
 
         // ngx.re.opt(regex, options?) -> 预编译句柄（表 {__orr_re=idx}），可回传给其它 ngx.re.*
-        let re_opt = lua.create_function(move |lua, (pattern, options): (String, Option<String>)| {
-            let built = build_regex(&pattern, options)?;
-            let idx = regex_to_cache(built);
-            let t = lua.create_table()?;
-            t.raw_set("__orr_re", idx as i64)?;
-            Ok(LuaValue::Table(t))
-        })?;
+        let re_opt =
+            lua.create_function(move |lua, (pattern, options): (String, Option<String>)| {
+                let built = build_regex(&pattern, options)?;
+                let idx = regex_to_cache(built);
+                let t = lua.create_table()?;
+                t.raw_set("__orr_re", idx as i64)?;
+                Ok(LuaValue::Table(t))
+            })?;
         re.set("opt", re_opt)?;
 
         // ngx.re.gmatch(subject, regex, options?) -> iterator；每次调用返回一个 cap 表，耗尽返回 nil
-        let re_gmatch = lua.create_function(move |lua, (subject, regex_arg, options): (String, LuaValue, Option<String>)| {
-            let built = build_from_arg(parse_re_arg(&regex_arg), options)?;
-            let state = std::sync::Arc::new(std::sync::Mutex::new((built, subject, 0usize)));
-            let it = lua.create_function(move |lua, ()| {
-                let mut st = state.lock().unwrap();
-                let (re, subj, pos) = &mut *st;
-                let tail = &subj[*pos..];
-                match re.captures(tail) {
-                    Some(caps) => {
-                        let m = caps.get(0).unwrap();
-                        let adv = m.end();
-                        *pos += adv;
-                        if adv == 0 {
-                            // 零宽匹配：前进一格避免在同一位置死循环
-                            *pos = (*pos + 1).min(subj.len());
+        let re_gmatch = lua.create_function(
+            move |lua, (subject, regex_arg, options): (String, LuaValue, Option<String>)| {
+                let built = build_from_arg(parse_re_arg(&regex_arg), options)?;
+                let state = std::sync::Arc::new(std::sync::Mutex::new((built, subject, 0usize)));
+                let it = lua.create_function(move |lua, ()| {
+                    let mut st = state.lock().unwrap();
+                    let (re, subj, pos) = &mut *st;
+                    let tail = &subj[*pos..];
+                    match re.captures(tail) {
+                        Some(caps) => {
+                            let m = caps.get(0).unwrap();
+                            let adv = m.end();
+                            *pos += adv;
+                            if adv == 0 {
+                                // 零宽匹配：前进一格避免在同一位置死循环
+                                *pos = (*pos + 1).min(subj.len());
+                            }
+                            let t = caps_to_table(lua, re, &caps)?;
+                            drop(st);
+                            Ok(LuaValue::Table(t))
                         }
-                        let t = caps_to_table(lua, re, &caps)?;
-                        drop(st);
-                        Ok(LuaValue::Table(t))
+                        None => Ok(LuaValue::Nil),
                     }
-                    None => Ok(LuaValue::Nil),
-                }
-            })?;
-            Ok(LuaValue::Function(it))
-        })?;
+                })?;
+                Ok(LuaValue::Function(it))
+            },
+        )?;
         re.set("gmatch", re_gmatch)?;
 
         // sub/gsub 共用：all=false 只替换首个；replace 可为字符串或回调函数
@@ -3494,24 +3602,48 @@ impl LuaEngine {
                     let n = re.find_iter(subject).count();
                     let limit = if all { usize::MAX } else { 1 };
                     let new = re.replacen(subject, limit, rep.as_str()).into_owned();
-                    let cnt = if all { n as i64 } else { if n > 0 { 1 } else { 0 } };
+                    let cnt = if all {
+                        n as i64
+                    } else {
+                        if n > 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    };
                     Ok((new, cnt))
                 }
             }
         }
 
         // ngx.re.sub(subject, regex, replace, options?) -> new_subject, n
-        let re_sub = lua.create_function(move |lua, (subject, regex_arg, replace, options): (String, LuaValue, LuaValue, Option<String>)| {
-            let (s, n) = do_sub(lua, &subject, &regex_arg, &replace, options, false)?;
-            Ok((s, n))
-        })?;
+        let re_sub = lua.create_function(
+            move |lua,
+                  (subject, regex_arg, replace, options): (
+                String,
+                LuaValue,
+                LuaValue,
+                Option<String>,
+            )| {
+                let (s, n) = do_sub(lua, &subject, &regex_arg, &replace, options, false)?;
+                Ok((s, n))
+            },
+        )?;
         re.set("sub", re_sub)?;
 
         // ngx.re.gsub(subject, regex, replace, options?) -> new_subject, n
-        let re_gsub = lua.create_function(move |lua, (subject, regex_arg, replace, options): (String, LuaValue, LuaValue, Option<String>)| {
-            let (s, n) = do_sub(lua, &subject, &regex_arg, &replace, options, true)?;
-            Ok((s, n))
-        })?;
+        let re_gsub = lua.create_function(
+            move |lua,
+                  (subject, regex_arg, replace, options): (
+                String,
+                LuaValue,
+                LuaValue,
+                Option<String>,
+            )| {
+                let (s, n) = do_sub(lua, &subject, &regex_arg, &replace, options, true)?;
+                Ok((s, n))
+            },
+        )?;
         re.set("gsub", re_gsub)?;
         ngx.set("re", re)?;
 
@@ -3529,12 +3661,11 @@ impl LuaEngine {
             Ok(LuaValue::String(lua.create_string(encoded)?))
         })?;
         ngx.set("encode_base64", b64e)?;
-        let b64d = lua.create_function(|lua, s: LuaString| {
-            match b64_decode(&s.to_string_lossy()) {
+        let b64d =
+            lua.create_function(|lua, s: LuaString| match b64_decode(&s.to_string_lossy()) {
                 Some(b) => Ok(LuaValue::String(lua.create_string(&b)?)),
                 None => Err(mlua::Error::external("decode_base64: 非法输入")),
-            }
-        })?;
+            })?;
         ngx.set("decode_base64", b64d)?;
 
         // ngx.escape_uri / unescape_uri
@@ -3618,7 +3749,8 @@ impl LuaEngine {
         })?;
         ngx.set("hmac_sha1", hmac)?;
         // ngx.crc32_short / crc32_long —— 同一 CRC32（历史命名，结果一致），无符号整数
-        let crc = lua.create_function(|_, s: LuaString| Ok(crc32(&s.as_bytes().to_vec()) as i64))?;
+        let crc =
+            lua.create_function(|_, s: LuaString| Ok(crc32(&s.as_bytes().to_vec()) as i64))?;
         ngx.set("crc32_short", crc.clone())?;
         ngx.set("crc32_long", crc)?;
         // ngx.cookie_time(ts) / ngx.http_time(ts)
@@ -3635,26 +3767,29 @@ impl LuaEngine {
         })?;
         ngx.set("parse_http_time", ptime)?;
         // ngx.today() —— "YYYY-MM-DD"（本地日，UTC 对齐 nginx 语义）
-        let today = lua.create_function(|_, ()| {
-            Ok(chrono::Utc::now().format("%Y-%m-%d").to_string())
-        })?;
+        let today =
+            lua.create_function(|_, ()| Ok(chrono::Utc::now().format("%Y-%m-%d").to_string()))?;
         ngx.set("today", today)?;
         // ngx.update_time() —— 刷新缓存时间。本实现每次实时取钟，故为无副作用的兼容占位。
         let update_time = lua.create_function(|_, ()| Ok(LuaValue::Nil))?;
         ngx.set("update_time", update_time)?;
         // ngx.get_phase() —— 返回当前阶段名（rewrite/access/content/header_filter/body_filter/log…）
-        let get_phase = lua.create_function(|lua, ()| {
-            match lua.named_registry_value::<String>("__phase") {
-                Ok(p) => Ok(LuaValue::String(lua.create_string(p)?)),
-                Err(_) => Ok(LuaValue::Nil),
-            }
-        })?;
+        let get_phase =
+            lua.create_function(
+                |lua, ()| match lua.named_registry_value::<String>("__phase") {
+                    Ok(p) => Ok(LuaValue::String(lua.create_string(p)?)),
+                    Err(_) => Ok(LuaValue::Nil),
+                },
+            )?;
         ngx.set("get_phase", get_phase)?;
 
         // ngx.worker.* —— 单进程反应器：pid 真实，worker id 恒 0，count 恒 1；
         // exiting() 由进程信号处理器置位，pids() 只含当前进程。
         let worker = lua.create_table()?;
-        worker.set("pid", lua.create_function(|_, ()| Ok(std::process::id() as i64))?)?;
+        worker.set(
+            "pid",
+            lua.create_function(|_, ()| Ok(std::process::id() as i64))?,
+        )?;
         worker.set("id", lua.create_function(|_, ()| Ok(0i64))?)?;
         worker.set("count", lua.create_function(|_, ()| Ok(1i64))?)?;
         worker.set(
@@ -3727,16 +3862,17 @@ impl LuaEngine {
                 _ => Ok(LuaValue::Nil),
             }
         })?;
-        let newidx = lua.create_function(move |_lua, (t, key, value): (LuaTable, String, LuaValue)| {
-            if key == "status" {
-                let code = value.as_integer().unwrap_or(200) as u16;
-                let f: LuaFunction = t.raw_get("_set_status")?;
-                f.call::<()>(code)?;
-            } else {
-                t.raw_set(key, value)?;
-            }
-            Ok(())
-        })?;
+        let newidx =
+            lua.create_function(move |_lua, (t, key, value): (LuaTable, String, LuaValue)| {
+                if key == "status" {
+                    let code = value.as_integer().unwrap_or(200) as u16;
+                    let f: LuaFunction = t.raw_get("_set_status")?;
+                    f.call::<()>(code)?;
+                } else {
+                    t.raw_set(key, value)?;
+                }
+                Ok(())
+            })?;
         mt.set("__index", idx)?;
         mt.set("__newindex", newidx)?;
         ngx.set_metatable(Some(mt));
@@ -3755,7 +3891,10 @@ impl LuaEngine {
             "set_current_peer",
             lua.create_function(move |lua, (host, port): (String, u16)| {
                 if host.is_empty() {
-                    return Ok((LuaValue::Nil, LuaValue::String(lua.create_string("invalid 'host'")?)));
+                    return Ok((
+                        LuaValue::Nil,
+                        LuaValue::String(lua.create_string("invalid 'host'")?),
+                    ));
                 }
                 let h = get_ctx(lua)?;
                 h.0.lock().unwrap().balancer_peer = Some((host, port));
@@ -3843,46 +3982,52 @@ impl LuaEngine {
                 None => LuaValue::Nil,
             })
         })?;
-        let var_newindex = lua.create_function(move |lua, (_t, (name, value)): (LuaTable, (String, LuaValue))| {
-            let h = get_ctx(lua)?;
-            let mut ctx = h.0.lock().unwrap();
-            // LuaString → owned String（避免 BorrowedStr 生命周期问题）
-            let as_str = |v: &LuaValue| -> Option<String> {
-                match v {
-                    LuaValue::String(s) => Some(String::from_utf8_lossy(&s.as_bytes()).into_owned()),
-                    _ => None,
-                }
-            };
-            match name.as_str() {
-                "uri" => {
-                    if let Some(p) = as_str(&value) {
-                        ctx.rewritten_path = Some(if p.starts_with('/') { p } else { format!("/{p}") });
+        let var_newindex = lua.create_function(
+            move |lua, (_t, (name, value)): (LuaTable, (String, LuaValue))| {
+                let h = get_ctx(lua)?;
+                let mut ctx = h.0.lock().unwrap();
+                // LuaString → owned String（避免 BorrowedStr 生命周期问题）
+                let as_str = |v: &LuaValue| -> Option<String> {
+                    match v {
+                        LuaValue::String(s) => {
+                            Some(String::from_utf8_lossy(&s.as_bytes()).into_owned())
+                        }
+                        _ => None,
                     }
-                }
-                "args" => {
-                    match &value {
+                };
+                match name.as_str() {
+                    "uri" => {
+                        if let Some(p) = as_str(&value) {
+                            ctx.rewritten_path = Some(if p.starts_with('/') {
+                                p
+                            } else {
+                                format!("/{p}")
+                            });
+                        }
+                    }
+                    "args" => match &value {
                         LuaValue::Nil => ctx.query = String::new(),
                         _ => {
                             if let Some(q) = as_str(&value) {
                                 ctx.query = q;
                             }
                         }
-                    }
-                }
-                "status" => {
-                    if let Some(n) = value.as_integer() {
-                        ctx.status = n as u16;
-                    } else if let Some(s) = as_str(&value) {
-                        if let Ok(n) = s.parse::<u16>() {
-                            ctx.status = n;
+                    },
+                    "status" => {
+                        if let Some(n) = value.as_integer() {
+                            ctx.status = n as u16;
+                        } else if let Some(s) = as_str(&value) {
+                            if let Ok(n) = s.parse::<u16>() {
+                                ctx.status = n;
+                            }
                         }
                     }
+                    // 其它 nginx 变量在本实现里只读；对齐"不可写变量被忽略"的最保守语义
+                    _ => {}
                 }
-                // 其它 nginx 变量在本实现里只读；对齐"不可写变量被忽略"的最保守语义
-                _ => {}
-            }
-            Ok(())
-        })?;
+                Ok(())
+            },
+        )?;
         var_mt.set("__index", var_index)?;
         var_mt.set("__newindex", var_newindex)?;
         var.set_metatable(Some(var_mt));
@@ -3890,19 +4035,39 @@ impl LuaEngine {
 
         // ngx.* 常量 —— 日志级别（OpenResty 取值）+ 控制值 + 常用 HTTP 状态码
         for (name, val) in [
-            ("STDERR", -1i64), ("EMERG", 0), ("ALERT", 1), ("CRIT", 2), ("ERR", 3),
-            ("WARN", 4), ("NOTICE", 5), ("INFO", 6), ("DEBUG", 7),
-            ("OK", 0i64), ("ERROR", -1i64),
+            ("STDERR", -1i64),
+            ("EMERG", 0),
+            ("ALERT", 1),
+            ("CRIT", 2),
+            ("ERR", 3),
+            ("WARN", 4),
+            ("NOTICE", 5),
+            ("INFO", 6),
+            ("DEBUG", 7),
+            ("OK", 0i64),
+            ("ERROR", -1i64),
         ] {
             ngx.raw_set(name, val)?;
         }
         for (name, code) in [
-            ("HTTP_OK", 200u16), ("HTTP_CREATED", 201), ("HTTP_ACCEPTED", 202),
-            ("HTTP_NO_CONTENT", 204), ("HTTP_MOVED_PERMANENTLY", 301), ("HTTP_MOVED_TEMPORARILY", 302),
-            ("HTTP_NOT_MODIFIED", 304), ("HTTP_BAD_REQUEST", 400), ("HTTP_UNAUTHORIZED", 401),
-            ("HTTP_FORBIDDEN", 403), ("HTTP_NOT_FOUND", 404), ("HTTP_REQUEST_TIMEOUT", 408),
-            ("HTTP_CONFLICT", 409), ("HTTP_UNPROCESSABLE_ENTITY", 422), ("HTTP_TOO_MANY_REQUESTS", 429),
-            ("HTTP_INTERNAL_SERVER_ERROR", 500), ("HTTP_BAD_GATEWAY", 502), ("HTTP_SERVICE_UNAVAILABLE", 503),
+            ("HTTP_OK", 200u16),
+            ("HTTP_CREATED", 201),
+            ("HTTP_ACCEPTED", 202),
+            ("HTTP_NO_CONTENT", 204),
+            ("HTTP_MOVED_PERMANENTLY", 301),
+            ("HTTP_MOVED_TEMPORARILY", 302),
+            ("HTTP_NOT_MODIFIED", 304),
+            ("HTTP_BAD_REQUEST", 400),
+            ("HTTP_UNAUTHORIZED", 401),
+            ("HTTP_FORBIDDEN", 403),
+            ("HTTP_NOT_FOUND", 404),
+            ("HTTP_REQUEST_TIMEOUT", 408),
+            ("HTTP_CONFLICT", 409),
+            ("HTTP_UNPROCESSABLE_ENTITY", 422),
+            ("HTTP_TOO_MANY_REQUESTS", 429),
+            ("HTTP_INTERNAL_SERVER_ERROR", 500),
+            ("HTTP_BAD_GATEWAY", 502),
+            ("HTTP_SERVICE_UNAVAILABLE", 503),
             ("HTTP_GATEWAY_TIMEOUT", 504),
         ] {
             ngx.raw_set(name, code)?;
@@ -4001,40 +4166,34 @@ impl LuaEngine {
         ssl.set("priv_key_pem_to_der", priv_key_pem_to_der)?;
 
         // set_cert_and_key(cert, key) / set_cert(chain) / set_priv_key(key)
-        let set_pair = lua.create_function(
-            move |lua, (cert, key): (LuaValue, LuaValue)| {
-                let chain = match ssl_cert_from_value(&cert) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?)))
-                    }
-                };
-                let key = match ssl_key_from_value(&key) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        return Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?)))
-                    }
-                };
-                if let Err(e) = crate::certs::certified_key_from_der(chain.clone(), key.clone()) {
-                    return Ok((
-                        LuaValue::Nil,
-                        LuaValue::String(lua.create_string(format!("证书/私钥无效: {e}"))?),
-                    ));
-                }
-                let h = get_ctx(lua)?;
-                let mut ctx = h.0.lock().unwrap();
-                let Some(ssl) = ctx.ssl.as_mut() else {
-                    return Ok((
-                        LuaValue::Nil,
-                        LuaValue::String(lua.create_string("不在 SSL 握手阶段")?),
-                    ));
-                };
-                ssl.cert_chain = Some(chain);
-                ssl.priv_key = Some(key);
-                ssl.cleared = false;
-                Ok((LuaValue::Boolean(true), LuaValue::Nil))
-            },
-        )?;
+        let set_pair = lua.create_function(move |lua, (cert, key): (LuaValue, LuaValue)| {
+            let chain = match ssl_cert_from_value(&cert) {
+                Ok(c) => c,
+                Err(e) => return Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
+            };
+            let key = match ssl_key_from_value(&key) {
+                Ok(k) => k,
+                Err(e) => return Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
+            };
+            if let Err(e) = crate::certs::certified_key_from_der(chain.clone(), key.clone()) {
+                return Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string(format!("证书/私钥无效: {e}"))?),
+                ));
+            }
+            let h = get_ctx(lua)?;
+            let mut ctx = h.0.lock().unwrap();
+            let Some(ssl) = ctx.ssl.as_mut() else {
+                return Ok((
+                    LuaValue::Nil,
+                    LuaValue::String(lua.create_string("不在 SSL 握手阶段")?),
+                ));
+            };
+            ssl.cert_chain = Some(chain);
+            ssl.priv_key = Some(key);
+            ssl.cleared = false;
+            Ok((LuaValue::Boolean(true), LuaValue::Nil))
+        })?;
         ssl.set("set_cert_and_key", set_pair)?;
 
         // 旧 API：set_cert 与 set_priv_key 分开调用，握手侧成对取用并统一校验
@@ -4363,13 +4522,14 @@ impl LuaEngine {
         if !chunks.contains_key(phase_name) {
             chunks.insert(phase_name.to_string(), HashMap::new());
         }
-        let by_code = chunks
-            .get_mut(phase_name)
-            .expect("刚插入的阶段桶一定存在");
+        let by_code = chunks.get_mut(phase_name).expect("刚插入的阶段桶一定存在");
         let f = match by_code.get(code.as_ref()) {
             Some(key) => lua.registry_value::<Function>(key)?,
             None => {
-                let compiled: Function = lua.load(code.as_ref()).set_name(phase_name).into_function()?;
+                let compiled: Function = lua
+                    .load(code.as_ref())
+                    .set_name(phase_name)
+                    .into_function()?;
                 let key = lua.create_registry_value(compiled.clone())?;
                 // 自检重载过的脚本会以「另一个源码键」留在这个桶里；桶满就整桶清空
                 // （RegistryKey drop 即 lua_unref，Lua 侧引用同步释放），避免长期攒出泄漏。
@@ -4402,7 +4562,7 @@ impl LuaEngine {
         let mut states: HashMap<u64, CoState> = HashMap::new();
         let mut ready: VecDeque<u64> = VecDeque::new();
         let mut waiting: HashMap<u64, u64> = HashMap::new(); // op id -> 协程 id
-        // 挂起等待时被 select 取走的作业/事件先暂存，下一步统一步骤内处理（避免丢事件）
+                                                             // 挂起等待时被 select 取走的作业/事件先暂存，下一步统一步骤内处理（避免丢事件）
         let mut inbox: VecDeque<Job> = VecDeque::new();
         let mut wake_evs: VecDeque<(u64, Vec<ResumeVal>)> = VecDeque::new();
         // ---------- ngx.thread.* 簿记 ----------
@@ -4430,7 +4590,13 @@ impl LuaEngine {
                 let mut adopted: Vec<(u64, u64)> = Vec::new();
                 for job in jobs {
                     match job {
-                        Job::Start { co_id, phase_name, code, ctx, reply } => {
+                        Job::Start {
+                            co_id,
+                            phase_name,
+                            code,
+                            ctx,
+                            reply,
+                        } => {
                             let spawned = {
                                 let mut cache = chunks.lock().unwrap();
                                 Self::co_spawn(lua, &mut cache, &phase_name, &code)
@@ -4516,7 +4682,12 @@ impl LuaEngine {
 
                 // 1b) 收下 spawn 请求：为每个子协程建 CoState，共享 owner 的 ctx/Arc/阶段并入队 ready。
                 let spawns = std::mem::take(&mut ctl.lock().unwrap().spawns);
-                for SpawnReq { tid, owner, thread_key } in spawns {
+                for SpawnReq {
+                    tid,
+                    owner,
+                    thread_key,
+                } in spawns
+                {
                     let prepared = states.get(&owner).map(|p| {
                         (
                             Arc::clone(&p.ctx),
@@ -4531,7 +4702,8 @@ impl LuaEngine {
                             continue;
                         }
                     };
-                    let ctx_table_key = match table_res.and_then(|ct| lua.create_registry_value(ct)) {
+                    let ctx_table_key = match table_res.and_then(|ct| lua.create_registry_value(ct))
+                    {
                         Ok(k) => k,
                         Err(e) => {
                             eprintln!("[onrouter] thread 共享 ctx 失败: {e}");
@@ -4622,48 +4794,63 @@ impl LuaEngine {
                 let mut preempts: u32 = 0;
                 while let Some(co_id) = pending.pop_front() {
                     // 借用 st 仅用于挂上下文 + 取句柄 + 取出唤醒参数/tid；随后立即结束借用
-                    let (thread, wake_args, wake_tid, is_child, owner) =
-                        match states.get_mut(&co_id) {
-                            None => continue,
-                            Some(st) => {
-                                let _ = lua.set_named_registry_value(
-                                    "__ctx",
-                                    CtxHandle(Arc::clone(&st.ctx)),
-                                );
-                                let _ = lua.set_named_registry_value("__phase", st.phase.clone());
-                                // spawn 需据此把子线程挂到正确的所属请求上
-                                let _ =
-                                    lua.set_named_registry_value("__cur_co", co_id as i64);
-                                let _ = lua
-                                    .set_named_registry_value("__cur_owner", st.owner as i64);
-                                if let Ok(ct) = lua.registry_value::<LuaTable>(&st.ctx_table_key) {
-                                    let _ = ngx.raw_set("ctx", ct);
-                                }
-                                let wa = std::mem::take(&mut st.wake_args);
-                                let wt = st.wake_tid.take();
-                                (
-                                    lua.registry_value::<Thread>(&st.thread_key),
-                                    wa,
-                                    wt,
-                                    st.is_child,
-                                    st.owner,
-                                )
+                    let (thread, wake_args, wake_tid, is_child, owner) = match states
+                        .get_mut(&co_id)
+                    {
+                        None => continue,
+                        Some(st) => {
+                            let _ = lua
+                                .set_named_registry_value("__ctx", CtxHandle(Arc::clone(&st.ctx)));
+                            let _ = lua.set_named_registry_value("__phase", st.phase.clone());
+                            // spawn 需据此把子线程挂到正确的所属请求上
+                            let _ = lua.set_named_registry_value("__cur_co", co_id as i64);
+                            let _ = lua.set_named_registry_value("__cur_owner", st.owner as i64);
+                            if let Ok(ct) = lua.registry_value::<LuaTable>(&st.ctx_table_key) {
+                                let _ = ngx.raw_set("ctx", ct);
                             }
-                        }; // states 借用到此结束
+                            let wa = std::mem::take(&mut st.wake_args);
+                            let wt = st.wake_tid.take();
+                            (
+                                lua.registry_value::<Thread>(&st.thread_key),
+                                wa,
+                                wt,
+                                st.is_child,
+                                st.owner,
+                            )
+                        }
+                    }; // states 借用到此结束
                     let thread = match thread {
                         Ok(t) => t,
                         Err(e) => {
                             if is_child {
                                 thread_complete(
-                                    lua, &mut states, &mut waiting, &mut done, &mut tid_waitop,
-                                    &mut wait_group, &mut ready, co_id,
+                                    lua,
+                                    &mut states,
+                                    &mut waiting,
+                                    &mut done,
+                                    &mut tid_waitop,
+                                    &mut wait_group,
+                                    &mut ready,
+                                    co_id,
                                     Some(&e.to_string()),
                                 );
                             } else {
-                                finish(lua, &mut states, &mut waiting, co_id, Err(AppError::Lua(e)));
+                                finish(
+                                    lua,
+                                    &mut states,
+                                    &mut waiting,
+                                    co_id,
+                                    Err(AppError::Lua(e)),
+                                );
                                 reap_children(
-                                    lua, &mut states, owner, &mut owner_children, &mut done,
-                                    &mut tid_waitop, &mut wait_group, &mut waiting,
+                                    lua,
+                                    &mut states,
+                                    owner,
+                                    &mut owner_children,
+                                    &mut done,
+                                    &mut tid_waitop,
+                                    &mut wait_group,
+                                    &mut waiting,
                                 );
                             }
                             continue;
@@ -4697,14 +4884,33 @@ impl LuaEngine {
                             eprintln!("[onrouter] 脚本错误: {e}");
                             if is_child {
                                 thread_complete(
-                                    lua, &mut states, &mut waiting, &mut done, &mut tid_waitop,
-                                    &mut wait_group, &mut ready, co_id, Some(&e.to_string()),
+                                    lua,
+                                    &mut states,
+                                    &mut waiting,
+                                    &mut done,
+                                    &mut tid_waitop,
+                                    &mut wait_group,
+                                    &mut ready,
+                                    co_id,
+                                    Some(&e.to_string()),
                                 );
                             } else {
-                                finish(lua, &mut states, &mut waiting, co_id, Err(AppError::Lua(e)));
+                                finish(
+                                    lua,
+                                    &mut states,
+                                    &mut waiting,
+                                    co_id,
+                                    Err(AppError::Lua(e)),
+                                );
                                 reap_children(
-                                    lua, &mut states, owner, &mut owner_children, &mut done,
-                                    &mut tid_waitop, &mut wait_group, &mut waiting,
+                                    lua,
+                                    &mut states,
+                                    owner,
+                                    &mut owner_children,
+                                    &mut done,
+                                    &mut tid_waitop,
+                                    &mut wait_group,
+                                    &mut waiting,
                                 );
                             }
                         }
@@ -4713,8 +4919,15 @@ impl LuaEngine {
                                 if is_child {
                                     // 子协程体在返回前已把结果写入 __thread_sink[tid]
                                     thread_complete(
-                                        lua, &mut states, &mut waiting, &mut done, &mut tid_waitop,
-                                        &mut wait_group, &mut ready, co_id, None,
+                                        lua,
+                                        &mut states,
+                                        &mut waiting,
+                                        &mut done,
+                                        &mut tid_waitop,
+                                        &mut wait_group,
+                                        &mut ready,
+                                        co_id,
+                                        None,
                                     );
                                 } else if states
                                     .get(&co_id)
@@ -4724,20 +4937,30 @@ impl LuaEngine {
                                     let stop = matches!(yielded, LuaValue::Boolean(false));
                                     finish_timer(lua, &mut states, &mut waiting, co_id, Ok(stop));
                                     reap_children(
-                                        lua, &mut states, owner, &mut owner_children, &mut done,
-                                        &mut tid_waitop, &mut wait_group, &mut waiting,
+                                        lua,
+                                        &mut states,
+                                        owner,
+                                        &mut owner_children,
+                                        &mut done,
+                                        &mut tid_waitop,
+                                        &mut wait_group,
+                                        &mut waiting,
                                     );
                                 } else {
                                     finish(lua, &mut states, &mut waiting, co_id, Ok(()));
                                     reap_children(
-                                        lua, &mut states, owner, &mut owner_children, &mut done,
-                                        &mut tid_waitop, &mut wait_group, &mut waiting,
+                                        lua,
+                                        &mut states,
+                                        owner,
+                                        &mut owner_children,
+                                        &mut done,
+                                        &mut tid_waitop,
+                                        &mut wait_group,
+                                        &mut waiting,
                                     );
                                 }
                             }
-                            ThreadStatus::Resumable
-                                if preempted.load(Ordering::Relaxed) =>
-                            {
+                            ThreadStatus::Resumable if preempted.load(Ordering::Relaxed) => {
                                 // 时间片到、由钩子切的，不是脚本 yield：放回队尾公平轮转。
                                 // 连续切满 PREEMPT_PER_HOLD 次就交回主循环（释放 VM 锁 + await），
                                 // 这样一个热循环再也占不住 tokio worker 线程。
@@ -4765,20 +4988,32 @@ impl LuaEngine {
                                     // 非受支持让出（yield 出的不是 op id）：无法唤醒，按错误回传避免悬挂
                                     eprintln!("[onrouter] 协程 yield 了非 op id 值，无法恢复");
                                     let msg = AppError::Other(
-                                        "attempt to yield from outside a supported operation".into(),
+                                        "attempt to yield from outside a supported operation"
+                                            .into(),
                                     );
                                     if is_child {
                                         let m = msg.to_string();
                                         thread_complete(
-                                            lua, &mut states, &mut waiting, &mut done,
-                                            &mut tid_waitop, &mut wait_group, &mut ready, co_id,
+                                            lua,
+                                            &mut states,
+                                            &mut waiting,
+                                            &mut done,
+                                            &mut tid_waitop,
+                                            &mut wait_group,
+                                            &mut ready,
+                                            co_id,
                                             Some(&m),
                                         );
                                     } else {
                                         finish(lua, &mut states, &mut waiting, co_id, Err(msg));
                                         reap_children(
-                                            lua, &mut states, owner, &mut owner_children,
-                                            &mut done, &mut tid_waitop, &mut wait_group,
+                                            lua,
+                                            &mut states,
+                                            owner,
+                                            &mut owner_children,
+                                            &mut done,
+                                            &mut tid_waitop,
+                                            &mut wait_group,
                                             &mut waiting,
                                         );
                                     }
@@ -4787,18 +5022,33 @@ impl LuaEngine {
                             ThreadStatus::Error => {
                                 if is_child {
                                     thread_complete(
-                                        lua, &mut states, &mut waiting, &mut done, &mut tid_waitop,
-                                        &mut wait_group, &mut ready, co_id,
+                                        lua,
+                                        &mut states,
+                                        &mut waiting,
+                                        &mut done,
+                                        &mut tid_waitop,
+                                        &mut wait_group,
+                                        &mut ready,
+                                        co_id,
                                         Some("coroutine error"),
                                     );
                                 } else {
                                     finish(
-                                        lua, &mut states, &mut waiting, co_id,
+                                        lua,
+                                        &mut states,
+                                        &mut waiting,
+                                        co_id,
                                         Err(AppError::Other("coroutine error".into())),
                                     );
                                     reap_children(
-                                        lua, &mut states, owner, &mut owner_children, &mut done,
-                                        &mut tid_waitop, &mut wait_group, &mut waiting,
+                                        lua,
+                                        &mut states,
+                                        owner,
+                                        &mut owner_children,
+                                        &mut done,
+                                        &mut tid_waitop,
+                                        &mut wait_group,
+                                        &mut waiting,
                                     );
                                 }
                             }
@@ -4842,7 +5092,9 @@ impl LuaEngine {
             if let Some(tx) = st.timer_done {
                 let _ = tx.send(Err("Lua 调度器已停止".into()));
             } else {
-                let _ = st.reply.send(Err(AppError::Other("Lua 调度器已停止".into())));
+                let _ = st
+                    .reply
+                    .send(Err(AppError::Other("Lua 调度器已停止".into())));
             }
         }
         drop(lua_guard);
@@ -5089,8 +5341,9 @@ impl LuaUserData for crate::shared_dict::SharedZone {
         methods.add_method(
             "set",
             |lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
-                let bytes = lua_value_to_bytes(&value)
-                    .ok_or_else(|| mlua::Error::external("值类型不支持（仅 string/number/boolean）"))?;
+                let bytes = lua_value_to_bytes(&value).ok_or_else(|| {
+                    mlua::Error::external("值类型不支持（仅 string/number/boolean）")
+                })?;
                 match this.set(&key, bytes, ex) {
                     Ok(()) => Ok((LuaValue::Boolean(true), LuaValue::Nil)),
                     Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
@@ -5141,11 +5394,11 @@ impl LuaUserData for crate::shared_dict::SharedZone {
         // d:incr(key, delta, init?) -> new_value | nil, err
         methods.add_method(
             "incr",
-            |lua, this, (key, delta, init): (String, i64, Option<i64>)| {
-                match this.incr(&key, delta, init) {
-                    Ok(v) => Ok((LuaValue::Integer(v), LuaValue::Nil)),
-                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
-                }
+            |lua, this, (key, delta, init): (String, i64, Option<i64>)| match this
+                .incr(&key, delta, init)
+            {
+                Ok(v) => Ok((LuaValue::Integer(v), LuaValue::Nil)),
+                Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
             },
         );
         // d:ttl(key) -> 剩余秒数 | -1（永不过期）| nil（不存在）
@@ -5194,13 +5447,16 @@ impl LuaUserData for crate::shared_dict::SharedZone {
         // d:len() -> 总条目数（对标 OpenResty len，等价 num）
         methods.add_method("len", |_, this, ()| Ok(this.num()));
         // d:key_present(key) -> boolean
-        methods.add_method("key_present", |_, this, key: String| Ok(this.key_present(&key)));
+        methods.add_method("key_present", |_, this, key: String| {
+            Ok(this.key_present(&key))
+        });
         // d:force_set(key, value, ex?) -> true | nil, "no memory"（始终覆盖，必要时 LRU 淘汰）
         methods.add_method(
             "force_set",
             |lua, this, (key, value, ex): (String, LuaValue, Option<f64>)| {
-                let bytes = lua_value_to_bytes(&value)
-                    .ok_or_else(|| mlua::Error::external("值类型不支持（仅 string/number/boolean）"))?;
+                let bytes = lua_value_to_bytes(&value).ok_or_else(|| {
+                    mlua::Error::external("值类型不支持（仅 string/number/boolean）")
+                })?;
                 match this.force_set(&key, bytes, ex) {
                     Ok(()) => Ok((LuaValue::Boolean(true), LuaValue::Nil)),
                     Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
@@ -5222,20 +5478,21 @@ impl LuaUserData for crate::shared_dict::SharedZone {
         // d:decr(key, minus, init?) -> new_value | nil, err
         methods.add_method(
             "decr",
-            |lua, this, (key, minus, init): (String, i64, Option<i64>)| {
-                match this.decr(&key, minus, init) {
-                    Ok(v) => Ok((LuaValue::Integer(v), LuaValue::Nil)),
-                    Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
-                }
+            |lua, this, (key, minus, init): (String, i64, Option<i64>)| match this
+                .decr(&key, minus, init)
+            {
+                Ok(v) => Ok((LuaValue::Integer(v), LuaValue::Nil)),
+                Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
             },
         );
         // d:bump(key, inc?) -> new_value | nil, err（允许累加已过期项，不新建）
-        methods.add_method("bump", |lua, this, (key, inc): (String, Option<i64>)| {
-            match this.bump(&key, inc.unwrap_or(1)) {
+        methods.add_method(
+            "bump",
+            |lua, this, (key, inc): (String, Option<i64>)| match this.bump(&key, inc.unwrap_or(1)) {
                 Ok(v) => Ok((LuaValue::Integer(v), LuaValue::Nil)),
                 Err(e) => Ok((LuaValue::Nil, LuaValue::String(lua.create_string(e)?))),
-            }
-        });
+            },
+        );
         // d:set_auto(key, value, expiry?, flags?) —— 无类型存储，flags 被接受但忽略
         methods.add_method(
             "set_auto",
@@ -5302,11 +5559,17 @@ mod tests {
 
         assert!(touched(&recheck_cached_files()), "自检应发现该文件变更");
         assert_eq!(&*load_file_cached(&p).unwrap(), "v2");
-        assert!(!touched(&recheck_cached_files()), "内容未再变化时自检应为空操作");
+        assert!(
+            !touched(&recheck_cached_files()),
+            "内容未再变化时自检应为空操作"
+        );
 
         std::fs::remove_file(&p).unwrap();
         assert!(touched(&recheck_cached_files()), "文件消失应清掉缓存条目");
-        assert!(load_file_cached(&p).is_err(), "缓存已失效且文件不存在 -> 读取报错");
+        assert!(
+            load_file_cached(&p).is_err(),
+            "缓存已失效且文件不存在 -> 读取报错"
+        );
         let _ = std::fs::remove_dir(&dir);
     }
 
@@ -5378,7 +5641,9 @@ mod tests {
     #[test]
     fn thread_body_packs_success_and_error() {
         let lua = mlua::Lua::new();
-        lua.globals().set("__thread_sink", lua.create_table().unwrap()).unwrap();
+        lua.globals()
+            .set("__thread_sink", lua.create_table().unwrap())
+            .unwrap();
         let define: mlua::Function = lua
             .load(
                 r#"return function()
@@ -5464,10 +5729,13 @@ mod tests {
             .unwrap();
         let t: mlua::Table = factory.call(()).unwrap();
         for name in ["spawn", "wait", "yield", "kill"] {
-            assert!(matches!(
-                t.raw_get::<mlua::Value>(name).unwrap(),
-                mlua::Value::Function(_)
-            ), "missing ngx.thread.{name}");
+            assert!(
+                matches!(
+                    t.raw_get::<mlua::Value>(name).unwrap(),
+                    mlua::Value::Function(_)
+                ),
+                "missing ngx.thread.{name}"
+            );
         }
     }
 
@@ -5543,7 +5811,11 @@ mod tests {
     async fn init_worker_runs_per_vm_with_lua_package_path() {
         let dir = std::env::temp_dir().join(format!("onrouter-initw-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("helper.lua"), "return { value = 'loaded-from-disk' }").unwrap();
+        std::fs::write(
+            dir.join("helper.lua"),
+            "return { value = 'loaded-from-disk' }",
+        )
+        .unwrap();
         let dir_slash = dir.to_string_lossy().replace('\\', "/");
         let conf = format!(
             r#"
@@ -5676,9 +5948,7 @@ mod tests {
         let script = dir.join("worker.lua");
         std::fs::write(&script, r#"ngx.shared.t:set("from_file", "yes")"#).unwrap();
         let script_slash = script.to_string_lossy().replace('\\', "/");
-        let conf = format!(
-            "lua_shared_dict t 1m;\ninit_worker_by_lua_file \"{script_slash}\";\n"
-        );
+        let conf = format!("lua_shared_dict t 1m;\ninit_worker_by_lua_file \"{script_slash}\";\n");
         let cfg = Config::parse(&conf).unwrap();
         let engine = LuaEngine::new(&cfg, &dir).unwrap();
         engine.run_init_workers().await.unwrap();
@@ -5694,7 +5964,10 @@ mod tests {
             .expect("_file 形式 init_worker 未生效");
 
         let bad = Config::parse("init_worker_by_lua_file \"definitely-not-exist.lua\";").unwrap();
-        assert!(LuaEngine::new(&bad, &dir).is_err(), "缺失的 init_worker 文件应在启动时报错");
+        assert!(
+            LuaEngine::new(&bad, &dir).is_err(),
+            "缺失的 init_worker 文件应在启动时报错"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5768,7 +6041,11 @@ mod tests {
         "#
         .into();
         engine
-            .run_phase("content_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(code),
+                Arc::clone(&shared),
+            )
             .await
             .expect("ngx.var content phase 执行失败");
         let c = shared.lock().unwrap();
@@ -5818,10 +6095,15 @@ mod tests {
         "#
         .into();
         engine
-            .run_phase("content_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(code),
+                Arc::clone(&shared),
+            )
             .await
             .expect("ngx.re content phase 执行失败");
-        let body = String::from_utf8_lossy(shared.lock().unwrap().body.as_deref().unwrap_or(&[])).to_string();
+        let body = String::from_utf8_lossy(shared.lock().unwrap().body.as_deref().unwrap_or(&[]))
+            .to_string();
         assert!(body.contains("gmatch=a1,b2,c3,"), "{body}");
         assert!(body.contains("sub=X world foo/1"), "{body}");
         assert!(body.contains("gsub=a_b_c/2"), "{body}");
@@ -5848,16 +6130,30 @@ mod tests {
         "#
         .into();
         engine
-            .run_phase("content_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(code),
+                Arc::clone(&shared),
+            )
             .await
             .expect("ngx.req header phase 执行失败");
         let c = shared.lock().unwrap();
-        let find = |k: &str| c.req_headers.iter().filter(|(n, _)| n == k).map(|(_, v)| v.clone()).collect::<Vec<_>>();
+        let find = |k: &str| {
+            c.req_headers
+                .iter()
+                .filter(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(find("x-foo"), vec!["bar"], "set_header 归一化小写名");
         assert_eq!(find("x-multi"), vec!["a", "b"], "表值按序写多值");
         assert!(find("x-del").is_empty(), "value=nil 应删除该头");
         assert!(find("user-agent").is_empty(), "clear_header 删除");
-        assert_eq!(find("X-Raw-Name"), vec!["kept"], "set_raw_header 保留原始名");
+        assert_eq!(
+            find("X-Raw-Name"),
+            vec!["kept"],
+            "set_raw_header 保留原始名"
+        );
     }
 
     // ngx.req.socket：对已缓冲请求体的顺序读取（receive/receiveuntil/close）
@@ -5884,11 +6180,15 @@ mod tests {
         "#
         .into();
         engine
-            .run_phase("content_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(code),
+                Arc::clone(&shared),
+            )
             .await
             .expect("req.socket phase 执行失败");
-        let body =
-            String::from_utf8_lossy(shared.lock().unwrap().body.as_deref().unwrap_or(&[])).to_string();
+        let body = String::from_utf8_lossy(shared.lock().unwrap().body.as_deref().unwrap_or(&[]))
+            .to_string();
         assert!(body.contains("a=part1"), "{body}");
         assert!(body.contains("b=\r\n\r\n"), "{body}");
         assert!(body.contains("c=part"), "{body}");
@@ -5919,7 +6219,11 @@ mod tests {
         "#
         .into();
         engine
-            .run_phase("content_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .run_phase(
+                "content_by_lua",
+                &LuaSource::Inline(code),
+                Arc::clone(&shared),
+            )
             .await
             .expect("flush phase 执行失败");
 
@@ -5983,7 +6287,11 @@ mod tests {
         )
         .into();
         engine
-            .run_phase("ssl_certificate", &LuaSource::Inline(code), Arc::clone(&shared))
+            .run_phase(
+                "ssl_certificate",
+                &LuaSource::Inline(code),
+                Arc::clone(&shared),
+            )
             .await
             .expect("ssl phase 执行失败");
         {
@@ -6003,7 +6311,11 @@ mod tests {
         let shared = Arc::new(Mutex::new(ctx));
         let code: Arc<str> = "ngx.exit(ngx.ERROR)".into();
         engine
-            .run_phase("ssl_certificate", &LuaSource::Inline(code), Arc::clone(&shared))
+            .run_phase(
+                "ssl_certificate",
+                &LuaSource::Inline(code),
+                Arc::clone(&shared),
+            )
             .await
             .expect("ngx.exit(ngx.ERROR) 不应抛 Lua 错误");
         assert!(shared.lock().unwrap().ssl.as_ref().unwrap().aborted);
@@ -6028,7 +6340,11 @@ mod tests {
         "#
         .into();
         engine
-            .run_phase("body_filter_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .run_phase(
+                "body_filter_by_lua",
+                &LuaSource::Inline(code),
+                Arc::clone(&shared),
+            )
             .await
             .expect("body_filter phase 执行失败");
         let c = shared.lock().unwrap();
@@ -6043,7 +6359,8 @@ mod tests {
         let engine = LuaEngine::new(&cfg, &base).unwrap();
         let mut ctx = RequestCtx::default();
         ctx.status = 200;
-        ctx.resp_headers.push(("content-type".into(), "text/plain".into()));
+        ctx.resp_headers
+            .push(("content-type".into(), "text/plain".into()));
         let shared = Arc::new(Mutex::new(ctx));
         let code: Arc<str> = r#"
             ngx.status = 203
@@ -6052,12 +6369,26 @@ mod tests {
         "#
         .into();
         engine
-            .run_phase("header_filter_by_lua", &LuaSource::Inline(code), Arc::clone(&shared))
+            .run_phase(
+                "header_filter_by_lua",
+                &LuaSource::Inline(code),
+                Arc::clone(&shared),
+            )
             .await
             .expect("header_filter phase 执行失败");
         let c = shared.lock().unwrap();
         assert_eq!(c.status, 203);
-        assert!(c.resp_headers.iter().any(|(k, v)| k == "x-filtered" && v == "yes"), "{:?}", c.resp_headers);
-        assert!(!c.resp_headers.iter().any(|(k, _)| k == "content-type"), "{:?}", c.resp_headers);
+        assert!(
+            c.resp_headers
+                .iter()
+                .any(|(k, v)| k == "x-filtered" && v == "yes"),
+            "{:?}",
+            c.resp_headers
+        );
+        assert!(
+            !c.resp_headers.iter().any(|(k, _)| k == "content-type"),
+            "{:?}",
+            c.resp_headers
+        );
     }
 }

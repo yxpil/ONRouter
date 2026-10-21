@@ -3,7 +3,9 @@ name: CI
 # 单元测试 + 关键特性 E2E。release.yml 只负责打各类平台的包，不跑测试；
 # 这里把"能编译"和"行为正确"分开守住：
 #   unit  全量 Rust 单元测试（配置解析、路由、WASM、熔断、缓存、Lua…）
-#   e2e   灰度 / WASM / 熔断懒重连 / CPU 亲和性 / 业务分流 / 响应缓存磁盘冷层，全部走真实端口和真实后端
+#   e2e   功能契约：灰度 / WASM / 熔断懒重连 / CPU 亲和性 / 业务分流 / 缓存磁盘冷层 /
+#         限流键 / expires / 惊群 / 攻击面矩阵，全部走真实端口和真实后端
+#   e2e   业务形状：选课报名、静态站+WASM+Lua、游戏 UDP（第二步）；同一站点 over h1/h2/h3 的跨传输一致性（第三步，需要 orr-h3check 探针）
 #   soak  手动触发，20 分钟混合流量并分析进程私有内存趋势（不在每次 push 上烧 20 分钟）
 on:
   push:
@@ -68,11 +70,30 @@ jobs:
       - name: Run feature E2E
         run: |
           mkdir -p conf/logs
-          for suite in canary wasm resilience affinity proxy_split proxy_disk; do
+          for suite in canary wasm resilience affinity proxy_split proxy_disk \
+                       limit_key expires herd security_matrix; do
             echo "::group::${suite}_e2e"
             python3 "tools/${suite}_e2e.py"
             echo "::endgroup::"
           done
+
+      - name: Run business-shape E2E
+        run: |
+          mkdir -p conf/logs
+          for suite in course_selection production_shape game_udp; do
+            echo "::group::${suite}_e2e"
+            python3 "tools/${suite}_e2e.py"
+            echo "::endgroup::"
+          done
+
+      - name: Run HTTP/3 + HTTPS business E2E
+        # 这条需要 h3 客户端探针（与网关同栈的 quinn+h3），Linux 上同样是自研客户端
+        run: |
+          mkdir -p conf/logs
+          cargo build --release -p onrouter-server --bin orr-h3check
+          echo "::group::quic_business_e2e"
+          python3 tools/quic_business_e2e.py
+          echo "::endgroup::"
 
       - name: Upload logs on failure
         if: failure()

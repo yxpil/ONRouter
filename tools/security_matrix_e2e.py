@@ -519,6 +519,35 @@ def s4_upgrade_uri_desync(tmp):
         gw.stop()
 
 
+def s13_duplicate_host(tmp):
+    """两条 Host 头必须 400（RFC 9112 只允许一条）。
+
+    历史行为是"取第一条"：客户端库常在显式 Host 之前自动加一条 `127.0.0.1:端口`，
+    于是请求被路由到该端口的**默认站点**——响应完全正常，只是内容来自别的租户。
+    这类"看起来成功"的跨站点路由比一个 400 危险得多。（随机拓扑套件正是被这个形态
+    骗出了几十条"网关选错 vhost"的假故障。）
+    """
+    gw = Gateway(tmp, "s13", '  location / { return 200 "ok"; }', head="")
+    try:
+        assert gw.ready(), gw.dead
+        dup = (b"GET / HTTP/1.1\r\n"
+               b"Host: 127.0.0.1:18320\r\n"
+               b"Host: sec.local\r\n"
+               b"Connection: close\r\n\r\n")
+        got = raw_request(dup)
+        first = got.split(b"\r\n", 1)[0]
+        check("S13 两条 Host 头被拒（400，不是默默按第一条路由）", b"400" in first, first[:60])
+
+        one = (b"GET / HTTP/1.1\r\n"
+               b"Host: sec.local\r\n\r\n")
+        got1 = raw_request(one)
+        # 对照组：单条 Host 照常服务，证明上面的 400 不是"整台都在拒"
+        check("S13 对照组：单条 Host 正常放行", b"200" in got1.split(b"\r\n", 1)[0],
+              got1.split(b"\r\n", 1)[0][:60])
+    finally:
+        gw.stop()
+
+
 def s5_stalled_upload(tmp):
     """proxy_request_buffering off 的上传也受 client_body_timeout 管。"""
     gw = Gateway(
@@ -759,23 +788,40 @@ def s10_dict_tmp_link_overwrite(tmp):
 
 
 def s11_limit_key_var_is_a_hard_error(tmp):
-    """限流区只能按客户端地址建 key。写了别的变量（`$http_x_api_key`、`$uri`…）时，
-    请求路径**根本不展开它**，于是运维以为在按令牌限流，实际在按 IP 限流。
-    这类"配置写了但那一维不存在"是静默的按预期失败放行，必须在 -t 就硬否决。"""
+    """限流区的 key 必须在判定时刻展开得出值。历史上更糟：写了 `$http_x_api_key` 也能过 -t，
+    然后暗地里按 `$remote_addr` 计数——运维以为在按令牌限流，实际在按 IP 限。
+    现在请求期变量真的参与计数（`tools/limit_key_e2e.py` 判行为），这一项判的是另一头：
+    判定时刻取不到值的写法（响应期变量、`$request_body`、常量键）必须被 -t 硬否决，
+    因为那种键会把全区并成一个空桶/常量桶，是比"按 IP 限"更静默的策略反转。"""
     head = 'error_log "%s" warn;\npid "%s";\n' % (slash(os.path.join(tmp, "s11_t_err.log")),
                                                   slash(os.path.join(tmp, "s11_t.pid")))
-    bad = head + ("limit_req_zone $http_x_api_key zone=bykey:1m rate=10r/s;\n"
-                  "server { listen 127.0.0.1:18320; server_name sec.local;"
-                  " location / { limit_req zone=bykey; return 200 \"ok\"; } }\n")
-    rc, out = run_t(tmp, "s11", bad)
-    check("S11 -t 否决非地址 key 的 limit_req_zone", rc != 0, f"rc={rc} 输出尾部={out[-300:]!r}")
-    check("S11 报错点名那个 key 并说清只支持什么",
-          "$http_x_api_key" in out and "只支持" in out, out[-300:])
-    ok = head + ("limit_req_zone $binary_remote_addr zone=byip:1m rate=10r/s;\n"
-                 "server { listen 127.0.0.1:18320; server_name sec.local;"
-                 " location / { limit_req zone=byip; return 200 \"ok\"; } }\n")
-    rc2, out2 = run_t(tmp, "s11ok", ok)
-    check("S11 对照组：$binary_remote_addr 照常通过", rc2 == 0, f"rc={rc2} {out2[-300:]!r}")
+    # 判定时刻取不到值的 key：全区会并成一个空桶/常量桶，必须否决
+    for bad_key, why in [
+        ("$status", "响应期变量"),
+        ("$request_body", "判定时刻请求体还没读完"),
+        ("$upstream_addr", "后端变量"),
+        ("$server_name", "本实现没有这个变量"),
+        ("$1abc", "没有任何可展开变量＝常量键"),
+    ]:
+        bad = head + ("limit_req_zone " + bad_key + " zone=bykey:1m rate=10r/s;" + chr(10)
+                      + "server { listen 127.0.0.1:18320; server_name sec.local;"
+                      + " location / { limit_req zone=bykey; return 200 " + chr(34) + "ok"
+                      + chr(34) + "; } }" + chr(10))
+        rc, out = run_t(tmp, "s11", bad)
+        check("S11 -t 否决 " + bad_key + "（" + why + "）", rc != 0,
+              "rc=" + str(rc) + " 输出尾部=" + repr(out[-200:]))
+        bare = bad_key.replace("$", "").lstrip("1")
+        check("S11 报错点名 " + bad_key, bare in out, out[-200:])
+
+    # 请求期变量现在真的参与计数：这一维必须通过 -t
+    # （真实计数行为由 tools/limit_key_e2e.py 判：全部同 IP，换键就必须换桶）
+    for good in ["$binary_remote_addr", "$http_x_api_key", "$cookie_sid", "$arg_token"]:
+        okc = head + ("limit_req_zone " + good + " zone=bykey:1m rate=10r/s;" + chr(10)
+                      + "server { listen 127.0.0.1:18320; server_name sec.local;"
+                      + " location / { limit_req zone=bykey; return 200 " + chr(34) + "ok"
+                      + chr(34) + "; } }" + chr(10))
+        rcd, outd = run_t(tmp, "s11ok", okc)
+        check("S11 对照组：" + good + " 通过 -t", rcd == 0, "rc=" + str(rcd) + " " + repr(outd[-200:]))
 
 
 def s12_vip_slot_collision(tmp):
@@ -848,7 +894,8 @@ def main():
     probes = [s1_auth_without_file, s2_empty_hash, s3_htpasswd_staleness,
               s4_upgrade_uri_desync, s5_stalled_upload, s6_sub_filter_memory, s7_lua_infinite_loop,
               s9_lkg_private_body_leaks, s10_dict_tmp_link_overwrite,
-              s11_limit_key_var_is_a_hard_error, s12_vip_slot_collision]
+              s11_limit_key_var_is_a_hard_error, s12_vip_slot_collision,
+              s13_duplicate_host]
     if len(sys.argv) > 1:  # python tools/security_matrix_e2e.py s5,s6
         want = {x.strip() for x in sys.argv[1].split(",")}
         probes = [p for p in probes if p.__name__.split("_")[0] in want]

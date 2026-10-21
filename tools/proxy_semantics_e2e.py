@@ -240,12 +240,12 @@ def main():
 
         # 8) proxy_send_timeout：sink 不收 body，300ms 写空闲后断开（远早于 30s read 超时）
         st, _, el = request("/big", data=BIG, timeout=40)
-        check("/big 后端不收 body → 502", st == 502, f"st={st}")
+        check("/big 后端不收 body → 504（写超时也是超时，不是连不上）", st == 504, f"st={st}")
         check("/big 在 send_timeout(300ms) 后快速失败（<1.5s）", el < 1.5, f"elapsed={el:.2f}s")
 
         # 9) 对照：send=0 时只能等 read 超时(2s)
         st, _, el = request("/big-nolimit", data=BIG, timeout=40)
-        check("/big-nolimit send=0 不被写超时掐断 → 由 read 2s 兜底 502", st == 502, f"st={st}")
+        check("/big-nolimit send=0 不被写超时掐断 → 由 read 2s 兜底 504", st == 504, f"st={st}")
         check("/big-nolimit 耗时 >=1.7s（证明没有 300ms 写超时）", el >= 1.7, f"elapsed={el:.2f}s")
 
         # 10) 正常后端持续读取：写超时不应误伤 8MB 上传

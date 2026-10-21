@@ -11,6 +11,10 @@
 # 另外证明两件最容易骗人的事：
 #   * 连接失败的耗时**不入账**（那是超时阈值不是后端的快慢）：死节点的 EWMA 恒为 0，
 #     但它确实进了 requests_total{result="failure"}。
+#   * "客户端更快"用**均值**判，不用"p50 要快一倍"判：on 档的样本是几毫秒与约两百毫秒两个峰
+#     的混合，中位数压在峰间边界上，样本再多也稳不住；而 P2C 每请求只比较两个候选，最快节点
+#     不在候选里时必然被略过——它对"迁移多少"的承诺本来就比"赢家通吃"弱。均值收敛快，且
+#     在"分数完全不参与选点"的情形下两侧相等，判据照样会红。
 #   * 配置层的冲突是错误不是告警：ip_hash + least_time（分数永远不参与）、least_time detect
 #     （那是 front_proxy_mode 的词）在 -t 就拒绝；单节点池只告警（无从比较，不算错）。
 #
@@ -288,8 +292,9 @@ def main():
         # ---- off：纯轮询基线（同时也是后面所有比较的分母） ----
         off_seq = [hit("/off")[0] for _ in range(24)]
         check("off 档严格轮询：24 次里三个后端各 8 次", [off_seq.count(t) for t in "abc"] == [8, 8, 8], str(off_seq))
-        off_dt = [hit("/off")[1] for _ in range(12)]
+        off_dt = [hit("/off")[1] for _ in range(60)]
         off_p50 = statistics.median(off_dt)
+        off_mean = statistics.fmean(off_dt)
         check("off 档的 p50 就是轮询的中间值（~200ms 量级）", 0.1 < off_p50 < 0.6, f"p50={off_p50:.3f}")
 
         # ---- observe：逐次与 off 一致，但真的量出了三个后端的快慢 ----
@@ -315,17 +320,33 @@ def main():
               all(warm.count(t) >= 1 for t in "abc"), str(warm))
         check("冷启动探索单独计数（cold>0）", d1["cold"] > 0, str(d1))
 
-        on_seq = [hit("/on")[0] for _ in range(45)]
-        on_dt = [hit("/on")[1] for _ in range(24)]
+        # 判据是"相对同一轮里的轮询基线偏了多少"，不是"a 得占多数"。P2C 每请求只比较两个
+        # 候选，最快节点不在候选里时必然被略过（未测过的节点还总是先被探索一次），所以
+        # 2/3 是理想上界而不是期望值；以前写死的 `>=0.55` 在满载的回归里会压在阈值上抖
+        # （实测 0.51 挂过一次），那测的不是"分数有没有用"，是机器的噪声。120 个样本下
+        # 基线差值的抖动约 ±0.06，0.15 这道线要"完全不看分数"才会红。
+        on_seq = [hit("/on")[0] for _ in range(120)]
+        on_dt = [hit("/on")[1] for _ in range(60)]
         text = metrics_text()
         d_on = diff(before_on, counters(text, "ltOn"))
         check("on 档确实由分数选点（picked 与请求数一致）",
               d_on["picked"] == len(warm) + len(on_seq) + len(on_dt), str(d_on))
-        check("on 档把流量移到了最快的后端（a 占多数）", share(on_seq, "a") >= 0.55, f"a={share(on_seq, 'a'):.2f} {on_seq[:12]}")
+        shift = share(on_seq, "a") - share(off_seq, "a")
+        check("on 档把流量偏向最快的后端：相对轮询基线至少多拿走 15 个百分点",
+              shift >= 0.15, f"a 在 on 档 {share(on_seq, 'a'):.2f} vs off 档 "
+                             f"{share(off_seq, 'a'):.2f}（差 {shift:.2f}）")
         check("on 档不再给最慢的后端流量（c ≈ 0）", share(on_seq, "c") <= 0.15, f"c={share(on_seq, 'c'):.2f}")
         on_p50 = statistics.median(on_dt)
-        check("客户端 p50 真的降了（on 比 off 至少快一倍）",
-              on_p50 < off_p50 / 2, f"off p50={off_p50:.3f} on p50={on_p50:.3f}")
+        on_p90 = sorted(on_dt)[int(len(on_dt) * 0.9)]
+        on_mean = statistics.fmean(on_dt)
+        # 比"平均"而不是比"p50 要快一倍"：on 档的样本是两个峰的混合（最快后端几毫秒、
+        # 次快后端约 200ms），中位数正好压在两峰之间的边界上，n 再大也稳不住；P2C 每请求
+        # 只比两个候选，本来就不承诺"中位数减半"。均值收敛快，且"分数被忽略"时两侧相等，
+        # 这条判据仍然会红。p50/p90 照样打印出来给人读。
+        check("客户端确实更快了：on 档平均耗时比 off 档低至少 20%",
+              on_mean < off_mean * 0.8,
+              f"off mean={off_mean:.3f} p50={off_p50:.3f} / on mean={on_mean:.3f} "
+              f"p50={on_p50:.3f} p90={on_p90:.3f}")
 
         # ---- 中途退化：a 突然变慢（0.005→0.400，比 b 还慢一倍）、c 突然变快，迁移必须反过来 ----
         backends["a"].delay = 0.400

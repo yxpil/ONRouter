@@ -48,6 +48,29 @@ BASE = f"http://127.0.0.1:{GW_PORT}"
 ERR_LOG = ROOT / "conf" / "logs" / "soak_err.log"
 OUT_LOG = ROOT / "conf" / "logs" / "soak_out.log"
 CACHE_DIR = ROOT / "conf" / "logs" / "soak_cache"
+
+
+def cache_dirs():
+    """压测配置里声明的**每一个** proxy_cache_path 目录都要清干净。
+
+    过去只清 soak_cache，而 conf/soak.conf 还有 `logs/soak_cold disk=on`：上一轮的冷层文件
+    留在原地，这一轮启动扫描把它们记成 `op="corrupt"`，把"冷层账目干净"这条证据弄脏了。
+    目录名从配置里读，避免两边各写一份再飘走。
+    """
+    import re
+
+    p = ROOT / CONF_REL
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [CACHE_DIR, ROOT / "conf" / "logs" / "soak_cold"]
+    names = re.findall(r"proxy_cache_path\s+([^;\s]+)", text)
+    dirs = [ROOT / "conf" / n for n in dict.fromkeys(names)] if names else []
+    if not dirs:
+        dirs = [CACHE_DIR]
+    if (ROOT / "conf" / "logs" / "soak_cold") not in dirs:
+        dirs.append(ROOT / "conf" / "logs" / "soak_cold")
+    return dirs
 STATIC_FILE = ROOT / "conf" / "soak_static" / "static.txt"
 REPORT_JSON = ROOT / "target" / "soak_report.json"
 SAMPLES_CSV = ROOT / "target" / "soak_samples.csv"
@@ -498,7 +521,8 @@ def main():
     if test.returncode != 0:
         raise SystemExit("!! 压测配置未通过 -t：\n" + ((test.stdout or "") + (test.stderr or ""))[-1200:])
 
-    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    for d in cache_dirs():
+        shutil.rmtree(d, ignore_errors=True)
     (ROOT / "conf" / "logs").mkdir(parents=True, exist_ok=True)
     for f in (ERR_LOG, OUT_LOG):
         if f.exists():

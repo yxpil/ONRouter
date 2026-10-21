@@ -22,8 +22,10 @@ WASM 鉴权、Lua 脚本和 CPU 绑定的网关。每一章都有可执行的命
 | 8 | Lua 内容与共享字典 | `/lua`、`/lua/count` |
 | 9 | 工作线程与 CPU 亲和性 | `-t` 的逐线程计划 |
 | 10 | 指标、热重载边界、优雅停机 | `/metrics`、改配置 |
-| 11 | 单元测试、E2E、20 分钟稳定性压测、CI | `tools/soak_test.py` |
-| 12 | 把完整配置讲清楚 + 上线检查表 | `conf/tutorial_full.conf` |
+| 11 | 单元测试、E2E、长时稳定性压测、CI | `tools/soak_test.py` |
+| 12 | 限流的键、空键语义、超限即拒 vs 有界排队 | `conf/tutorial_limit.conf` |
+| 13 | TCP 隧道、SNI 分流、UDP 数据报与会话上限 | `conf/tutorial_stream.conf` |
+| 14 | 把完整配置讲清楚 + 上线检查表 | `conf/tutorial_full.conf` |
 
 ---
 
@@ -54,7 +56,7 @@ target/release/orr-gencert     # Windows: target\release\orr-gencert.exe
 
 ```bash
 target/release/onrouter -V
-# ONRouter/1.0.0 (Rust, OpenResty-compatible)
+# ONRouter/1.0.2 (Rust, OpenResty-compatible)
 ```
 
 教程里的辅助后端和压测脚本需要 Python 3.8+，只用于本机练习，不参与网关进程。
@@ -139,10 +141,37 @@ curl -i http://127.0.0.1:18600/
 - `/health` 返回 `200` 和 `ok`；
 - `/hello` 返回 `200` 和 `hello from onrouter`；
 - `/` 返回 `public/index.html`；
-- 响应头里有 `Server: ONRouter/1.0.0`（可通过 `server_tokens` 调整）。
+- 响应头里有 `Server: ONRouter/<版本>`（跟着 crate 版本走，可用 `server_tokens` 关掉）。
 
 停止：前台按 `Ctrl+C`；Linux/macOS 也可以 `kill -TERM <pid>`。进程会停止接受新连接，
 等待存量请求完成，最长 `shutdown_grace`（默认 30 秒）。
+
+### 2.1 让资产真的被浏览器缓存住：`expires`
+
+静态站部署到网关上，第一件事通常是"给带指纹的 JS/CSS 一年，别让人人每次都回源"。
+`add_header Cache-Control …` 能做到，但 nginx 用户写的其实是 `expires`，而它有自己的口径：
+
+```nginx
+server {
+    root "../public";
+    expires 1h;                       # 兜底：整站一小时
+    location /assets/ { expires max; }    # 文件名带哈希的资产：十年
+    location /login   { expires off; }    # 显式不写（"没写"和"off"是两回事）
+}
+```
+
+- `off / epoch / max / @23:59:59 / -1h / "private, no-store"` 全部按 nginx 语义落头：
+  正时长 → `max-age` + 未来的 `Expires`；负时长或已过去的 `@时刻` → `no-cache`；
+  `max` → `public, max-age=315360000`；`epoch` → `no-store`；裸文本原样作为 `Cache-Control`。
+- 只在可缓存的状态码上改写（200/201/206/3xx/304）；404、500 一个字都不动。
+- location 写了就整条替换 server 的，不叠加。
+- 网关的策略**覆盖源站自己发的 `Cache-Control`**（nginx 的 header filter 同样如此）。
+- 写坏时间值（`expires 1x;`）在 `-t` 直接失败：那种配置落下去是"响应里没有过期头"，
+  而人以为已经缓存住了——这类静默失效是本项目最不接受的故障形态。
+
+`expires` 只管客户端（和下游 CDN）看到的头，本机 `proxy_cache` 存多久是 §5 的
+`proxy_cache_valid`，两维分开想。验证见 `tools/expires_e2e.py`（静态、反代、缓存命中、
+Lua 缓冲与已 flush 的流式、`return`、404 逐条钉住）。
 
 ---
 
@@ -158,6 +187,8 @@ python tools/tutorial_backend.py a 18601
 # 终端 B
 python tools/tutorial_backend.py b 18602
 ```
+
+### 3.1 最小反代与路径前缀
 
 现在用完整教程配置启动网关。它包含本章及后面所有章节的模块，先整体 `-t` 一次：
 
@@ -196,6 +227,21 @@ curl -s http://127.0.0.1:18600/api/hello
 `/` 会把 `/api/` 前缀替换掉，后端收到 `/hello`；如果写成 `proxy_pass http://app;`（无末尾
 斜杠），后端会收到完整的 `/api/hello`。这是 nginx 的既有语义，迁移时最容易踩。
 
+替换规则是**纯字符串替换**，不补斜杠也不去重：转发的路径 = `proxy_pass` 的 URI 部分 +
+"请求路径去掉匹配到的 location 前缀之后剩下的部分"。三条边界值得记住（都有用例钉住，
+`proxy::tests::proxy_pass_uri_replacement_is_pure_string_replacement`）：
+
+- 请求路径**正好等于** location 前缀时，余下部分是空的，转发的就是 URI 部分本身——
+  `location /api/hot` + `proxy_pass http://app/api/hot;` 收到 `/api/hot` 转 `/api/hot`，
+  **不是** `/api/hot/`（1.0.2 之前会被补一个尾斜杠，后端因此把同一个资源看成两条路由，
+  缓存键也跟着分叉）；
+- `location /api`（不带尾斜杠）也会匹配 `/apix`，此时转 `/v1x`——nginx 就是这个行为，
+  所以文档一直劝 location 以 `/` 结尾；
+- `location /api` + `proxy_pass http://app/v1/;` 收到 `/api/x` 转 `/v1//x`（双斜杠），
+  nginx 同样不做去重。想避免就把 location 写成 `/api/`。
+
+### 3.2 upstream 的负载与长连接选项
+
 `upstream` 里可以按需加：
 
 ```nginx
@@ -209,7 +255,7 @@ keepalive 32;    # 到后端的空闲长连接池
 `lazy_rejoin`、`circuit_breaker`、权重）需要**重启进程**，热重载不会替换已经运行的池，
 具体边界见第 10 章。
 
-### 3.4 整站跳转与 server 级的 `return` / `set` / `if`
+### 3.3 整站跳转与 server 级的 `return` / `set` / `if`
 
 只把 80 端口的流量搬到 443，配置就是一个不写任何 location 的 vhost：
 
@@ -805,7 +851,7 @@ curl -s http://127.0.0.1:18600/health
 
 ---
 
-## 11. 测试、20 分钟稳定性压测与 CI
+## 11. 测试、长时稳定性压测与 CI
 
 ### 11.1 单元测试与静态检查
 
@@ -817,24 +863,47 @@ cargo clippy --workspace --all-targets
 仓库现有代码里可能有一些历史 clippy 告警，CI 不把它们设为 `-D warnings`；但新增代码不应
 引入新的 warning。
 
-### 11.2 六组真实流量 E2E
+### 11.2 E2E：功能契约与业务形状两层
 
-这些脚本会自己起网关、后端和探针，使用固定端口；运行前先停掉本机占用这些端口的进程。
-教程的 18600 不会冲突。
+这些脚本自己起网关、起后端、自己发请求，使用固定端口；运行前先停掉本机占用这些端口的进程
+（教程的 18600 与本章示例不冲突）。跑全部：
 
 ```bash
-python tools/canary_e2e.py        # 22 项
-python tools/wasm_e2e.py         # 23 项
-python tools/resilience_e2e.py   # 17 项
-python tools/affinity_e2e.py     # 7 项
-python tools/proxy_split_e2e.py  # 76 项
-python tools/proxy_disk_e2e.py   # 39 项（响应缓存磁盘冷层）
+python run_regression.py                # 串行跑完 tools/*_e2e.py 与根目录脚本
+python run_regression.py --only expires_e2e   # 只跑其中一条
 ```
 
-它们验证的是行为，不是“能编译”：灰度第一条命中、熔断半开、懒重连真实探针、WASM 改写
-状态/头/体、亲和性逐线程绑定、分流账本、缓存冷层的落盘/读回/跨重启/坏文件不发错内容等
-（合计 184 项断言）。任何一项失败都会打印 HTTP 状态、响应头或进程日志，先看脚本输出再改代码。
-缓存那条套件还额外盯着"后端计数不变"这一件事——它是唯一能证明命中真的没回源的证据。
+单独拎出来值得先看的几条，分两类。
+
+**功能契约**——一条指令一种行为，逐项对照 nginx 的语义：
+
+```bash
+python tools/canary_e2e.py        # 22 项：灰度第一条命中
+python tools/wasm_e2e.py          # 23 项：WASM 改写状态/头/体
+python tools/resilience_e2e.py    # 17 项：熔断半开、懒重连真实探针
+python tools/affinity_e2e.py      #  7 项：逐线程绑核
+python tools/proxy_split_e2e.py   # 76 项：分流账本守恒
+python tools/proxy_disk_e2e.py    # 39 项：缓存冷层落盘/读回/跨重启/坏文件不发错内容
+python tools/limit_key_e2e.py     # 35 项：限流键取哪一维、空键语义、队列救回的是谁
+python tools/expires_e2e.py       # 42 项：expires 各写法与继承
+```
+
+**业务形状**——按真实流量的样子打，验证的是"整套东西凑在一起还成不成立"：
+
+```bash
+python tools/course_selection_e2e.py   # 学校选课：2400 学生 ×13 请求，不超卖
+python tools/production_shape_e2e.py   # 800 文件静态站 + WASM + Lua 同进程（529 项）
+python tools/herd_e2e.py               # 缓存惊群：TTL 到期时源站被打几次
+python tools/game_udp_e2e.py           # 游戏服务器：60 客户端 UDP、心跳洪水、会话上限
+python tools/flash_sale_e2e.py         # 秒杀：瞬时并发 + 排队 + 库存不超卖
+python tools/security_matrix_e2e.py    # 攻击面矩阵：49 项，含 -t 应当否决的写法
+```
+
+它们验证的是行为，不是"能编译"：选课那条要求**源站实际报名人数等于网关放行数**（把 409
+当成"被拦"会得出假矛盾）；惊群那条数的是 TTL 到期的那一刻有几个请求真的回源；UDP 那条
+逐包核对回包有没有串到别的客户端手上；缓存那条还额外盯着"后端计数不变"这一件事——它是
+唯一能证明命中真的没回源的证据。任何一项失败都会打印 HTTP 状态、响应头或进程日志，
+先看脚本输出再改代码。
 
 ### 11.3 21 分钟稳定性压测
 
@@ -877,14 +946,232 @@ target/soak_metrics_end.txt
 `.github/workflows/ci.yml` 在 push / PR 到 `master`/`main` 时运行：
 
 - `unit`：`cargo test --workspace` + clippy；
-- `e2e`：release 构建后依次跑上面五组脚本，失败时上传 `conf/logs/`；
+- `e2e`：release 构建后依次跑上面这些脚本，失败时上传 `conf/logs/`；
 - `soak`：仅 `workflow_dispatch` 且输入分钟数非 0 时运行（建议填 21），报告作为 artifact 上传。
 
 本地通过不等于 CI 通过：CI 是 Linux，端口、路径大小写、证书和信号行为都要以它为准。
 
 ---
 
-## 12. 完整配置导读与上线检查表
+## 12. 限流与配额：先回答"谁和谁共享同一个桶"
+
+限流是网关上最容易"配了等于没配"的功能：指令写进去了、`-t` 过了、指标也在动，但**计数的
+维度不是你想要的那个**。所以本章从键开始，不从指令列表开始。本章的例子都在
+`conf/tutorial_limit.conf` 里，可以直接跑：`python tools/tutorial_limit_check.py`（17 项）。
+
+### 12.1 一个键就是一个桶
+
+```nginx
+# 一个进程里声明多个区：每种维度各自一个桶
+limit_req_zone $binary_remote_addr zone=perip:1m    rate=50r/s burst=100;
+limit_req_zone $cookie_sid         zone=peruser:1m  rate=2r/s  burst=5;
+limit_req_zone $http_x_api_key     zone=perapp:1m   rate=50r/s burst=100;
+
+server {
+    listen 18650;
+    server_name limit.test;
+
+    location = /ping { return 200 "pong"; }
+    location /api/order/  { limit_req zone=peruser; return 200 "ok"; }
+    location /api/public/ { limit_req zone=perapp;  return 200 "ok"; }
+    location /            { limit_req zone=perip;   return 200 "ok"; }
+}
+```
+
+`$remote_addr` / `$binary_remote_addr` 之外，键可以是**判定时刻已经有值**的变量：
+
+- `$http_<头>`、`$cookie_<名>`、`$arg_<参数>`——按调用方 / 会话 / 令牌计数；
+- `$uri`、`$host`、`$scheme`、`$request_method`、`$server_port`、`$args`、`$remote_port`…；
+- 拼接：`$cookie_sid$remote_addr`（同一会话在不同来源各算一个桶）。
+
+写不下去的会被 `-t` **直接否决**，不会只给一行告警：`$status`、`$upstream_*`、`$sent_http_*`
+（判定发生在回源之前，这些还没有值）、`$request_body`（那时请求体还没读完）、`$server_name`
+（本实现没有这个变量），以及 `set` 出来的变量（限流跑在 REWRITE 之前，`set` 还没执行）。
+它们的共同后果是**整个区并成一个键**——比"按 IP 限"更静默，也更难发现。
+
+### 12.2 空键 = 这个请求不受本区限流
+
+`limit_req_zone $http_x_api_key …` 只对**带这个头**的请求生效；没带的请求在这一维上没有值，
+本区直接放行（nginx 同义）。这是设计而不是漏洞，但它意味着"按调用方限流"必须和 ACL 或
+`if` + `return` 搭配，否则不带头的流量完全不受约束：
+
+```nginx
+location /api/public/ {
+    if ($http_x_api_key = "") { return 401 "need api key\n"; }
+    limit_req zone=perapp;
+    return 200 "ok";
+}
+```
+
+不带 `X-Api-Key` 的请求在这里得到 401，带上才进入 `perapp` 这一维。
+（`if ($x = "")` 这种"空串右值"曾经被括号处理顺手滤掉，判成"缺少右值"——那是配置起不来的
+真 bug，1.0.2 已修，并有用例 `if_accepts_an_empty_string_right_side` 钉住。）
+
+### 12.3 超限即拒，还是有界排队
+
+默认行为等价 nginx 的 `nodelay`：超了就 429。加上 `limit_req_queue` 之后，超出的请求
+**在判定的那一刻就把令牌预留下来**再等，所以"排上了又被拒"不会发生：
+
+```nginx
+limit_req_zone $cookie_sid zone=plain:1m  rate=2r/s burst=0;   # 只有超限即拒
+limit_req_zone $cookie_sid zone=queued:1m rate=2r/s burst=0;   # 同一份 rate
+limit_req_queue queued depth=20 depth_min=20 max_delay=3000ms;
+```
+
+同一份 `rate=2r/s burst=0`、同一时刻发出 4 个请求，本机实测：
+
+| 位置 | 4 个请求的状态 | 完成时刻 |
+|---|---|---|
+| `/api/plain/x`（不排队） | 1×200 + 3×429 | 2/2/2/2 ms |
+| `/api/queued/x`（排队） | 4×200 | 1/512/1009/1506 ms |
+
+排队那条的等待正好是补桶间隔（500 ms）的整数倍：第 2、3、4 个请求在判定时就分别预留了
+0.5/1/1.5 s 之后的令牌。`max_delay` 是硬预算——预计等待超过它就立刻 429，不把连接挂在那里
+干等。客户端中途断开，队列名额随请求一起归还。
+
+### 12.4 验证它真的在按人限
+
+最直接的判定：**所有请求都从同一个 IP 发**，换 Cookie 就该换桶。
+
+```bash
+# 同一个出口 IP、两个不同会话，各发 12 个并发请求
+for i in $(seq 12); do curl -s -o /dev/null -w "%{http_code} " \
+     -b "sid=A" http://127.0.0.1:18650/api/order/x & done; wait; echo
+for i in $(seq 4);  do curl -s -o /dev/null -w "%{http_code} " \
+     -b "sid=B" http://127.0.0.1:18650/api/order/x & done; wait; echo
+```
+
+本机实测：`sid=A` 得到 6 个 200 加 6 个 429（`rate=2r/s burst=5` → 桶里一次能取 6 个），
+`sid=B` 的 4 个请求全 200——同一个出口 IP 下两个人互不拖累。按 IP 计数时第二条也会被打红。
+被拒的响应带 `retry-after`。这一整套契约在仓库里是 `tools/limit_key_e2e.py` 的 35 项，
+本章示例配置的 17 项在 `tools/tutorial_limit_check.py`。
+
+### 12.5 观测与三条坑
+
+启动时每个区都有一行 `[info]`，直接告诉你实际的计数维度（`error_log` 要到 `info`；
+相对日志路径以配置文件目录为基准，本例落在 `conf/logs/tutorial_limit_err.log`）：
+
+```
+2026-10-21 19:51:53 [info] 生效 limit_req zone=peruser rate=2.0r/s burst=5 key=$cookie_sid
+2026-10-21 19:51:53 [info] 生效 limit_req zone=queued rate=2.0r/s burst=0 key=$cookie_sid，队列 depth=20..20 max_delay=3000ms 学习=off
+```
+
+写了 `limit_req_queue` 的区还会在 `-t` 里出现同一行摘要，没写的区一行都不出——老配置的
+`-t` 输出保持原样。
+
+- **`zone=<名>:<容量>` 的容量是展示值**：实际每区能跟踪多少键由分片上限决定
+  （32 分片 × 16384 键），到顶按最久未用淘汰。写 `1m` 还是 `10m` 不改变这个数。
+- **客户端可自报的键是可以绕的**：换一个 `$http_x_api_key` 值就是一个新桶。所以这类键要么
+  是服务端签发的会话号，要么就得接受"绕过的成本是改一个请求头"。
+- **信誉/队列上限也记在这个键上**：`vip_learning` 与自报键同时出现时 `-t` 会给告警——
+  攒"重要客户"的分数同样变成改一个头的成本。
+
+---
+
+## 13. 四层转发：TCP 隧道、SNI 分流与 UDP 数据报
+
+七层之外还有两类流量不属于 HTTP：一条不解析内容的 TCP 隧道，和成吨的 UDP 小包
+（游戏、语音、实时状态同步）。两者都在 `stream {}` 里，与 `server {}` 平级。
+完整可跑的示例是 `conf/tutorial_stream.conf`（`-t` 会逐条列出每个 UDP 监听的形状）。
+
+### 13.1 TCP 隧道与按 SNI 分流
+
+```nginx
+stream {
+    server {
+        listen 18651;
+        ssl_preread on;                          # 只窥探 ClientHello，不终止 TLS
+        sni_match "a.example.com" 127.0.0.1:18661;
+        sni_match "*.example.com" 127.0.0.1:18662;
+        proxy_pass 127.0.0.1:18663;             # 没命中就用它
+    }
+}
+```
+
+字节透明：网关不解密、不改内容、不解析协议；窥探失败（不是 TLS、握手分片不全、无 SNI）时
+按 `proxy_pass` 接线，并把已经读到的字节原样补给后端。
+
+### 13.2 UDP：三种业务形状
+
+```nginx
+stream {
+    upstream rooms {
+        server 127.0.0.1:18671;
+        server 127.0.0.1:18672;
+    }
+    server {                                     # 心跳/状态上报：只发不等
+        listen 18652 udp;
+        proxy_pass 127.0.0.1:18671;
+        proxy_responses 0;
+        proxy_timeout 5s;
+    }
+    server {                                     # 房间服：一问一答，按会话
+        listen 18653 udp;
+        proxy_pass rooms;                        # 命名 upstream，选点/max_conns 照常
+        proxy_timeout 2s;
+        udp_max_sessions 4096;
+    }
+    server {                                     # 匹配服：一问多答
+        listen 18654 udp;
+        proxy_pass 127.0.0.1:18672;
+        proxy_responses 4;
+    }
+}
+```
+
+`-t` 里每条都会说清形状：
+
+```
+  监听 udp://0.0.0.0:18652（proxy_responses=0，空闲回收 5s）
+  监听 udp://0.0.0.0:18653（proxy_responses=1，空闲回收 2s）
+  监听 udp://0.0.0.0:18654（proxy_responses=4，空闲回收 600s）
+```
+
+- **一个会话 = 一个客户端 4 元组 = 一条 connect 到后端的 socket**。后端回包只可能来自它连的
+  那台，"把 A 的位置发给 B"在内核层面就不成立——这是 UDP 代理最容易做错、也最致命的一件事。
+- `proxy_responses 0` 不建会话、不开任务、不占 fd，纯发出去。
+- 会话占 `worker_connections` 额度（一条会话就是一个 fd），空闲超过 `proxy_timeout` 回收；
+  额度用尽时**丢包并计数**，不会把进程拖到 fd 耗尽。
+- `udp_max_sessions <n>;` 是**本实现的护栏，nginx 没有对应物**：UDP 的四元组可以伪造，
+  没有上限时一条吵闹的 UDP 服务会把整台进程的额度吃光，连七层一起饿死。同一进程里有 HTTP
+  监听而 UDP 监听没设上限时，启动日志会给一条告警。
+
+### 13.3 验证与边界
+
+```bash
+# 一问一答
+python -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(2);
+s.sendto(b'hello',('127.0.0.1',18653));print(s.recvfrom(65535)[0])"
+```
+
+本机回环实测（`tools/game_udp_e2e.py`，30 项；下面这组数取自发布前的那一轮全量回归）：
+
+- 60 个客户端并发打房间服，**没有一个回包串到别人手上**；
+- 3 万个心跳数据报全部到达后端（发出 30000 / 收到 30000，计数守恒）；这一条是判定，
+  **速率不是**：同一份代码在空载机器上 0.5 s 打完（≈58,000 pps），在全量回归的负载下要
+  7.6 s（≈3,900 pps），所以 pps 只能按机器读，别拿它当容量承诺；
+- 一问一答的往返 p50 0.25 ms / p99 0.86 ms（这两项在三轮运行里稳定）；65000 B 与 0 B 的
+  数据报都能原路往返；
+- 一个客户端连发 30 次心跳只建了 1─2 条会话（会话在复用，不是每包一条）；
+- 并发打开 600 个客户端、上限设 32：活跃会话钉在 32，另外 568 个按
+  `onrouter_stream_udp_dropped_total{role="session_cap"}` 计数，**七层照常服务**；
+  同一份配置去掉 `udp_max_sessions` 时会话吃满 `worker_connections=256`，七层直接不可用，
+  洪水退去后随 `proxy_timeout` 归还额度恢复。
+
+边界：
+
+- `listen … udp` 不能配 `ssl_preread`/`sni_match`：数据报会乱序、会丢失，从半条 ClientHello
+  里取 SNI 不是一次安全操作。两种写法都在 `-t` 失败。
+- HTTP 层的 `listen` 不认 `udp`——那里唯一的 UDP 传输是 QUIC（`listen … quic`）。
+- 同一端口号上 TCP 与 UDP 可以并存，互不干扰（示例里 18652 同时有一条 TCP 隧道和一条 UDP 心跳）。
+- 七层这一侧同样是"一个端口三种传输"：`listen 443 ssl http2 quic;` 给 h1.1/h2（TCP）与 h3（UDP）。
+  `quic` 不会替你把 TCP 侧升成 h2，`http2` 要显式写；`-t` 会把端点念成 `TLS+HTTP/3(同端口 UDP)`。
+  三种传输共用同一本缓存与限流的账，请求体也都按分帧读到流结束。要点与坑在
+  [OPERATIONS.md](OPERATIONS.md) §5.4，判定在 `tools/quic_business_e2e.py`（41 项，跨传输逐项对撞）。
+
+---
+
+## 14. 完整配置导读与上线检查表
 
 `conf/tutorial_full.conf` 把前面所有模块放在同一个进程里，端口与引用关系如下：
 
@@ -898,6 +1185,7 @@ ONRouter
    ├─ /pair      app（观察摘除/恢复）
    ├─ /breaker   breaker（单节点 + circuit_breaker）
    ├─ /cached    proxy_cache tutorial + canary
+   ├─ /cold      proxy_cache soakcold（disk=on 的冷层演示，见第 5 章）
    ├─ /guarded   access_by_wasm authz ── app
    ├─ /filtered  header_filter_by_wasm hf ── app
    ├─ /lua, /lua/count   Lua 内容与共享字典
@@ -915,17 +1203,20 @@ location、`proxy_pass` 的目标池是否存在、目标池里是否有健康�
 2. 监听地址、TLS 证书、私钥权限、`/metrics` 来源限制；
 3. upstream 每台后端可连接，`max_fails`/`fail_timeout` 与业务超时匹配；
 4. 灰度规则有 `default`，粘性键包含业务用户标识而不是只有 `$remote_addr`；
-5. 缓存 TTL 与业务可接受的新鲜度一致，敏感响应不被缓存；
-6. WASM/Lua 的预算、日志与失败关闭行为符合预期；
-7. 有 `reload` 或 SIGHUP 流程，且知道哪些改动必须重启；
-8. 用生产同规格机器跑过 20 分钟 soak，并做过杀后端、恢复、配置回滚演练；
-9. 发布产物用 `tools/release_verify.py` 验过，回滚包和配置都在手边。
+5. 限流区的 key 就是"谁和谁共享同一个令牌桶"：出口共用 IP 的业务（校园、企业网、移动网络）
+   按会话或请求头计数，别停在 `$remote_addr`；同时确认"没带那个头"的请求该怎么处理
+   （该区不限流，见第 12 章与 OPERATIONS §5.2）；
+6. 缓存 TTL 与业务可接受的新鲜度一致，敏感响应不被缓存；静态资产另有 `expires`（§2.1）；
+7. WASM/Lua 的预算、日志与失败关闭行为符合预期；
+8. 有 `reload` 或 SIGHUP 流程，且知道哪些改动必须重启；
+9. 用生产同规格机器跑过 20 分钟 soak，并做过杀后端、恢复、配置回滚演练；
+10. 发布产物用 `tools/release_verify.py` 验过，回滚包和配置都在手边。
 
 更细的容量、安全、升级与排障见 [OPERATIONS.md](OPERATIONS.md)。
 
 ---
 
-## 13. 常见问题
+## 15. 常见问题
 
 | 现象 | 常见原因 | 处理 |
 |---|---|---|
@@ -937,6 +1228,7 @@ location、`proxy_pass` 的目标池是否存在、目标池里是否有健康�
 | `/guarded` 一直 403 | 没带 `X-Gateway-Token`，或插件名引用错 | 带 token 重试；`-t` 检查 `access_by_wasm` 名字 |
 | WASM 请求返回 5xx | 插件 trap、越界、fuel 耗尽 | 看 `wasm_errors_total`/`fuel_exhausted_total` 与 error_log |
 | 缓存一直 MISS | URL 每次不同（查询串）、TTL 为 0、方法是 POST、上游发 Set-Cookie | 用固定 URL 连测两次；检查 `X-Cache` 与 TTL |
+| h2/h3 上的 POST 到后端变成空 body | 1.0.2 之前的网关按 `Content-Length`/`Transfer-Encoding` 决定读不读体，而分帧协议两个都不带 | 升到 1.0.2；临时缓解：让客户端显式带 `Content-Length`（h2 允许），或该 vhost 先只走 h1.1。判定见 `tools/quic_business_e2e.py` |
 | 灰度比例明显偏离 | 粘性键只有 IP、样本太小、上游池容量不足 | 换业务用户键；看 `proxy_split_targets_total` 的增量 |
 | 启动报端口占用 | 已有进程监听同一地址/端口 | 停掉旧进程或换端口 |
 | 日志找不到 | 相对路径基于配置文件目录 | 去 `conf/logs/` 找，或改绝对路径 |
@@ -971,6 +1263,9 @@ kill -TERM "$(cat conf/logs/tutorial.pid)"
 
 # 测试
 cargo test --workspace
+python run_regression.py                       # 全量回归（串行，几十分钟）
+python run_regression.py --only limit_key      # 只跑名字含该子串的套件
+python tools/tutorial_limit_check.py           # 第 12 章的 17 项
 python tools/soak_test.py --minutes 21
 ```
 

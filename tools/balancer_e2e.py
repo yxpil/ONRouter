@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 # ngx.balancer (balancer_by_lua) E2E —— 用真实流量证明 Lua 在转发前选定上游节点：
-#   * proxy_pass 指向一个"死" upstream(18999)，无 balancer 时必然 502（对照组 /dead）；
+#   * proxy_pass 指向一个"死" upstream(18999)，无 balancer 时必然失败（对照组 /dead）；
+#     超时是 504、连不上/坏响应才是 502 —— 口径同 nginx 的 ngx_http_upstream_next：
+#     FT_TIMEOUT 与 FT_HTTP_504 走 GATEWAY_TIME_OUT，其余走 BAD_GATEWAY。
 #   * balancer_by_lua 用 set_current_peer 把连接改到真实后端，按查询串/请求头分流到 A/B；
-#   * set_timeouts 覆盖读超时：慢后端睡 3s，但读超时压到 400ms → ~0.4s 内 502；
-#   * set_timeouts 覆盖写超时：sink 不收请求体，8MB 在 300ms 内写不动 → 快速 502；
+#   * set_timeouts 覆盖读超时：慢后端睡 3s，但读超时压到 400ms → ~0.4s 内 504；
+#   * set_timeouts 覆盖写超时：sink 不收请求体，8MB 在 300ms 内写不动 → 快速 504；
 #   * Upgrade + balancer：WebSocket 101 与隧道回显只经 set_current_peer 指定的后端；
 #   * 服务发现风格轮转：共享字典计数器在 A/B 间均分真实请求。
 #
@@ -178,9 +180,12 @@ def main():
         st, body, _ = get("/ping")
         check("/ping pong", st == 200 and "pong" in body, f"st={st} body={body!r}")
 
-        # 对照组：无 balancer，代理到死 upstream → 502
+        # 对照组：无 balancer，代理到死 upstream → 必然失败。码按根因分：端口主动 RST 是
+        # 502（连不上），SYN 没人应答是 504（超时）——本机回环上两种端口都可能遇到，CI(Linux)
+        # 上是拒绝，所以这里判"确实失败且不是 5xx 之外的东西"，把 502/504 的具体归属交给
+        # upstream_test 的根因一致性判定与 proxy_semantics 的超时判定。
         st, body, _ = get("/dead")
-        check("/dead 无 balancer→502", st == 502, f"st={st}")
+        check("/dead 无 balancer→按根因失败（502 或 504）", st in (502, 504), f"st={st}")
 
         # 按查询串选点
         st, body, _ = get("/pick?be=A")
@@ -196,14 +201,14 @@ def main():
         st, body, _ = get("/hdr")
         check("/hdr 默认→后端 A", st == 200 and "be=A" in body, f"st={st} body={body!r}")
 
-        # set_timeouts 覆盖读超时：慢后端睡 3s，读超时 400ms → 应快速 502
+        # set_timeouts 覆盖读超时：慢后端睡 3s，读超时 400ms → 应快速 504
         st, body, el = get("/to")
-        check("/to 502(read timeout)", st == 502, f"st={st}")
+        check("/to 504(read timeout)", st == 504, f"st={st}")
         check("/to 挂钟≈400ms(<1.2s)证明 set_timeouts 生效", el < 1.2, f"elapsed={el:.2f}s")
 
         # set_timeouts 覆盖写超时：sink 只收头部不收 body，8MB 写 300ms 后断开
         st, body, el = post("/to-send", b"x" * (8 * 1024 * 1024))
-        check("/to-send 502(send timeout)", st == 502, f"st={st} body={body!r}")
+        check("/to-send 504(send timeout)", st == 504, f"st={st} body={body!r}")
         check("/to-send 快速失败(<1.5s)证明 set_timeouts 写超时生效", el < 1.5, f"elapsed={el:.2f}s")
         check("/to-send 确实到达 sink", sink_hits[0] == 1, f"hits={sink_hits[0]}")
 

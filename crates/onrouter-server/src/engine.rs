@@ -18,8 +18,8 @@ use tokio::sync::mpsc;
 
 use onrouter_config::Directive;
 
-use crate::AppError;
 use crate::log_warn;
+use crate::AppError;
 
 /// 流式响应的帧：Head 只在最前面出现一次，之后都是 Data，End 表示脚本收尾、
 /// 响应体到此为止（不依赖发送端全部 drop，便于 log 阶段继续持有 ctx）。
@@ -190,7 +190,9 @@ impl RequestCtx {
         if self.eof_sent {
             return;
         }
-        self.body.get_or_insert_with(Vec::new).extend_from_slice(bytes);
+        self.body
+            .get_or_insert_with(Vec::new)
+            .extend_from_slice(bytes);
         if self.stream.is_some()
             && self
                 .body
@@ -464,6 +466,10 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
     }
     match name {
         "remote_addr" => Some(ctx.remote_addr.clone()),
+        // nginx 的 $binary_remote_addr 是 4/16 字节裸地址，只适合当键、不适合当头值。
+        // 这里返回文本形式：作为 proxy_set_header 的值它本来就是这个用途，
+        // 作为限流 key 的一部分，文本与裸字节的一一映射等价（见 limit::addr_var）。
+        "binary_remote_addr" => Some(ctx.remote_addr.clone()),
         "remote_port" => Some(ctx.remote_port.to_string()),
         "server_port" => Some(ctx.server_port.to_string()),
         "scheme" => Some(ctx.scheme.clone()),
@@ -471,7 +477,11 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
         "request_uri" => Some(ctx.uri.clone()),
         "uri" => Some(ctx.effective_path().to_string()),
         "args" | "query_string" => Some(ctx.query.clone()),
-        "is_args" => Some(if ctx.query.is_empty() { String::new() } else { "?".to_string() }),
+        "is_args" => Some(if ctx.query.is_empty() {
+            String::new()
+        } else {
+            "?".to_string()
+        }),
         // $host 去端口（要原始头用 $http_host）；无 Host 头时沿用既有的 "unknown" 回落，
         // 让 Lua、add_header、cache key 三条路径共用同一个答案
         "host" => Some(
@@ -491,8 +501,12 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
             .map(|(_, v)| v.clone()),
         "request_length" => Some(
             (ctx.uri.len()
-                + ctx.req_headers.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>())
-                .to_string(),
+                + ctx
+                    .req_headers
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len() + 4)
+                    .sum::<usize>())
+            .to_string(),
         ),
         "content_length" => ctx
             .req_headers
@@ -502,9 +516,24 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
         "request_body" => Some(String::from_utf8_lossy(&ctx.req_body).into_owned()),
         "request_time" => Some(format!("{:.3}", (unix_now() - ctx.start_time).max(0.0))),
         "msec" => Some(format!("{:.3}", unix_now())),
-        "time_local" => Some(chrono::Local::now().format("%d/%b/%Y:%H:%M:%S %z").to_string()),
-        "time_iso8601" => Some(chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string()),
-        "https" => Some(if ctx.scheme.eq_ignore_ascii_case("https") { "on" } else { "" }.to_string()),
+        "time_local" => Some(
+            chrono::Local::now()
+                .format("%d/%b/%Y:%H:%M:%S %z")
+                .to_string(),
+        ),
+        "time_iso8601" => Some(
+            chrono::Local::now()
+                .format("%Y-%m-%dT%H:%M:%S%:z")
+                .to_string(),
+        ),
+        "https" => Some(
+            if ctx.scheme.eq_ignore_ascii_case("https") {
+                "on"
+            } else {
+                ""
+            }
+            .to_string(),
+        ),
         "server_addr" => ctx.listener.map(|a| a.ip().to_string()),
         "proxy_add_x_forwarded_for" => Some(match ctx.header("x-forwarded-for") {
             Some(prior) if !prior.trim().is_empty() => format!("{prior}, {}", ctx.remote_addr),
@@ -525,7 +554,11 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
         "front_proxy" => Some(ctx.front_proxy.clone()),
         "front_proxy_country" => Some(ctx.front_proxy_country.clone()),
         "front_proxy_host" => Some(ctx.front_proxy_host.clone()),
-        "front_proxy_verified" => Some(if ctx.front_proxy_verified { "1".to_string() } else { String::new() }),
+        "front_proxy_verified" => Some(if ctx.front_proxy_verified {
+            "1".to_string()
+        } else {
+            String::new()
+        }),
         "realip_remote_addr" => Some(ctx.realip_remote_addr.clone()),
         _ => None,
     }
@@ -536,6 +569,7 @@ pub fn builtin_var(ctx: &RequestCtx, name: &str) -> Option<String> {
 /// `static_var_names_are_known` 单测会把每个名字拿去实际解析做交叉检查。
 const STATIC_VAR_NAMES: &[&str] = &[
     "remote_addr",
+    "binary_remote_addr",
     "remote_port",
     "server_port",
     "server_addr",
@@ -728,7 +762,10 @@ fn expand_map_result(result: &str, re: &regex::Regex, caps: &regex::Captures) ->
         let digit_len = rest.chars().take_while(|c| c.is_ascii_digit()).count();
         if digit_len > 0 {
             let idx: usize = rest[..digit_len].parse().unwrap_or(0);
-            let val = caps.get(idx).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let val = caps
+                .get(idx)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
             out.push_str(&val);
             i += 1 + digit_len;
         } else {
@@ -1094,9 +1131,7 @@ impl CanaryWhen {
             CanaryWhen::Header { name, value } => {
                 canary_value_matches(ctx.header(name).map(str::to_string), value)
             }
-            CanaryWhen::Arg { name, value } => {
-                canary_value_matches(query_arg(ctx, name), value)
-            }
+            CanaryWhen::Arg { name, value } => canary_value_matches(query_arg(ctx, name), value),
             CanaryWhen::UserAgent { regex, .. } => regex.is_match(ua_of(ctx)),
             CanaryWhen::Os(os) => detect_os(ua_of(ctx)) == *os,
         }
@@ -1121,7 +1156,10 @@ impl CanaryWhen {
                 pattern,
                 case_insensitive,
                 ..
-            } => format!("ua {} {pattern}", if *case_insensitive { "~*" } else { "~" }),
+            } => format!(
+                "ua {} {pattern}",
+                if *case_insensitive { "~*" } else { "~" }
+            ),
             CanaryWhen::Os(os) => format!("os {}", os.as_str()),
         }
     }
@@ -1332,9 +1370,8 @@ impl SplitRouteStats {
     }
 }
 
-static SPLIT_STATS: std::sync::OnceLock<
-    std::sync::RwLock<HashMap<String, Arc<SplitRouteStats>>>,
-> = std::sync::OnceLock::new();
+static SPLIT_STATS: std::sync::OnceLock<std::sync::RwLock<HashMap<String, Arc<SplitRouteStats>>>> =
+    std::sync::OnceLock::new();
 
 /// 登记上限：分流条目来自配置文件本身，这个数只是防止有人把它写成无界表。
 const MAX_SPLIT_ROUTES: usize = 64;
@@ -1413,18 +1450,29 @@ pub struct SubFilterConf {
 /// 响应 Content-Type 是否落在 sub_filter_types 内（取 `;` 前的 MIME，大小写不敏感，
 /// 支持 `text/*` 通配子类型）。
 pub fn sub_filter_applies(content_type: Option<&str>, types: &[String]) -> bool {
-    if types.iter().any(|t| t == "*" || t.eq_ignore_ascii_case("all")) {
+    if types
+        .iter()
+        .any(|t| t == "*" || t.eq_ignore_ascii_case("all"))
+    {
         return true;
     }
     let ct = match content_type {
         Some(c) => c,
         None => return false,
     };
-    let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let mime = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     types.iter().any(|t| {
         let tl = t.to_ascii_lowercase();
         match tl.split_once('/') {
-            Some((base, "*")) => mime.split_once('/').map(|(b, _)| b == base).unwrap_or(false),
+            Some((base, "*")) => mime
+                .split_once('/')
+                .map(|(b, _)| b == base)
+                .unwrap_or(false),
             _ => tl == mime,
         }
     })
@@ -1460,7 +1508,10 @@ fn replace_sub_literal(body: &str, needle: &str, repl: &str, once: bool) -> Stri
         match rest.find(needle) {
             Some(pos) => {
                 out.push_str(&rest[..pos]);
-                out.push_str(&expand_sub_replacement(repl, &rest[pos..pos + needle.len()]));
+                out.push_str(&expand_sub_replacement(
+                    repl,
+                    &rest[pos..pos + needle.len()],
+                ));
                 rest = &rest[pos + needle.len()..];
                 if once {
                     out.push_str(rest);
@@ -1566,7 +1617,10 @@ pub enum RewriteStep {
     /// `if (cond) { return ...; }`：命中时记下 return 并停止后续步骤，实际执行在 ACCESS 之后
     Return(ReturnAction),
     /// `if (cond) { ... }`：条件成立才依次执行内层步骤（内层允许 rewrite/set/return）
-    If { cond: IfCond, then: Vec<RewriteStep> },
+    If {
+        cond: IfCond,
+        then: Vec<RewriteStep>,
+    },
 }
 
 /// `if` 的条件：左值一定是变量（nginx 的语法要求），右值是字面量或变量模板。
@@ -1614,7 +1668,9 @@ pub fn eval_if_cond(cond: &IfCond, ctx: &RequestCtx) -> bool {
 }
 
 fn cond_rhs(cond: &IfCond, ctx: &RequestCtx) -> Option<String> {
-    cond.rhs.as_deref().map(|r| crate::proxy::interpolate_vars(r, ctx))
+    cond.rhs
+        .as_deref()
+        .map(|r| crate::proxy::interpolate_vars(r, ctx))
 }
 
 /// return 指令：状态码 + 可选文本/URL
@@ -1652,20 +1708,24 @@ fn apply_steps(ctx: &mut RequestCtx, steps: &[RewriteStep], depth: u8) -> StepFl
                 let mut replaced = rule.replacement.clone();
                 // $1..$9 反向引用
                 for i in (1..10).rev() {
-                    let cap = caps
-                        .get(i)
-                        .map(|m| m.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let cap = caps.get(i).map(|m| m.as_str()).unwrap_or("").to_string();
                     replaced = replaced.replace(&format!("${i}"), &cap);
                 }
                 match rule.flag {
                     RewriteFlag::Redirect | RewriteFlag::Permanent => {
-                        let code = if matches!(rule.flag, RewriteFlag::Permanent) { 301 } else { 302 };
+                        let code = if matches!(rule.flag, RewriteFlag::Permanent) {
+                            301
+                        } else {
+                            302
+                        };
                         let target = if replaced.starts_with("http") {
                             replaced
                         } else {
-                            format!("http://{}{}", ctx.host.as_deref().unwrap_or("localhost"), replaced)
+                            format!(
+                                "http://{}{}",
+                                ctx.host.as_deref().unwrap_or("localhost"),
+                                replaced
+                            )
                         };
                         ctx.redirect = Some((code, target));
                         ctx.done = true;
@@ -1758,7 +1818,12 @@ pub enum Phase {
 
 impl Phase {
     pub fn directive_names() -> &'static [&'static str] {
-        &["rewrite_by_rust", "access_by_rust", "content_by_rust", "log_by_rust"]
+        &[
+            "rewrite_by_rust",
+            "access_by_rust",
+            "content_by_rust",
+            "log_by_rust",
+        ]
     }
 
     pub fn from_directive(name: &str) -> Option<Phase> {
@@ -1833,10 +1898,7 @@ impl HandlerRegistry {
         // status：直接返回指定状态码与文本
         reg.register("status", |ctx: &mut RequestCtx, args: &[String]| {
             Box::pin(async move {
-                ctx.status = args
-                    .first()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(200);
+                ctx.status = args.first().and_then(|s| s.parse().ok()).unwrap_or(200);
                 if let Some(text) = args.get(1) {
                     ctx.say(&crate::proxy::interpolate_vars(text, ctx));
                 }
@@ -1896,9 +1958,7 @@ impl HandlerRegistry {
                 spec_name = spec.name
             ))
         })?;
-        h(ctx, &spec.args)
-            .await
-            .map_err(AppError::Other)
+        h(ctx, &spec.args).await.map_err(AppError::Other)
     }
 }
 
@@ -1919,13 +1979,24 @@ mod tests {
         regex::Regex::new(pat).unwrap()
     }
     fn re_ci(pat: &str) -> regex::Regex {
-        regex::RegexBuilder::new(pat).case_insensitive(true).build().unwrap()
+        regex::RegexBuilder::new(pat)
+            .case_insensitive(true)
+            .build()
+            .unwrap()
     }
     fn lit(pattern: &str, result: &str) -> MapCase {
-        MapCase { literal: Some(pattern.to_string()), regex: None, result: result.to_string() }
+        MapCase {
+            literal: Some(pattern.to_string()),
+            regex: None,
+            result: result.to_string(),
+        }
     }
     fn rx(pattern: regex::Regex, result: &str) -> MapCase {
-        MapCase { literal: None, regex: Some(pattern), result: result.to_string() }
+        MapCase {
+            literal: None,
+            regex: Some(pattern),
+            result: result.to_string(),
+        }
     }
 
     #[test]
@@ -1983,8 +2054,10 @@ mod tests {
             dest: "d".into(),
             source: "s".into(),
             default: None,
-            cases: vec![rx(re("^/api/([a-z]+)/(\\d+)$"), "$2@$1"),
-                        rx(re("^(?<verb>[A-Z]+)"), "verb-${verb}")],
+            cases: vec![
+                rx(re("^/api/([a-z]+)/(\\d+)$"), "$2@$1"),
+                rx(re("^(?<verb>[A-Z]+)"), "verb-${verb}"),
+            ],
         };
         assert_eq!(match_map(&def, "/api/users/42"), "42@users");
         assert_eq!(match_map(&def, "GET"), "verb-GET");
@@ -1996,11 +2069,18 @@ mod tests {
         let mut ctx = RequestCtx::default();
         ctx.scheme = "https".into();
         ctx.remote_addr = "203.0.113.9".into();
-        ctx.req_headers.push(("x-client".to_string(), "android-13".to_string()));
+        ctx.req_headers
+            .push(("x-client".to_string(), "android-13".to_string()));
         // 内置变量走 builtin_var（未安装任何 map/geo 时 resolve_variable 等价于 builtin_var）
         assert_eq!(resolve_variable(&ctx, "scheme").as_deref(), Some("https"));
-        assert_eq!(resolve_variable(&ctx, "remote_addr").as_deref(), Some("203.0.113.9"));
-        assert_eq!(resolve_variable(&ctx, "http_x_client").as_deref(), Some("android-13"));
+        assert_eq!(
+            resolve_variable(&ctx, "remote_addr").as_deref(),
+            Some("203.0.113.9")
+        );
+        assert_eq!(
+            resolve_variable(&ctx, "http_x_client").as_deref(),
+            Some("android-13")
+        );
         // 未定义变量返回 None
         assert_eq!(resolve_variable(&ctx, "no_such_var"), None);
     }
@@ -2012,8 +2092,16 @@ mod tests {
             source: "remote_addr".into(),
             default: Some("ZZ".into()),
             rules: vec![
-                GeoRule { ip: "127.0.0.1".parse().unwrap(), prefix: 32, result: "local".into() },
-                GeoRule { ip: "10.1.0.0".parse().unwrap(), prefix: 16, result: "private".into() },
+                GeoRule {
+                    ip: "127.0.0.1".parse().unwrap(),
+                    prefix: 32,
+                    result: "local".into(),
+                },
+                GeoRule {
+                    ip: "10.1.0.0".parse().unwrap(),
+                    prefix: 16,
+                    result: "private".into(),
+                },
             ],
         };
         assert_eq!(match_geo(&def, &"127.0.0.1".parse().unwrap()), "local");
@@ -2027,9 +2115,21 @@ mod tests {
     fn geo_longest_prefix_wins() {
         // 声明顺序刻意「宽在前」，排序后应最具体优先
         let mut rules = vec![
-            GeoRule { ip: "10.0.0.0".parse().unwrap(), prefix: 8, result: "wide".into() },
-            GeoRule { ip: "10.1.0.0".parse().unwrap(), prefix: 16, result: "mid".into() },
-            GeoRule { ip: "10.1.2.0".parse().unwrap(), prefix: 24, result: "narrow".into() },
+            GeoRule {
+                ip: "10.0.0.0".parse().unwrap(),
+                prefix: 8,
+                result: "wide".into(),
+            },
+            GeoRule {
+                ip: "10.1.0.0".parse().unwrap(),
+                prefix: 16,
+                result: "mid".into(),
+            },
+            GeoRule {
+                ip: "10.1.2.0".parse().unwrap(),
+                prefix: 24,
+                result: "narrow".into(),
+            },
         ];
         rules.sort_by(|a, b| b.prefix.cmp(&a.prefix));
         let def = GeoDef {
@@ -2050,7 +2150,12 @@ mod tests {
         let b = murmur_hash2(b"${remote_addr}127.0.0.1");
         assert_eq!(a, b);
         assert_ne!(murmur_hash2(b"alpha"), murmur_hash2(b"beta"));
-        for k in ["", "x", "127.0.0.1Chrome", "a-long-key-that-spans-several-4-byte-blocks"] {
+        for k in [
+            "",
+            "x",
+            "127.0.0.1Chrome",
+            "a-long-key-that-spans-several-4-byte-blocks",
+        ] {
             let id = split_id(k);
             assert!(id < 10000, "split_id({k}) = {id} 越界");
         }
@@ -2067,7 +2172,11 @@ mod tests {
         a.note(SplitRole::Routed);
         assert_eq!(a.served("x"), 1);
         assert_eq!(a.role(SplitRole::Routed), 1);
-        assert_eq!(a.served("nope"), 0, "未声明的分支不进账：指标标签的基数必须有上界");
+        assert_eq!(
+            a.served("nope"),
+            0,
+            "未声明的分支不进账：指标标签的基数必须有上界"
+        );
         // 分支数超过登记上限：分流照走，只是不再统计，绝不无界增长
         let too_many: Vec<String> = (0..=MAX_SPLIT_BRANCHES).map(|i| format!("b{i}")).collect();
         assert!(
@@ -2082,8 +2191,14 @@ mod tests {
             dest: "v".into(),
             key: "${remote_addr}".into(),
             buckets: vec![
-                SplitBucket { percent: 0.5, result: "a".into() },
-                SplitBucket { percent: 50.0, result: "b".into() },
+                SplitBucket {
+                    percent: 0.5,
+                    result: "a".into(),
+                },
+                SplitBucket {
+                    percent: 50.0,
+                    result: "b".into(),
+                },
             ],
             star: Some("rest".into()),
         };
@@ -2095,7 +2210,12 @@ mod tests {
         assert_eq!(pick_split_bucket(&def, 5050), "rest");
         assert_eq!(pick_split_bucket(&def, 9999), "rest");
         // 无 * 时落空返回空串
-        let no_star = SplitDef { dest: "v".into(), key: String::new(), buckets: def.buckets.clone(), star: None };
+        let no_star = SplitDef {
+            dest: "v".into(),
+            key: String::new(),
+            buckets: def.buckets.clone(),
+            star: None,
+        };
         assert_eq!(pick_split_bucket(&no_star, 6000), "");
     }
 
@@ -2109,8 +2229,14 @@ mod tests {
                 dest: "z".into(),
                 key: String::new(),
                 buckets: vec![
-                    SplitBucket { percent: 0.0, result: "fallback_only".into() },
-                    SplitBucket { percent: 70.0, result: "a".into() },
+                    SplitBucket {
+                        percent: 0.0,
+                        result: "fallback_only".into(),
+                    },
+                    SplitBucket {
+                        percent: 70.0,
+                        result: "a".into(),
+                    },
                 ],
                 star: Some("b".into()),
             },
@@ -2118,8 +2244,14 @@ mod tests {
                 dest: "z".into(),
                 key: String::new(),
                 buckets: vec![
-                    SplitBucket { percent: 70.0, result: "a".into() },
-                    SplitBucket { percent: 0.0, result: "fallback_only".into() },
+                    SplitBucket {
+                        percent: 70.0,
+                        result: "a".into(),
+                    },
+                    SplitBucket {
+                        percent: 0.0,
+                        result: "fallback_only".into(),
+                    },
                 ],
                 star: Some("b".into()),
             },
@@ -2145,13 +2277,17 @@ mod tests {
     fn expand_split_key_resolves_builtin_vars() {
         let mut ctx = RequestCtx::default();
         ctx.remote_addr = "203.0.113.7".into();
-        ctx.req_headers.push(("user-agent".to_string(), "curl/8".to_string()));
+        ctx.req_headers
+            .push(("user-agent".to_string(), "curl/8".to_string()));
         // ${var} 与 $var 两种写法都插值；未定义变量按空串
         assert_eq!(
             expand_split_key(&ctx, "${remote_addr}${http_user_agent}", 0),
             "203.0.113.7curl/8"
         );
-        assert_eq!(expand_split_key(&ctx, "$remote_addr-$no_such", 0), "203.0.113.7-");
+        assert_eq!(
+            expand_split_key(&ctx, "$remote_addr-$no_such", 0),
+            "203.0.113.7-"
+        );
     }
 
     // ---- canary：灰度条件与求值 ----
@@ -2160,7 +2296,8 @@ mod tests {
     fn return_expands_variables_in_body_and_redirect_url() {
         let mut ctx = RequestCtx::default();
         ctx.host = Some("www.example.com".to_string());
-        ctx.set_vars.push(("reason".to_string(), "maintenance".to_string()));
+        ctx.set_vars
+            .push(("reason".to_string(), "maintenance".to_string()));
         // 200 + 文本：变量必须展开（nginx 1.4.0 起的行为）；认不出的名字保持字面量
         apply_return(
             &mut ctx,
@@ -2191,11 +2328,20 @@ mod tests {
             .find(|(k, _)| k.eq_ignore_ascii_case("location"))
             .map(|(_, v)| v.clone())
             .expect("301 必须带 Location");
-        assert_eq!(loc, "https://www.example.com/redirect", "URL 里的变量要展开");
+        assert_eq!(
+            loc, "https://www.example.com/redirect",
+            "URL 里的变量要展开"
+        );
         assert!(ctx2.body.is_none(), "重定向响应不该带 body");
         // 301 不带文本时不该凭空造一个 Location
         let mut ctx3 = RequestCtx::default();
-        apply_return(&mut ctx3, &ReturnAction { code: 301, text: None });
+        apply_return(
+            &mut ctx3,
+            &ReturnAction {
+                code: 301,
+                text: None,
+            },
+        );
         assert!(!ctx3
             .resp_headers
             .iter()
@@ -2351,8 +2497,14 @@ mod tests {
             dest: "release".into(),
             rules: Vec::new(),
             buckets: vec![
-                SplitBucket { percent: 50.0, result: "a".into() },
-                SplitBucket { percent: 50.0, result: "b".into() },
+                SplitBucket {
+                    percent: 50.0,
+                    result: "a".into(),
+                },
+                SplitBucket {
+                    percent: 50.0,
+                    result: "b".into(),
+                },
             ],
             key: "${cookie_sid}".into(),
             default: "stable".into(),
@@ -2382,7 +2534,10 @@ mod tests {
                 when: CanaryWhen::Os(CanaryOs::Ios),
                 target: "beta".into(),
             }],
-            buckets: vec![SplitBucket { percent: 0.5, result: "beta".into() }],
+            buckets: vec![SplitBucket {
+                percent: 0.5,
+                result: "beta".into(),
+            }],
             key: "${cookie_sid}".into(),
             default: "stable".into(),
         };
@@ -2404,10 +2559,17 @@ mod tests {
             once: false,
             types: vec!["text/html".into()],
         };
-        let out = apply_sub_filter(Some(&conf), Some("text/html; charset=utf-8"), b"a foo b foo c".to_vec());
+        let out = apply_sub_filter(
+            Some(&conf),
+            Some("text/html; charset=utf-8"),
+            b"a foo b foo c".to_vec(),
+        );
         assert_eq!(std::str::from_utf8(&out).unwrap(), "a bar b bar c");
         // once=只替换第一处
-        let once = SubFilterConf { once: true, ..conf.clone() };
+        let once = SubFilterConf {
+            once: true,
+            ..conf.clone()
+        };
         let out = apply_sub_filter(Some(&once), Some("text/html"), b"a foo b foo c".to_vec());
         assert_eq!(std::str::from_utf8(&out).unwrap(), "a bar b foo c");
     }
@@ -2425,7 +2587,11 @@ mod tests {
         };
         let out = apply_sub_filter(Some(&conf), Some("text/html"), b"the cat sat".to_vec());
         assert_eq!(std::str::from_utf8(&out).unwrap(), "the [cat] sat");
-        let out2 = apply_sub_filter(Some(&conf), Some("application/json"), b"the cat sat".to_vec());
+        let out2 = apply_sub_filter(
+            Some(&conf),
+            Some("application/json"),
+            b"the cat sat".to_vec(),
+        );
         assert_eq!(&out2, b"the cat sat");
     }
 
@@ -2434,7 +2600,10 @@ mod tests {
         let conf = SubFilterConf {
             filters: vec![SubFilter {
                 pattern: SubPattern::Regex(
-                    regex::RegexBuilder::new("he[l]{2,}o").case_insensitive(true).build().unwrap(),
+                    regex::RegexBuilder::new("he[l]{2,}o")
+                        .case_insensitive(true)
+                        .build()
+                        .unwrap(),
                 ),
                 replacement: "HI".into(),
             }],
@@ -2450,8 +2619,14 @@ mod tests {
         // 规则按序：第二条作用于第一条的结果
         let conf = SubFilterConf {
             filters: vec![
-                SubFilter { pattern: SubPattern::Literal("a".into()), replacement: "b".into() },
-                SubFilter { pattern: SubPattern::Literal("b".into()), replacement: "c".into() },
+                SubFilter {
+                    pattern: SubPattern::Literal("a".into()),
+                    replacement: "b".into(),
+                },
+                SubFilter {
+                    pattern: SubPattern::Literal("b".into()),
+                    replacement: "c".into(),
+                },
             ],
             once: false,
             types: vec!["*".into()],
@@ -2471,8 +2646,16 @@ mod tests {
             source: "s".into(),
             default: Some("none".into()),
             rules: vec![
-                GeoRule { ip: "2001:db8::".parse().unwrap(), prefix: 32, result: "doc".into() },
-                GeoRule { ip: "::1".parse().unwrap(), prefix: 128, result: "loopback".into() },
+                GeoRule {
+                    ip: "2001:db8::".parse().unwrap(),
+                    prefix: 32,
+                    result: "doc".into(),
+                },
+                GeoRule {
+                    ip: "::1".parse().unwrap(),
+                    prefix: 128,
+                    result: "loopback".into(),
+                },
             ],
         };
         assert_eq!(match_geo(&def, &"2001:db8:abcd::1".parse().unwrap()), "doc");
@@ -2487,7 +2670,11 @@ mod tests {
             dest: "d".into(),
             source: "s".into(),
             default: Some("other".into()),
-            rules: vec![GeoRule { ip: "0.0.0.0".parse().unwrap(), prefix: 0, result: "any-v4".into() }],
+            rules: vec![GeoRule {
+                ip: "0.0.0.0".parse().unwrap(),
+                prefix: 0,
+                result: "any-v4".into(),
+            }],
         };
         assert_eq!(match_geo(&def, &"1.2.3.4".parse().unwrap()), "any-v4");
         // v6 不匹配 v4 的 /0
@@ -2505,7 +2692,10 @@ mod tests {
             ("content-type".into(), "text/plain".into()),
             ("content-length".into(), "3".into()),
         ];
-        ctx.ssl = Some(SslState { server_name: Some("tls.example.test".into()), ..Default::default() });
+        ctx.ssl = Some(SslState {
+            server_name: Some("tls.example.test".into()),
+            ..Default::default()
+        });
         for name in STATIC_VAR_NAMES {
             // $hostname 读环境变量，CI 机器上可能两个都没有
             if *name == "hostname" {
@@ -2522,7 +2712,12 @@ mod tests {
         assert!(!is_static_var_name("definitely_not_a_variable"));
         assert!(!is_derived_var_name("definitely_not_a_variable"));
         // 前缀派生名：没有值也属于合法变量
-        for d in ["http_x_no_such", "arg_no_such", "cookie_no_such", "sent_http_no_such"] {
+        for d in [
+            "http_x_no_such",
+            "arg_no_such",
+            "cookie_no_such",
+            "sent_http_no_such",
+        ] {
             assert!(is_derived_var_name(d), "{d} 应识别为派生变量");
             assert!(builtin_var(&ctx, d).is_none());
         }
@@ -2535,7 +2730,10 @@ mod tests {
         ctx.host = Some("example.test:8080".into());
         // $host 去端口；$http_host 保留原始头值
         assert_eq!(builtin_var(&ctx, "host").as_deref(), Some("example.test"));
-        assert_eq!(builtin_var(&ctx, "http_host").as_deref(), Some("example.test:8080"));
+        assert_eq!(
+            builtin_var(&ctx, "http_host").as_deref(),
+            Some("example.test:8080")
+        );
         // 无端口 / IPv6（带括号与不带括号）都不能被截坏
         for (raw, want) in [
             ("example.test", "example.test"),
@@ -2545,12 +2743,19 @@ mod tests {
             ("host:notaport", "host:notaport"),
         ] {
             ctx.host = Some(raw.into());
-            assert_eq!(builtin_var(&ctx, "host").as_deref(), Some(want), "raw={raw}");
+            assert_eq!(
+                builtin_var(&ctx, "host").as_deref(),
+                Some(want),
+                "raw={raw}"
+            );
         }
     }
 
     fn set_step(name: &str, value: &str) -> RewriteStep {
-        RewriteStep::Set { name: name.to_string(), value: value.to_string() }
+        RewriteStep::Set {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
     }
 
     #[test]
@@ -2577,7 +2782,10 @@ mod tests {
         ctx.uri = "/orig?q=1".into();
         ctx.path = "/orig".into();
         apply_rewrite_steps(&mut ctx, &[set_step("request_uri", "/fake")]);
-        assert_eq!(resolve_variable(&ctx, "request_uri").as_deref(), Some("/fake"));
+        assert_eq!(
+            resolve_variable(&ctx, "request_uri").as_deref(),
+            Some("/fake")
+        );
     }
 
     #[test]
@@ -2593,17 +2801,54 @@ mod tests {
         };
         // 空/非空：nginx 只看变量是否有值，字符串 "0" 算真
         assert!(eval_if_cond(&cond("$arg_a", CondOp::NonEmpty, None), &ctx));
-        assert!(!eval_if_cond(&cond("$arg_missing", CondOp::NonEmpty, None), &ctx));
-        assert!(eval_if_cond(&cond("$arg_missing", CondOp::Empty, None), &ctx));
+        assert!(!eval_if_cond(
+            &cond("$arg_missing", CondOp::NonEmpty, None),
+            &ctx
+        ));
+        assert!(eval_if_cond(
+            &cond("$arg_missing", CondOp::Empty, None),
+            &ctx
+        ));
         // = / !=：右值本身也是模板
         assert!(eval_if_cond(&cond("$arg_a", CondOp::Eq, Some("0")), &ctx));
-        assert!(eval_if_cond(&cond("$scheme", CondOp::Ne, Some("$arg_a")), &ctx));
+        assert!(eval_if_cond(
+            &cond("$scheme", CondOp::Ne, Some("$arg_a")),
+            &ctx
+        ));
+        // `= ""` 是 nginx 里"这个头/Cookie 没带"的标准写法，空右值要能活到求值阶段
+        assert!(eval_if_cond(
+            &cond("$http_x_key", CondOp::Eq, Some("")),
+            &ctx
+        ));
+        assert!(!eval_if_cond(
+            &cond("$http_user_agent", CondOp::Eq, Some("")),
+            &ctx
+        ));
+        assert!(eval_if_cond(
+            &cond("$http_user_agent", CondOp::Ne, Some("")),
+            &ctx
+        ));
         // ~ 区分大小写、~* 忽略、!~ / !~* 取反
-        assert!(eval_if_cond(&cond("$http_user_agent", CondOp::Regex(re("MSIE")), None), &ctx));
-        assert!(!eval_if_cond(&cond("$http_user_agent", CondOp::Regex(re("msie")), None), &ctx));
-        assert!(eval_if_cond(&cond("$http_user_agent", CondOp::IRegex(re_ci("msie")), None), &ctx));
-        assert!(eval_if_cond(&cond("$http_user_agent", CondOp::NotRegex(re("msie")), None), &ctx));
-        assert!(!eval_if_cond(&cond("$http_user_agent", CondOp::NotIRegex(re_ci("MSIE")), None), &ctx));
+        assert!(eval_if_cond(
+            &cond("$http_user_agent", CondOp::Regex(re("MSIE")), None),
+            &ctx
+        ));
+        assert!(!eval_if_cond(
+            &cond("$http_user_agent", CondOp::Regex(re("msie")), None),
+            &ctx
+        ));
+        assert!(eval_if_cond(
+            &cond("$http_user_agent", CondOp::IRegex(re_ci("msie")), None),
+            &ctx
+        ));
+        assert!(eval_if_cond(
+            &cond("$http_user_agent", CondOp::NotRegex(re("msie")), None),
+            &ctx
+        ));
+        assert!(!eval_if_cond(
+            &cond("$http_user_agent", CondOp::NotIRegex(re_ci("MSIE")), None),
+            &ctx
+        ));
     }
 
     #[test]
@@ -2611,10 +2856,17 @@ mod tests {
         let mut ctx = RequestCtx::default();
         ctx.query = "debug=1".into();
         let steps = vec![RewriteStep::If {
-            cond: IfCond { lhs: "$arg_debug".into(), op: CondOp::NonEmpty, rhs: None },
+            cond: IfCond {
+                lhs: "$arg_debug".into(),
+                op: CondOp::NonEmpty,
+                rhs: None,
+            },
             then: vec![
                 set_step("why", "debug-on"),
-                RewriteStep::Return(ReturnAction { code: 403, text: Some("no".into()) }),
+                RewriteStep::Return(ReturnAction {
+                    code: 403,
+                    text: Some("no".into()),
+                }),
             ],
         }];
         // return 只被"记下"：ONRouter 让它和裸 return 一样在 ACCESS 之后执行，
@@ -2640,8 +2892,15 @@ mod tests {
         ctx.query = "go=1".into();
         let steps = vec![
             RewriteStep::If {
-                cond: IfCond { lhs: "$arg_go".into(), op: CondOp::NonEmpty, rhs: None },
-                then: vec![RewriteStep::Return(ReturnAction { code: 429, text: None })],
+                cond: IfCond {
+                    lhs: "$arg_go".into(),
+                    op: CondOp::NonEmpty,
+                    rhs: None,
+                },
+                then: vec![RewriteStep::Return(ReturnAction {
+                    code: 429,
+                    text: None,
+                })],
             },
             // if 命中后不该再执行：后面的 rewrite 不生效
             RewriteStep::Rewrite(RewriteRule {
@@ -2662,7 +2921,11 @@ mod tests {
         ctx.query = "go=1".into();
         let steps = vec![
             RewriteStep::If {
-                cond: IfCond { lhs: "$arg_go".into(), op: CondOp::NonEmpty, rhs: None },
+                cond: IfCond {
+                    lhs: "$arg_go".into(),
+                    op: CondOp::NonEmpty,
+                    rhs: None,
+                },
                 then: vec![RewriteStep::Rewrite(RewriteRule {
                     pattern: re("^/old$"),
                     replacement: "/new".into(),

@@ -137,9 +137,16 @@ def main():
         check("摘除事件进了错误日志",
               "9105" in errs and "摘除" in errs, errs[-400:])
 
-        # 5 全部后端不可用 → 502（不是把请求硬塞给死节点）
+        # 5 全部后端不可用 → 按根因给码：SYN 没人应答是**超时**（504），端口主动 RST 才是
+        # **连不上**（502）。同一台机器上这两类端口可以并存（本机回环上 9107/9108 是丢包，
+        # 18999 是拒绝），所以断言"码与网关写下的根因一致"，而不是硬绑其中一个。
         st, b, body = http("/dead/ping")
-        check("全死时是 502", st == 502, f"{st} {b} {body[:80]}")
+        with open(ERRLOG, "r", encoding="utf-8", errors="ignore") as f:
+            errs = f.read()
+        said_timeout = "连接后端超时" in errs[-4000:]
+        check("全死时失败，且状态码与真实根因一致（超时=504 / 连不上=502）",
+              (st == 504 and said_timeout) or (st == 502 and not said_timeout),
+              f"{st} {b} 根因超时={said_timeout}")
 
         # 6 主动健康检查：interval=1s fails=1，9109 没人监听应被摘除
         time.sleep(2.5)

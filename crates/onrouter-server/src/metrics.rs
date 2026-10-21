@@ -106,7 +106,8 @@ pub fn register_governor(g: &Arc<crate::governor::Governor>) {
 /// 取得全局指标单例（首次调用时按 capacity 初始化容量与启动时刻）。
 pub fn global(worker_connections: usize) -> &'static Metrics {
     let m = METRICS.get_or_init(Metrics::default);
-    m.capacity.store(worker_connections as u64, Ordering::Relaxed);
+    m.capacity
+        .store(worker_connections as u64, Ordering::Relaxed);
     m.start.get_or_init(Instant::now);
     m
 }
@@ -201,16 +202,25 @@ impl Metrics {
         s.push_str(&format!("onrouter_uptime_seconds {uptime}\n"));
         s.push_str("# HELP onrouter_connections_accepted Total accepted TCP connections.\n");
         s.push_str("# TYPE onrouter_connections_accepted counter\n");
-        s.push_str(&format!("onrouter_connections_accepted {}\n", g(&self.accepted)));
+        s.push_str(&format!(
+            "onrouter_connections_accepted {}\n",
+            g(&self.accepted)
+        ));
         s.push_str("# HELP onrouter_connections_active Current open connections (gauge).\n");
         s.push_str("# TYPE onrouter_connections_active gauge\n");
-        s.push_str(&format!("onrouter_connections_active {}\n", g(&self.active)));
+        s.push_str(&format!(
+            "onrouter_connections_active {}\n",
+            g(&self.active)
+        ));
         s.push_str("# HELP onrouter_connections_capacity worker_connections limit.\n");
         s.push_str("# TYPE onrouter_connections_capacity gauge\n");
         s.push_str(&format!("onrouter_connections_capacity {cap}\n"));
         s.push_str("# HELP onrouter_http_requests_total Total HTTP requests handled.\n");
         s.push_str("# TYPE onrouter_http_requests_total counter\n");
-        s.push_str(&format!("onrouter_http_requests_total {}\n", g(&self.handled)));
+        s.push_str(&format!(
+            "onrouter_http_requests_total {}\n",
+            g(&self.handled)
+        ));
         s.push_str("# HELP onrouter_http_responses_total Response count by status class.\n");
         s.push_str("# TYPE onrouter_http_responses_total counter\n");
         for (class, cell) in [
@@ -219,9 +229,14 @@ impl Metrics {
             ("4xx", &self.http_4xx),
             ("5xx", &self.http_5xx),
         ] {
-            s.push_str(&format!("onrouter_http_responses_total{{class=\"{class}\"}} {}\n", g(cell)));
+            s.push_str(&format!(
+                "onrouter_http_responses_total{{class=\"{class}\"}} {}\n",
+                g(cell)
+            ));
         }
-        s.push_str("# HELP onrouter_cache_requests_total proxy_cache outcomes by X-Cache-Status.\n");
+        s.push_str(
+            "# HELP onrouter_cache_requests_total proxy_cache outcomes by X-Cache-Status.\n",
+        );
         s.push_str("# TYPE onrouter_cache_requests_total counter\n");
         for (status, cell) in [
             ("hit", &self.cache_hit),
@@ -439,12 +454,20 @@ impl Metrics {
                 ));
                 s.push_str("# HELP onrouter_vip_score Client reputation scores; kind=\"threshold\" is the configured promotion bar, kind=\"max\" the highest score currently held.\n");
                 s.push_str("# TYPE onrouter_vip_score gauge\n");
-                s.push_str(&format!("onrouter_vip_score{{kind=\"threshold\"}} {}\n", v.min));
-                s.push_str(&format!("onrouter_vip_score{{kind=\"max\"}} {}\n", v.max_score));
+                s.push_str(&format!(
+                    "onrouter_vip_score{{kind=\"threshold\"}} {}\n",
+                    v.min
+                ));
+                s.push_str(&format!(
+                    "onrouter_vip_score{{kind=\"max\"}} {}\n",
+                    v.max_score
+                ));
                 s.push_str("# HELP onrouter_vip_clients Clients currently at or above the promotion threshold.\n");
                 s.push_str("# TYPE onrouter_vip_clients gauge\n");
                 s.push_str(&format!("onrouter_vip_clients {}\n", v.vip_count));
-                s.push_str("# HELP onrouter_vip_decay_ms Silence that costs one reputation point.\n");
+                s.push_str(
+                    "# HELP onrouter_vip_decay_ms Silence that costs one reputation point.\n",
+                );
                 s.push_str("# TYPE onrouter_vip_decay_ms gauge\n");
                 s.push_str(&format!("onrouter_vip_decay_ms {}\n", v.decay_ms));
                 s.push_str("# HELP onrouter_vip_events_total Rate-limit outcomes fed into reputation; role=\"passed\" within rate (earns credit), role=\"queued\" needed the queue (neutral), role=\"rejected\" hit the limit (costs credit), role=\"promoted\"/\"demoted\" crossed the threshold either way, role=\"collision\" a new key lost the slot to a still-scored incumbent (reputation is never stolen by collision).\n");
@@ -486,11 +509,7 @@ impl Metrics {
                     ));
                     s.push_str(&format!(
                         "onrouter_schedule_next_fire_ms{{name=\"{name}\"}} {}\n",
-                        if row.enabled {
-                            row.next_ms
-                        } else {
-                            -1
-                        }
+                        if row.enabled { row.next_ms } else { -1 }
                     ));
                     s.push_str(&format!(
                         "onrouter_schedule_enabled{{name=\"{name}\"}} {}\n",
@@ -519,10 +538,7 @@ impl Metrics {
                     .unwrap_or(0);
                 s.push_str("# HELP onrouter_governor_phase Current cache-layer phase: 0=sleep (background cadence stretched; deep tier also demotes) 1=normal 2=boost (full cadence + cold-tier pre-warm).\n");
                 s.push_str("# TYPE onrouter_governor_phase gauge\n");
-                s.push_str(&format!(
-                    "onrouter_governor_phase {}\n",
-                    gv.phase() as u8
-                ));
+                s.push_str(&format!("onrouter_governor_phase {}\n", gv.phase() as u8));
                 s.push_str("# HELP onrouter_governor_rps Smoothed requests-per-second estimate over the trailing window (the input the phase machine reads).\n");
                 s.push_str("# TYPE onrouter_governor_rps gauge\n");
                 s.push_str(&format!("onrouter_governor_rps {}\n", gv.rps(secs)));
@@ -582,7 +598,9 @@ impl Metrics {
             "onrouter_tls_handshake_failures_total {}\n",
             g(&self.tls_handshake_failures)
         ));
-        s.push_str("# HELP onrouter_limit_rejections_total Requests rejected by limit_req/limit_conn.\n");
+        s.push_str(
+            "# HELP onrouter_limit_rejections_total Requests rejected by limit_req/limit_conn.\n",
+        );
         s.push_str("# TYPE onrouter_limit_rejections_total counter\n");
         s.push_str(&format!(
             "onrouter_limit_rejections_total{{type=\"req\"}} {}\n",
@@ -779,7 +797,9 @@ impl Metrics {
         let wasm = crate::wasm::stats_snapshot();
         if !wasm.is_empty() {
             use crate::wasm::WasmPhase;
-            s.push_str("# HELP onrouter_wasm_invocations_total WASM plugin invocations by phase.\n");
+            s.push_str(
+                "# HELP onrouter_wasm_invocations_total WASM plugin invocations by phase.\n",
+            );
             s.push_str("# TYPE onrouter_wasm_invocations_total counter\n");
             s.push_str("# HELP onrouter_wasm_errors_total WASM plugin invocations that trapped or hit the fuel limit (the request is failed closed).\n");
             s.push_str("# TYPE onrouter_wasm_errors_total counter\n");
@@ -789,7 +809,11 @@ impl Metrics {
             s.push_str("# TYPE onrouter_wasm_denied_total counter\n");
             for (name, st) in &wasm {
                 let plugin = label(name);
-                for phase in [WasmPhase::Access, WasmPhase::HeaderFilter, WasmPhase::BodyFilter] {
+                for phase in [
+                    WasmPhase::Access,
+                    WasmPhase::HeaderFilter,
+                    WasmPhase::BodyFilter,
+                ] {
                     let p = phase.label();
                     s.push_str(&format!(
                         "onrouter_wasm_invocations_total{{plugin=\"{plugin}\",phase=\"{p}\"}} {}\n",
@@ -812,13 +836,22 @@ impl Metrics {
         }
         s.push_str("# HELP onrouter_lua_phase_inline_total Lua phases that ran their first segment inline in the request task.\n");
         s.push_str("# TYPE onrouter_lua_phase_inline_total counter\n");
-        s.push_str(&format!("onrouter_lua_phase_inline_total {}\n", g(&self.lua_inline)));
+        s.push_str(&format!(
+            "onrouter_lua_phase_inline_total {}\n",
+            g(&self.lua_inline)
+        ));
         s.push_str("# HELP onrouter_lua_phase_adopted_total Lua phases handed to the scheduler after yielding in the request task.\n");
         s.push_str("# TYPE onrouter_lua_phase_adopted_total counter\n");
-        s.push_str(&format!("onrouter_lua_phase_adopted_total {}\n", g(&self.lua_adopted)));
+        s.push_str(&format!(
+            "onrouter_lua_phase_adopted_total {}\n",
+            g(&self.lua_adopted)
+        ));
         s.push_str("# HELP onrouter_lua_phase_scheduled_total Lua phases submitted to the scheduler without the fast path.\n");
         s.push_str("# TYPE onrouter_lua_phase_scheduled_total counter\n");
-        s.push_str(&format!("onrouter_lua_phase_scheduled_total {}\n", g(&self.lua_scheduled)));
+        s.push_str(&format!(
+            "onrouter_lua_phase_scheduled_total {}\n",
+            g(&self.lua_scheduled)
+        ));
         // ngx.shared.DICT 磁盘冷层：运维要看分层到底有没有在转（落盘/冷命中/提升）
         push_cold_zones(&mut s, &crate::disk_cache::snapshot(), "dict", "dict");
         // proxy_cache 的冷层同一套账，另起一族名字：响应缓存的落盘不能被读成字典的落盘
@@ -828,6 +861,88 @@ impl Metrics {
             "proxy_cache",
             "zone",
         );
+        // 四层 UDP：没开 UDP 监听时这一族一个字节都不出。渲染"全零"会让人以为
+        // 有个空闲的 UDP 入口，而配置里其实没有。
+        if let Some(u) = crate::stream::udp_snapshot() {
+            macro_rules! udp_row {
+                ($name:expr, $help:expr, $kind:expr, $val:expr) => {{
+                    s.push_str(&format!(
+                        "# HELP {}
+",
+                        $help
+                    ));
+                    s.push_str(&format!(
+                        "# TYPE {} {}
+",
+                        $name, $kind
+                    ));
+                    s.push_str(&format!(
+                        "{} {}
+",
+                        $name, $val
+                    ));
+                }};
+            }
+            udp_row!(
+                "onrouter_stream_udp_datagrams_total",
+                "Datagrams received on stream UDP listeners.",
+                "counter",
+                u.datagrams_in
+            );
+            udp_row!(
+                "onrouter_stream_udp_bytes_total",
+                "Payload bytes received on stream UDP listeners.",
+                "counter",
+                u.bytes_in
+            );
+            udp_row!(
+                "onrouter_stream_udp_forwarded_total",
+                "Datagrams handed to a backend on stream UDP listeners.",
+                "counter",
+                u.forwarded
+            );
+            udp_row!(
+                "onrouter_stream_udp_responses_total",
+                "Backend datagrams delivered back to clients on stream UDP listeners.",
+                "counter",
+                u.responses
+            );
+            udp_row!(
+                "onrouter_stream_udp_sessions_total",
+                "Client sessions ever created on stream UDP listeners.",
+                "counter",
+                u.sessions_total
+            );
+            udp_row!(
+                "onrouter_stream_udp_sessions_active",
+                "Sessions currently open (one session = one socket = one fd).",
+                "gauge",
+                u.sessions_live
+            );
+            s.push_str(
+                "# HELP onrouter_stream_udp_dropped_total Datagrams dropped on stream UDP listeners,                  by reason: no_permit (worker_connections exhausted), queue_full (per-session queue                  saturated), send_failed (backend send failed or target unresolvable), session_cap                  (this listener hit its udp_max_sessions).
+"
+            );
+            s.push_str(
+                "# TYPE onrouter_stream_udp_dropped_total counter
+",
+            );
+            for (role, val) in [
+                ("no_permit", u.drop_no_permit),
+                ("queue_full", u.drop_queue_full),
+                ("session_cap", u.drop_session_cap),
+                ("send_failed", u.drop_send_failed),
+            ] {
+                let q = chr34();
+                s.push_str(&format!(
+                    "onrouter_stream_udp_dropped_total{{role={q}{role}{q}}} {val}
+",
+                    q = q,
+                    role = role,
+                    val = val,
+                ));
+            }
+        }
         s
     }
 }
@@ -845,6 +960,10 @@ fn label(s: &str) -> String {
 /// 两家共用同一个 [`crate::disk_cache`] 实现，账目口径必须一致，所以渲染也只写一份；
 /// 分开的只有序列名——把响应缓存的落盘记到 `onrouter_dict_disk_*` 头上会误导告警。
 /// 只在真的开了冷层的区才输出：没开磁盘层的部署里，这些 0 值序列只是噪音。
+fn chr34() -> char {
+    34u8 as char
+}
+
 fn push_cold_zones(
     s: &mut String,
     zones: &[(String, crate::disk_cache::DiskStore)],
@@ -878,10 +997,7 @@ fn push_cold_zones(
             ));
         };
     }
-    gauge!(
-        "entries",
-        "Cold tier entries currently indexed on disk."
-    );
+    gauge!("entries", "Cold tier entries currently indexed on disk.");
     for (name, z) in zones {
         row!("entries", name, z.entries() as u64);
     }
@@ -1075,7 +1191,12 @@ mod tests {
         assert!(store.spill("k", b"hello", None, 4.0));
         store.flush_pending();
         let mut text = String::new();
-        push_cold_zones(&mut text, &[("api cache".to_string(), store.clone())], "dict", "dict");
+        push_cold_zones(
+            &mut text,
+            &[("api cache".to_string(), store.clone())],
+            "dict",
+            "dict",
+        );
         for needle in [
             "onrouter_dict_disk_entries{dict=\"api cache\"} 1",
             "onrouter_dict_disk_value_bytes{dict=\"api cache\"} 5",

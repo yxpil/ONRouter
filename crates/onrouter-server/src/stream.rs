@@ -14,12 +14,14 @@
 //! * 窥探是 best-effort：不是 TLS / 读不完整 / 没有 SNI 时，仍按默认目标接线，并把已经读到的
 //!   字节原样补给后端（字节透明，绝不吃掉握手数据）。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 
 use crate::router::StreamServer;
@@ -242,7 +244,10 @@ async fn handle_connection(
     let target = match target {
         Some(t) => t,
         None => {
-            log_warn!("stream {} 连接 {peer} 无可用目标（未配 proxy_pass 且 SNI 未命中）", srv.listen);
+            log_warn!(
+                "stream {} 连接 {peer} 无可用目标（未配 proxy_pass 且 SNI 未命中）",
+                srv.listen
+            );
             return;
         }
     };
@@ -366,6 +371,372 @@ where
     }
 }
 
+// ==================== 四层 UDP（数据报代理） ====================
+//
+// 与 TCP 隧道完全不同的一条通路：没有连接、没有"读完再写"，只有"一个客户端 4 元组
+// 对应一条到后端的通道"。游戏 / 语音 / 实时状态同步这类业务全靠这个形状，而它的难点
+// 不在转发一个包，在几万到几十万小包下的那几个边界：
+//
+// * **回包必须回到发起它的那个客户端**。会话按 (客户端 IP, 端口) 归位，并且每会话一条
+//   `connect` 到后端的 socket——连好之后内核只把那个源发来的报文交给我们，别人伪造的
+//   回包进不来。把 A 的位置/血量/房间状态发给 B 不是"体验差"，是跨用户数据泄漏。
+// * **会话必须有生命周期**。没有回收就没有 UDP 代理：源地址可以伪造，洪水会让会话表
+//   无限增长。`proxy_timeout` 就是这条边（nginx 同义：空闲多久就丢掉这个"伪连接"）。
+//   会话数还与 `worker_connections` 共用同一个额度——一个会话就是一条 socket、一个 fd。
+//   额度用尽时**丢包并计数**，而不是把进程拖到 EMFILE。
+// * `proxy_responses 0` 是"只管发、不等回包"（心跳、状态上报）。这种形态不该建会话、
+//   不该占 fd，所以在主循环里直接 `send_to`，一个任务都不开。
+// * 队列满时丢包，不排队到内存里。对 UDP 来说丢一个包是协议允许的结果。
+
+/// 单个数据报的上限（UDP 规范值）
+const MAX_DATAGRAM: usize = 65535;
+
+/// 每个会话的入向队列长度；满了直接丢并计数
+const SESSION_QUEUE: usize = 256;
+
+/// 会话表大到这个数就顺手清一次"任务已结束但表里还在"的条目
+const SESSION_SWEEP_TRIGGER: usize = 4096;
+
+/// UDP 侧的运行计数（`/metrics` 渲染；没开 UDP 监听时一个指标都不出，
+/// 免得把 `off` 这个配置状态渲染成一堆零，让人以为有个空闲的 UDP 入口）
+#[derive(Debug, Default)]
+pub struct UdpCounters {
+    datagrams_in: AtomicU64,
+    bytes_in: AtomicU64,
+    forwarded: AtomicU64,
+    responses: AtomicU64,
+    sessions_total: AtomicU64,
+    sessions_live: AtomicI64,
+    drop_no_permit: AtomicU64,
+    drop_session_cap: AtomicU64,
+    drop_queue_full: AtomicU64,
+    drop_send_failed: AtomicU64,
+}
+
+/// 会话表条目的入向端
+type SessionTx = tokio::sync::mpsc::Sender<Vec<u8>>;
+
+pub struct UdpStats {
+    pub datagrams_in: u64,
+    pub bytes_in: u64,
+    pub forwarded: u64,
+    pub responses: u64,
+    pub sessions_total: u64,
+    pub sessions_live: i64,
+    pub drop_no_permit: u64,
+    pub drop_session_cap: u64,
+    pub drop_queue_full: u64,
+    pub drop_send_failed: u64,
+}
+
+static UDP: OnceLock<UdpCounters> = OnceLock::new();
+
+fn udp() -> &'static UdpCounters {
+    UDP.get_or_init(UdpCounters::default)
+}
+
+pub fn udp_snapshot() -> Option<UdpStats> {
+    let c = UDP.get()?;
+    let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    Some(UdpStats {
+        datagrams_in: g(&c.datagrams_in),
+        bytes_in: g(&c.bytes_in),
+        forwarded: g(&c.forwarded),
+        responses: g(&c.responses),
+        sessions_total: g(&c.sessions_total),
+        sessions_live: c.sessions_live.load(Ordering::Relaxed),
+        drop_no_permit: g(&c.drop_no_permit),
+        drop_session_cap: g(&c.drop_session_cap),
+        drop_queue_full: g(&c.drop_queue_full),
+        drop_send_failed: g(&c.drop_send_failed),
+    })
+}
+
+/// 一个数据报入口的服务循环：收 → 按客户端 4 元组归位 → 转给会话任务（或不等回包时直接发出）。
+pub async fn serve_udp(
+    state: Arc<crate::server::AppState>,
+    pool: Arc<UpstreamPool>,
+    srv: Arc<StreamServer>,
+    sock: Arc<UdpSocket>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let addr = srv.listen;
+    let idle = srv.proxy_timeout;
+    let fire_and_forget = srv.proxy_responses == 0;
+    udp(); // 把计数表立起来：/metrics 由此决定渲染这一族
+    log_info!(
+        "stream 监听 udp://{addr}（proxy_responses={}，空闲回收 {idle:?}，{}）",
+        srv.proxy_responses,
+        if fire_and_forget {
+            "不等回包"
+        } else {
+            "双向"
+        }
+    );
+
+    // 不等回包时共用的出向 socket；双向模式下每个会话自己 connect
+    let egress: Option<Arc<UdpSocket>> = if fire_and_forget {
+        Some(Arc::new(
+            UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| log_error!("stream udp://{addr} 出向 socket 失败: {e}"))
+                .ok()
+                .expect("绑定出向 socket"),
+        ))
+    } else {
+        None
+    };
+
+    let mut sessions: HashMap<SocketAddr, SessionTx> = HashMap::new();
+    // 本条监听的在世会话数（与 `udp_max_sessions` 比）：会话由任务自己收尾，所以是原子计数
+    let live_sessions: Arc<std::sync::atomic::AtomicUsize> =
+        Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cap = srv.udp_max_sessions;
+    if cap == 0 && !state.routing().listeners.is_empty() {
+        log_warn!(
+            "stream udp://{addr} 没有设 udp_max_sessions：源地址可伪造的 UDP 洪水会吃光              worker_connections，把七层与其它四层服务一起饿死（nginx 没有这个旋钮，这里给一个）。             想要上限就写 udp_max_sessions <n>;"
+        );
+    }
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut sweep_logged = false;
+
+    loop {
+        let (n, peer) = tokio::select! {
+            _ = shutdown.changed() => break,
+            r = sock.recv_from(&mut buf) => match r {
+                Ok(v) => v,
+                Err(e) => {
+                    log_warn!("stream udp://{addr} 收包失败: {e}");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+            }
+        };
+        let count = udp();
+        count.datagrams_in.fetch_add(1, Ordering::Relaxed);
+        count.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
+        let data = &buf[..n];
+        let target_spec = match srv.default_target.as_deref() {
+            Some(t) => t,
+            None => {
+                log_warn!("stream udp://{addr} 没有 proxy_pass 目标，丢包");
+                continue;
+            }
+        };
+        let client_ip = peer.ip().to_string();
+
+        if fire_and_forget {
+            // 不建会话、不占 fd：选一个节点直接发出去
+            let Some((spec, _guard)) = resolve_target(&pool, target_spec, &client_ip) else {
+                count.drop_no_permit.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let Some(dest) = resolve_backend(&spec).await else {
+                log_warn!("stream udp://{addr} 后端 {spec} 无法解析，丢包");
+                count.drop_send_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            match egress.as_ref().unwrap().send_to(data, dest).await {
+                Ok(m) if m == n => {
+                    count.forwarded.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(m) => {
+                    log_warn!("stream udp://{addr} 数据报被截断（发出 {m}/{n} 字节），丢包");
+                    count.drop_send_failed.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    log_debug!("stream udp://{addr} 发后端 {dest} 失败: {e}");
+                    count.drop_send_failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            continue;
+        }
+
+        // 双向：已有会话就直接投递；投递失败说明那头已经收摊，顺手把条目摘掉
+        if let Some(tx) = sessions.get(&peer).cloned() {
+            if tx.is_closed() {
+                sessions.remove(&peer);
+            } else {
+                match tx.try_send(data.to_vec()) {
+                    Ok(()) => continue,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        count.drop_queue_full.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        sessions.remove(&peer);
+                    }
+                }
+            }
+        }
+
+        if sessions.len() >= SESSION_SWEEP_TRIGGER {
+            let before = sessions.len();
+            sessions.retain(|_, tx| !tx.is_closed());
+            if !sweep_logged {
+                log_warn!(
+                    "stream udp://{addr} 会话表到达 {before} 条，回收了 {} 条已结束的空位",
+                    before - sessions.len()
+                );
+                sweep_logged = true;
+            }
+        }
+
+        // 每监听点的会话上限：先挡在这一层，别让一条吵闹的 UDP 服务把进程额度吃光
+        if cap > 0 && live_sessions.load(Ordering::Relaxed) >= cap {
+            count.drop_session_cap.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        // 会话=一条 socket=一个 fd，所以与 HTTP/stream 共用 worker_connections 额度
+        let Ok(permit) = state.permits.clone().try_acquire_owned() else {
+            count.drop_no_permit.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let Some((spec, guard)) = resolve_target(&pool, target_spec, &client_ip) else {
+            count.drop_no_permit.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let Some(backend) = resolve_backend(&spec).await else {
+            log_warn!("stream udp://{addr} 后端 {spec} 无法解析，丢包");
+            count.drop_send_failed.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(SESSION_QUEUE);
+        sessions.insert(peer, tx);
+        live_sessions.fetch_add(1, Ordering::Relaxed);
+        count.sessions_total.fetch_add(1, Ordering::Relaxed);
+        count.sessions_live.fetch_add(1, Ordering::Relaxed);
+        let first = data.to_vec();
+        tokio::spawn(udp_session(
+            Arc::clone(&sock),
+            Arc::clone(&srv),
+            peer,
+            backend,
+            rx,
+            first,
+            guard,
+            permit,
+            Arc::clone(&live_sessions),
+            shutdown.clone(),
+        ));
+    }
+
+    // 停机：把会话条目全摘掉，各任务的 rx 随之关闭并自行收尾
+    sessions.clear();
+    log_info!("stream udp://{addr} 已停止");
+}
+
+/// 把一个后端写法（`ip:port`，或带域名的字面量）落成一个可发的地址。
+async fn resolve_backend(spec: &str) -> Option<SocketAddr> {
+    if let Ok(a) = spec.parse::<SocketAddr>() {
+        return Some(a);
+    }
+    let mut addrs = tokio::net::lookup_host(spec).await.ok()?;
+    addrs.next()
+}
+
+/// 一个客户端会话：一条 connect 到后端的 socket + 双向搬运 + 空闲回收。
+///
+/// `permit`/`guard` 必须随会话存活：前者是 worker_connections 额度（会话=一个 fd），
+/// 后者是 upstream 的并发计数（`max_conns`）。它们在函数返回时才释放。
+async fn udp_session(
+    gw: Arc<UdpSocket>,
+    srv: Arc<StreamServer>,
+    peer: SocketAddr,
+    backend: SocketAddr,
+    mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    first: Vec<u8>,
+    _guard: Option<UpstreamGuard>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    live_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let count = udp();
+    // 先 bind 再 connect：connect 之后内核只把**这个后端**发来的报文交给我们，
+    // 于是"把 A 的状态发给 B"这条路径在操作系统层面就不存在
+    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            log_warn!("stream udp 会话 {peer} 建 socket 失败: {e}");
+            live_sessions.fetch_sub(1, Ordering::Relaxed);
+            count.sessions_live.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    if let Err(e) = sock.connect(backend).await {
+        log_warn!("stream udp 会话 {peer} → {backend} 连接失败: {e}");
+        live_sessions.fetch_sub(1, Ordering::Relaxed);
+        count.sessions_live.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+    let idle = srv.proxy_timeout;
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    // 第一个包已经在主循环里收到，先把它发出去，别再等 rx
+    let mut pending: Option<Vec<u8>> = Some(first);
+
+    loop {
+        // 空闲上限每轮重算：任何一次收发都算"还活着"
+        let deadline = if idle.is_zero() {
+            tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600)
+        } else {
+            tokio::time::Instant::now() + idle
+        };
+        let out = {
+            let pending = &mut pending;
+            let rx = &mut rx;
+            async move {
+                match pending.take() {
+                    Some(d) => Some(d),
+                    None => rx.recv().await,
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            maybe = out => {
+                let Some(data) = maybe else {
+                    // rx 关闭（主循环停机或会话被摘掉）
+                    break;
+                };
+                let n = data.len();
+                match sock.send(&data).await {
+                    Ok(m) if m == n => { count.forwarded.fetch_add(1, Ordering::Relaxed); }
+                    Ok(m) => {
+                        log_warn!("stream udp 会话 {peer}：数据报被截断（{m}/{n} 字节）");
+                        count.drop_send_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        log_debug!("stream udp 会话 {peer} → {backend} 发送失败: {e}");
+                        count.drop_send_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            r = sock.recv(&mut buf) => match r {
+                Ok(n) => {
+                    // 回包只可能来自这个后端（socket 已 connect），因此这里不存在
+                    // "把别人的状态发给这位客户端"的路径
+                    count.responses.fetch_add(1, Ordering::Relaxed);
+                    if let Err(e) = gw.send_to(&buf[..n], peer).await {
+                        log_debug!("stream udp 回包给 {peer} 失败: {e}");
+                    }
+                }
+                Err(e) => {
+                    log_debug!("stream udp 会话 {peer} 收后端失败: {e}");
+                    break;
+                }
+            },
+            _ = tokio::time::sleep_until(deadline), if !idle.is_zero() => {
+                log_debug!("stream udp 会话 {peer} 空闲超过 {idle:?}，回收");
+                break;
+            }
+            _ = shutdown.changed() => break,
+        }
+    }
+    live_sessions.fetch_sub(1, Ordering::Relaxed);
+    count.sessions_live.fetch_sub(1, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,7 +804,10 @@ mod tests {
 
     #[test]
     fn no_sni_and_garbage_return_none() {
-        assert_eq!(parse_client_hello_sni(&[0x17, 0x03, 0x03, 0x00, 0x10]), None);
+        assert_eq!(
+            parse_client_hello_sni(&[0x17, 0x03, 0x03, 0x00, 0x10]),
+            None
+        );
         assert_eq!(parse_client_hello_sni(&[]), None);
         let mut not_hello = client_hello("x");
         not_hello[5] = 0x02; // 握手类型改成 server_hello
@@ -461,10 +835,19 @@ mod tests {
     fn pick_sni_target_first_match_wins_and_none_falls_back() {
         let mut srv = StreamServer::default();
         srv.sni_matches = vec![
-            crate::router::SniMatch { pattern: "*.example.com".into(), target: "up_a".into() },
-            crate::router::SniMatch { pattern: "a.example.com".into(), target: "up_b".into() },
+            crate::router::SniMatch {
+                pattern: "*.example.com".into(),
+                target: "up_a".into(),
+            },
+            crate::router::SniMatch {
+                pattern: "a.example.com".into(),
+                target: "up_b".into(),
+            },
         ];
-        assert_eq!(pick_sni_target(&srv, Some("a.example.com")).as_deref(), Some("up_a"));
+        assert_eq!(
+            pick_sni_target(&srv, Some("a.example.com")).as_deref(),
+            Some("up_a")
+        );
         assert_eq!(pick_sni_target(&srv, Some("other.net")).as_deref(), None);
         assert_eq!(pick_sni_target(&srv, None).as_deref(), None);
     }

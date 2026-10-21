@@ -1,6 +1,6 @@
 # ONRouter 1.0 操作手册
 
-适用版本：**1.0.0**（2026-10-21）
+适用版本：**1.0.2**（2026-10-21）
 面向：部署、值守、容量规划与故障排查。
 配套文档：[使用教程](TUTORIAL.md)、[完整功能矩阵与 Lua API](../README.md)、[能力矩阵与证据](CAPABILITY_MATRIX.md)。
 
@@ -28,40 +28,49 @@ Linux/macOS 用信号管理进程；Windows 只响应 Ctrl+C，热重载依赖�
 
 ### 2.1 使用发布包
 
-1.0 的发布包是“开箱可跑”的完整目录，不只是两个可执行文件：
+有两种产物，装的东西不一样，先看清要拿哪一个：
+
+**A. GitHub Release 上的平台包**（`release.yml` 推 `v*` 标签时自动产出 8 个）——
+每个里面**只有两个可执行文件**（`onrouter` 与 `orr-gencert`），文件名是
+`onrouter-v<版本>-<target>.tar.gz`（Linux/macOS）或 `.zip`（Windows），
+target 为 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、
+`armv7-unknown-linux-gnueabihf`、`riscv64gc-unknown-linux-gnu`、
+`x86_64-apple-darwin`、`aarch64-apple-darwin`、`x86_64-pc-windows-msvc`、
+`aarch64-pc-windows-msvc`。配置、示例站点与文档**不在**这种包里，随仓库拿或自己准备。
+
+**B. 本地/内网构建机打包的"开箱可跑"完整目录**（`build-release.ps1` / `build-release.sh`
+产出，落在 `target/dist/archives/`）——除两个可执行文件外还带：
 
 | 路径 | 用途 |
 |---|---|
-| `onrouter` / `onrouter.exe` | 网关主程序 |
-| `orr-gencert` / `orr-gencert.exe` | 生成自签名证书（测试/内网用） |
 | `conf/*.conf` | 示例配置（含 `tutorial_hello.conf`、`tutorial_full.conf`） |
 | `conf/wasm/`、`conf/wasm_static/` 等 | WASM 插件与 E2E/教学用静态资源 |
 | `lua/`、`public/` | 示例 Lua 脚本与静态站点 |
-| `certs/` | 打包时新生成的自签名证书对，供 `conf/onrouter.conf` 的 8443 TLS 演示直接使用 |
-| `docs/OPERATIONS.md`、`docs/TUTORIAL.md` | 操作手册与使用教程 |
-| `README.md` | 项目说明 |
+| `certs/` | 打包时由 `orr-gencert` 现生成的自签名证书对，供 `conf/onrouter.conf` 的 8443 TLS 演示直接使用 |
+| `docs/`、`README.md` | 操作手册、使用教程与项目说明 |
 
-`certs/` 里的私钥不进入 git，每次打包由 `orr-gencert` 现生成；它只用于开箱验证，
-生产环境请按第 5 节替换为自己的证书。`logs/`、`cache/` 等运行时状态**不会**打进包内，
-首次启动前需保证对应目录可写。
+两种包的压缩结构都是"内容在压缩包根"，**没有** `onrouter-v1.0.2-…/` 这样的外层目录，
+所以解压时先自己建目录，别指望 `cd` 进一个包里不存在的名字：
 
 ```bash
-# Linux / macOS
-tar xzf onrouter-v1.0.0-x86_64-unknown-linux-gnu.tar.gz
-cd onrouter-v1.0.0-x86_64-unknown-linux-gnu
-install -m 0755 onrouter orr-gencert /usr/local/bin/
+# A 类（GitHub 资产）：Linux / macOS
+mkdir -p /usr/local/onrouter && tar xzf onrouter-v1.0.2-x86_64-unknown-linux-gnu.tar.gz -C /usr/local/onrouter
+install -m 0755 /usr/local/onrouter/onrouter /usr/local/onrouter/orr-gencert /usr/local/bin/
 onrouter -V
-onrouter -t -c conf/onrouter.conf
 
-# Windows PowerShell
-Expand-Archive onrouter-v1.0.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\onrouter
-cd C:\onrouter
-.\onrouter.exe -V
-.\onrouter.exe -t -c conf\onrouter.conf
+# A 类：Windows PowerShell
+New-Item -ItemType Directory -Force C:\onrouter | Out-Null
+Expand-Archive onrouter-v1.0.2-x86_64-pc-windows-msvc.zip -DestinationPath C:\onrouter
+C:\onrouter\onrouter.exe -V
+
+# B 类（完整目录包）：解开就是推荐布局，conf/ 与可执行文件同级，直接能跑
+mkdir -p orr && tar xzf onrouter-v1.0.2-x86_64-unknown-linux-gnu.tar.gz -C orr
+cd orr && ./onrouter -t -c conf/onrouter.conf
 ```
 
-解压后目录本身就是推荐布局（`onrouter` 与 `conf/`、`lua/`、`public/` 同级），
-直接 `onrouter -c conf/onrouter.conf` 即可启动，教程见 `docs/TUTORIAL.md`。
+`certs/` 里的私钥不进入 git，每次打包现生成；它只用于开箱验证，生产环境请按第 5 节
+替换为自己的证书。`logs/`、`cache/` 等运行时状态**不会**打进包内，首次启动前需保证对应
+目录可写。教程见 `docs/TUTORIAL.md`。
 
 ### 2.2 从源码构建
 
@@ -88,7 +97,9 @@ target/release/onrouter -V
 配置里的相对路径**以配置文件所在目录为基准**（不是进程当前目录）：
 
 - `onrouter -c conf/onrouter.conf` → `logs/a.log` 落在 `conf/logs/a.log`；
-- `wasm_plugin auth conf/wasm/auth.wat;` 应写成 `wasm_plugin auth wasm/auth.wat;`（相对 `conf/`）；
+- `wasm_plugin authz conf/wasm/authz.wat;` 会去 `conf/conf/wasm/authz.wat` 找文件，应写成
+  `wasm_plugin authz wasm/authz.wat;`（相对 `conf/`，仓库里就带 `authz.wat`/`header_filter.wat`/
+  `body_filter.wat`/`fuel.wat` 四个示例）；
 - 使用 `-p <prefix>` 时，所有相对路径以 prefix 为基准，配置文件本身也是 `prefix/<conf>`。
 
 这是新用户最容易踩的坑：`-t` 能过、启动后日志却找不到，通常就是基准目录理解错了。
@@ -226,6 +237,10 @@ Windows 没有 `SIGHUP`：改了配置后要么重启，要么预先配置 `relo
 
 ### 4.3 日志
 
+nginx 的 `error_log` 级别不记 info，但 ONRouter 的启动摘要（每个限流区的实际 `key=`、缓存区、
+调度窗口、冷层目录）都是 info 级：**排障要看这些行就得留 info**。下面的日志路径都是相对路径，
+按**配置文件所在目录**解析（配置放 `conf/` 时就是 `conf/logs/`，不是仓库根的 `logs/`）。
+
 ```nginx
 error_log "logs/error.log" info;   # debug|info|warn|error
 error_log_max_size 64m;            # 单文件上限，超出滚动
@@ -249,15 +264,15 @@ access_log_keep 5;
 | `worker_connections <n>;` | 每进程连接额度 | 10240 |
 | `keepalive_requests <n>;` | 单连接最多请求数 | 1000 |
 | `keepalive_timeout <t>;` | 下游空闲 keep-alive 超时 | 见示例配置 |
-| `client_header_timeout` / `client_body_timeout` | 读请求头/体的空闲超时 | — |
+| `client_header_timeout` / `client_body_timeout` | 读请求头/体的空闲超时（体超时是**单帧之间**的最大间隔，不是总时长） | 15s / 30s |
+| `tls_handshake_timeout <t>;` | 与客户端 TLS 握手的上限，超时直接关连接（不占 worker 额度干等） | 10s |
 | `shutdown_grace <t>;` | 优雅停机排空上限 | 30s |
 | `reload <t>;` | 配置/证书轮询间隔 | 仅信号 |
-| `server_tokens on/off;` | 是否暴露版本 | — |
-| `tcp_nodelay on/off;` | TCP_NODELAY | — |
-| `accept_backlog <n>;` | listen backlog | — |
+| `server_tokens on/off;` | 是否暴露版本（`Server:` 与错误页） | on |
+| `tcp_nodelay on/off;` | TCP_NODELAY | on |
+| `accept_backlog <n>;` | listen backlog | 512 |
 | `gzip ...` | 响应压缩 | 关闭 |
 | `proxy_cache_path <path> keys_zone=<name>:<size> [disk=on] [max_size=] [levels=] [inactive=] [spill_after=] [max_value=];` | 缓存区；`disk=on` 时 `<path>` 就是该区冷层目录 | 冷层关闭 |
-| `proxy_cache_revalidate on|off;` | 过期条目先带上缓存自己的 ETag/Last-Modified 问一次，304 就复用已存 body | `off` |
 | `still_online_zone <name> <size>;` | 最后已知好副本区 | — |
 
 ### 5.1 server 级的 `return` / `rewrite` / `set` / `if`
@@ -284,6 +299,134 @@ server {
 - 形态检查与 location 级共用同一套解析器：`if` 嵌套、`set plain 1`（变量名不是 `$` 开头）、
   非法条件都会在 `-t` 直接失败，不是告警。
 - 执行仍受 `MAX_URI_CHANGES` 的环检测保护；server 级 rewrite 自身不消耗跳数额度。
+
+### 5.2 限流的计数维度：`limit_req_zone` / `limit_conn_zone` 的 key
+
+`limit_*_zone` 的第一个参数决定**谁和谁共用同一个令牌桶**，所以它是限流配置里最要紧的一个选择。
+按 IP 计数在机房出口、校园网、公司 NAT 之后会把一整栋楼算成一个人；真实业务经常需要按人、
+按会话、按调用方限：
+
+```nginx
+# 按会话限：一人一键，同 IP 的另一个人不受影响
+limit_req_zone  $cookie_JSESSIONID  zone=peruser:1m  rate=2r/s  burst=5;
+# 按调用方限（API 网关常见形状：一个 key 一个配额）
+limit_req_zone  $http_x_api_key     zone=perapp:1m   rate=50r/s burst=100;
+# 拼一个键：参数 + 地址一起构成计数维度
+limit_req_zone  $arg_k$remote_addr  zone=perpath:1m   rate=1r/s;
+# 并发额度是另一类区（limit_conn_zone），与 limit_req_zone 不能互换
+limit_conn_zone $cookie_JSESSIONID  zone=peruser_conn:1m;
+
+server {
+    location /api/ { limit_req zone=peruser; }
+    # limit_conn 用的是并发区（limit_conn_zone），也可以写在 location 里：
+    # 写了就整组替换 server 级那一条，不是叠加
+    location /export/ { limit_conn peruser_conn 1; }
+}
+```
+
+支持的维度：
+
+| 写法 | 计的是什么 |
+|---|---|
+| `$remote_addr` / `$binary_remote_addr` | 客户端地址（走 realip / front_proxy 采信后的地址） |
+| `$http_<头名>` | 请求头，如 `$http_x_api_key`（不存在的头 = 空 = 不限流） |
+| `$cookie_<名>` | Cookie 里的一个值，如 `$cookie_JSESSIONID`（没有这个 Cookie = 空 = 不限流） |
+| `$arg_<名>` | URL 查询参数，如 `$arg_token` |
+| `$remote_port` `$server_addr` `$server_port` `$scheme` `$https` `$request_method`（`$method`） `$uri`（规范化后的） `$request_uri` `$args`（=`$query_string`） `$is_args` `$hostname` `$host` `$ssl_server_name` `$realip_remote_addr` `$content_type` `$content_length` `$request_length` `$proxy_add_x_forwarded_for` `$front_proxy*` | 判定时刻就有值的固定变量 |
+| 以上任意拼接 | `$cookie_sid$remote_addr`，按整模板插值成一个键 |
+
+明确**不支持**、并且 `-t` 会直接否决的写法（不是告警）：
+
+- 响应期/后端变量：`$status`、`$upstream_*`、`$sent_http_*`。限流判定发生在回源之前，这些取不到值，
+  写下去等于把全区流量并成一个空键的桶。
+- `$request_body`：判定时刻请求体还没读完，恒为空。
+- `set` 出来的请求级变量：限流跑在 REWRITE 之前，那时 `set` 还没执行。nginx 允许这种写法，
+  ONRouter 目前不允许 —— 请直接用 `set` 右边那个来源变量当键。
+- 本实现没有的变量（如 `$server_name`）。想按站点限流请为每个站点声明各自的区。
+
+运维上必须知道的三件事：
+
+1. **空键 = 这个请求不受本区限流**（与 nginx 一致）。没带 `$http_x_api_key` 的请求不会占任何桶，
+   所以"按头限流"必须和 ACL 或 `if` + `return` 搭配，否则不带头的流量完全不受约束。
+   想确认实际生效的维度：`error_log ... info;` 下每个区启动时都有一行
+   `生效 limit_req zone=peruser rate=2.0r/s burst=5 key=$cookie_JSESSIONID`（`-t` 只摘要开了队列的区）。
+2. **键的基数由客户端决定时要设防**。每个区最多跟踪 32 分片 × 16384 个键。到顶时：
+   `limit_req_zone` 淘汰最久未使用的那批（它们的桶被清空 = 重新计数），`limit_conn_zone`
+   优先复用已归零的键、一个都没有时按 nginx 的 shm 耗尽语义**拒绝**新连接。
+   拿一个客户端可以随意伪造的头当键，攻击者只要每次换个值就能永远落在"新键"上，等于绕过限流。
+   因此这类键要么必须是服务端签发的会话号，要么就得接受"换键成本为零"的事实。
+3. **`zone=<名>:<容量>` 里的容量数字目前只用于展示**，实际表上限就是上面那条 32×16384。
+   写 `1m` 还是 `10m` 不改变能跟踪多少个键。
+4. **拒绝时回哪个码是两处默认值差异**：`limit_req_status`（http 级）ONRouter 默认 **429**，
+   nginx 默认 503；`limit_conn_status` 两边都是 503。`limit_req` 拒绝的响应还带 `Retry-After`
+   （`limit_conn` 是直接收口的，没有这个头）。
+   从 nginx 迁过来、告警规则按"503 才是被限流"写的，显式写一行 `limit_req_status 503;`，
+   别依赖默认值。
+
+### 5.3 静态资源的过期头：`expires`
+
+`expires` 只管响应头（`Cache-Control` / `Expires`），不影响本机 `proxy_cache` 的存留时间——
+那一维由 `proxy_cache_valid` 决定。nginx 的取值口径这里全部可用：
+
+| 写法 | 落下的头 |
+|---|---|
+| `expires 30d;` / `expires +1h;` | `Cache-Control: max-age=2592000` + 未来的 `Expires` |
+| `expires -1h;` | `Cache-Control: no-cache` + 已经过去的 `Expires` |
+| `expires max;` | `Cache-Control: public, max-age=315360000`（十年） |
+| `expires epoch;` | `Cache-Control: no-store` + `Expires: Thu, 01 Jan 1970 00:00:01 GMT` |
+| `expires @23:59:59;` | 定到当天 UTC 的那个时刻；已过则 `no-cache` |
+| `expires "private, no-store";` | 原样作为 `Cache-Control` 的值，不动 `Expires` |
+| `expires off;` | 什么都不写 |
+
+要点：
+
+- server 与 location 两级都能写。location 一旦写了就**整条替换** server 的（写成 `off` 是显式关闭，
+  与"没写"不同），与 nginx 的指令继承一致。
+- 只在可缓存的状态码上改写：**200/201/204/206/301/302/303/304/307/308**，逐条对照 nginx
+  `ngx_http_headers_filter_module.c` 里的 `safe_status` 分支（**包含 204**：空响应也可以被说成
+  能存一小时）；其余（404、500……）一字不动，否则错误页会被浏览器存成"能看一小时的本页"。
+  用例在 `router::tests` 里逐码钉住，端到端由 `tools/expires_e2e.py` 覆盖。
+- 网关的策略**覆盖源站自己那份 `Cache-Control`**（nginx 的 header filter 同样如此）。要透传源站的
+  过期策略就别在这一级写 `expires`。
+- 静态文件、反向代理、缓存命中、Lua（含已经 `flush` 出去的流式响应）、`return` 五条响应路径都落。
+  流式那条最容易漏，`tools/expires_e2e.py` 逐条钉住。
+- 时间值写坏（`expires 1x;`）在 `-t` 直接失败：那种配置落下去是"响应里一个过期头都没有"，
+  而运维以为已经缓存住了。
+
+```nginx
+server {
+    root /srv/site;
+    expires 1h;                       # 兜底：整站一小时
+    location /assets/ { expires max; }    # 带指纹的静态资源：十年
+    location /login   { expires off; }    # 显式不写（不是"没配"）
+}
+```
+
+### 5.4 传输协议：h1 / h2 / h3 各自要写对的地方
+
+```nginx
+server {
+    listen 443 ssl http2 quic;       # TCP 上 h1.1+h2，UDP 443 上 h3
+    server_name www.example.com;
+}
+```
+
+- **`quic` 只带来 UDP 上的 HTTP/3，不会把 TCP 侧顺手升级成 h2**（口径同 nginx：那是两个
+  参数）。只写 `ssl quic` 时，用 ALPN 要 h2 的客户端会被拒绝（`no application protocol`）——
+  想三种都要就写全 `ssl http2 quic`。
+- `-t` 与启动横幅会把这个端点的形状说出来：`监听 127.0.0.1:443 TLS+HTTP/3(同端口 UDP) -> […]`。
+  运维不该靠外部探测才知道"这台到底开没开 h3"。TCP 侧的响应会自动带
+  `Alt-Svc: h3=":443"; ma=3600`，浏览器据此跳到 QUIC。
+- **请求体按分帧读，不按头猜**：h2/h3 的请求既没有 `Content-Length` 也没有
+  `Transfer-Encoding: chunked`，字节就在 DATA 帧里、流的结束标记就是体的结束。1.0.2 之前
+  网关用"这两个头在不在"来决定读不读体，于是 h2/h3 上的 POST 交到上游时是**空体**（源站看到
+  一个没有 Content-Length 的 POST），而 h1 一切正常——这类差别不会报错，只会让业务"偶尔丢单"。
+  现在三种传输的 body 长度与摘要在 `tools/quic_business_e2e.py` 里逐个对齐。
+- 缓存、限流、`expires`、状态码这些**策略是跨传输共享的同一本账**：同一会话的令牌桶不会因为
+  它从 h2 换到 h3 就重置；一条 `proxy_cache` 命中对三种传输是同一份字节。这一点是刻意测的
+  （同一条套件），因为"每种协议各一套行为"是这类网关最常见的坑。
+- 已知边界：网关到后端只说 HTTP/1.1（ALPN 固定 `http/1.1`，没有 h2/h3 upstream）；
+  WebSocket over h2/h3（RFC 8441 / 9220）未实现——要 WS 就走 h1.1 的 Upgrade 那条路。
 
 ---
 
@@ -347,8 +490,23 @@ upstream app {
 }
 ```
 
-`max_fails`/`fail_timeout` 是被动健康检查：连接失败/超时累计到阈值后摘除节点，`fail_timeout`
-内不再选它。`down` 是人工下线，不参与探测。
+`max_fails`/`fail_timeout` 是被动健康检查。"一次尝试算不算失败"分两类，这个区别在 nginx
+源码里就存在（`ngx_http_upstream_next()` 在函数开头就把对端记为失败，"要不要重试"是后面
+另一件事）：
+
+- **连不上、等满 `proxy_*_timeout`、响应非法**：一定算一次失败，**即使这次不能重发**。
+  非幂等方法（POST/LOCK/PATCH）不会被重发，但那台后端照样被记一次——它确实没答上来。
+- **状态码命中 `proxy_next_upstream http_XXX`**：只有**真的换了节点**的那一次才算失败，
+  且 `http_403`/`http_404` 永远不算（nginx 走 `NGX_PEER_NEXT`）。所以一台"只会回 503"的
+  后端，没写 `http_503` 时它的响应会被当成合法响应原样回给客户端，既不换节点也不计入
+  `max_fails`；要摘它就得把 `http_503` 写进 `proxy_next_upstream`。
+
+`down` 是人工下线，不参与探测。
+
+给客户端的码也按根因分：**等满超时是 504**，连不上、响应非法、所有节点都在摘除期是 502。
+这两个码在告警与 `error_page` 里不该合并——一台只是慢的后端和一台已经死掉的后端，处理方式不同。
+非幂等方法（POST/LOCK/PATCH）默认不参与换节点重试，请求一旦交到某台后端就只在那台上成败，
+除非显式写 `non_idempotent`。
 
 ### 7.2 懒重连（lazy rejoin）
 
@@ -410,6 +568,62 @@ curl -s http://127.0.0.1:8080/metrics | grep onrouter_upstream
 排障顺序：先看 `server_available` 是否与预期一致，再看 `requests_total` 的 failure 增量，最后看
 `circuit_state` 是否卡在 2。被动摘除/懒重连没有独立线程，`lazy_probes_total` 的增量就是恢复
 探测发生的证据。
+
+---
+
+### 7.5 四层 UDP：游戏 / 语音 / 实时状态同步
+
+```nginx
+stream {
+    server {
+        listen 18613 udp;
+        proxy_pass 127.0.0.1:18621;
+        proxy_responses 0;      # 心跳/状态上报：只发不等，不建会话也不占 fd
+        proxy_timeout 5s;
+    }
+    server {
+        listen 18614 udp;
+        proxy_pass rooms;       # 房间服：命名 upstream，选点与 max_conns 照常生效
+        proxy_timeout 2s;
+        udp_max_sessions 2048;  # 见下：这条监听同时最多维持多少条会话
+    }
+    server {
+        listen 18615 udp;
+        proxy_pass 127.0.0.1:18623;
+        proxy_responses 4;      # 一问多答：匹配结果 + 若干状态帧
+    }
+}
+```
+
+要点（都是 `tools/game_udp_e2e.py` 量过的，不是设计意图）：
+
+- **会话按客户端 4 元组归位**，并且每条会话用一条 `connect` 到后端的 socket：内核只会把
+  那个后端发来的报文交给我们，所以"把 A 的位置/血量发给 B"这条路径在操作系统层面不存在。
+  60 个客户端并发、每人只该收到自己的 player 号——这套件的判定就是这个。
+- **一个会话 = 一个 fd**，与 HTTP/stream 共用 `worker_connections` 额度。额度用尽时**丢包并计数**
+  （`onrouter_stream_udp_dropped_total{role="no_permit"}`），不会把进程拖到 EMFILE。
+- `proxy_timeout` 是会话的**空闲回收**期限。60 个客户端停手后 `…_sessions_active` 必须回落到 0，
+  否则就是 fd 泄漏（件套件钉住了这一条）。
+- **`udp_max_sessions` 是 ONRouter 的扩展，nginx 没有对应物**，而且它是给 UDP 用的护栏：
+  UDP 的源地址与 4 元组是可以伪造的，一条吵闹的 UDP 服务在没有上限时会把 `worker_connections`
+  吃光，**连七层一起饿死**。实测对照（`worker_connections=256`，同时打开 600 个客户端）：
+
+  | 配置 | 活跃会话 | `/ping` | 备注 |
+  |---|---|---|---|
+  | 不设 `udp_max_sessions` | 顶到额度 | 取不到（含 `/metrics`） | 洪水期间整台不可观测 |
+  | `udp_max_sessions 32` | 32 | 200 | 568 次挡在门外，记 `role="session_cap"` |
+
+  UDP 监听没设上限而同一进程里又有七层监听时，启动日志会给一条告警说明这件事。
+- 同一端口号上的 TCP 与 UDP 互不干扰（`listen 18613;` 与 `listen 18613 udp;` 可以并存）。
+- 数据报边界：0 字节与 65000 字节都能原路往返；单个数据报上限 65535，每会话入向队列 256，
+  队列满即丢并记 `role="queue_full"`。
+- 本机回环上的实测延迟：p50 0.25 ms、p99 0.86 ms（一问一答，三轮回归里都稳定在这个量级）。
+  心跳路径的判定是**计数守恒**而不是速率：3 万个数据报全部到达后端、
+  `datagrams_in == forwarded + dropped` 严格成立；速率同一份代码从 ≈58k pps（空载单跑）到
+  ≈3.9k pps（在全量回归的负载里跑）都出现过，所以它只能按机器读，容量规划要用自己机器的数。
+- 能力边界：`listen … udp` 不能配 `ssl_preread`/`sni_match`（数据报会乱序、会丢失，从半条
+  ClientHello 里取 SNI 不是安全操作），也不能写在 HTTP 的 `listen` 上（那里 UDP 只有 QUIC）。
+  两种写法都在 `-t` 直接失败。
 
 ---
 
@@ -737,6 +951,11 @@ scrape_configs:
 | `onrouter_limit_rejections_total` | 限流/限连拒绝 |
 | `onrouter_access_log_dropped_total` | 日志丢弃（磁盘告警） |
 | `onrouter_still_online_*` | 副本区条目/字节/待恢复任务 |
+| `onrouter_dict_disk_{entries,bytes,value_bytes,capacity_bytes,pending_jobs,pending_bytes}` | `lua_shared_dict … disk=<目录>` 各区的冷层体量与写盘排队（没配 disk= 的区不输出） |
+| `onrouter_dict_disk_operations_total{dict,op}` | 共享字典冷层的 `spill`/`cold_hit`/`promote`/`evict`/`expire`/`corrupt`/`cold_error` 等逐操作计数 |
+| `onrouter_stream_udp_{datagrams,bytes,forwarded,responses}_total` | 四层 UDP 的进/出账：收到多少数据报、转发多少、后端回了多少 |
+| `onrouter_stream_udp_sessions_total` / `_sessions_active` | 会话累计与当前活跃（一条会话=一个 fd，长期不回落就是 `proxy_timeout` 配长了） |
+| `onrouter_stream_udp_dropped_total{role}` | 丢包原因：`no_permit`（连接额度耗尽）/`queue_full`（会话队列满）/`send_failed`（后端发送失败）/`session_cap`（撞上 `udp_max_sessions`） |
 
 建议告警：
 
@@ -765,7 +984,7 @@ scrape_configs:
 
 ## 13. 性能与稳定性验证
 
-### 13.1 本机 1.0.0 压测口径
+### 13.1 本机压测口径（1.0.2）
 
 仓库内提供：
 
@@ -782,10 +1001,23 @@ python tools/proxy_split_e2e.py  # 76 项
 python tools/proxy_disk_e2e.py   # 39 项（响应缓存磁盘冷层）
 python tools/proxy_cache_e2e.py  # 21 项（含 proxy_cache_revalidate 的 R1–R8）
 python tools/set_if_e2e.py       # 34 项（含 server 级 REWRITE 的 S16–S23）
+python tools/limit_key_e2e.py    # 35 项（限流按头/Cookie/参数分桶；全部同 IP，换键必换桶）
+python tools/expires_e2e.py      # 42 项（expires 各写法在静态/反代/缓存/Lua/流式/return 上的落头，含 4 条 -t 否决）
+python tools/herd_e2e.py         # 18 项（惊群：热点 key 到期、锁、冷层过期、同键 200 并发限流）
 
-# 稳定性压测：默认 20 分钟，混合反代/缓存/WASM/Lua/静态流量
+# 业务形状（不是指令清单，判的是业务底线）
+python tools/course_selection_e2e.py --students 2400 --conc 240   # 选课开放：不超卖、源站报名数==网关放行数
+python tools/flash_sale_e2e.py                                   # 大促/闪购（36 项）
+python tools/game_udp_e2e.py                                     # 游戏服务器 UDP（31 项）
+python tools/quic_business_e2e.py                                # 同一站点 over h1/h2/h3 的跨传输一致性（41 项）
+python tools/production_shape_e2e.py                               # 800 文件静态站 + WASM + Lua 同进程（529 项）
+
+# 教程示例本身的核对（文档里那几行配置照抄能不能得到同样结果）
+python tools/tutorial_limit_check.py                             # §12 的 17 项（含 rate/burst/队列实测值）
+
+# 稳定性压测：默认 20 分钟，混合反代/缓存/WASM/Lua/静态流量；发布口径跑 21 分钟
 cargo build --release -p onrouter-server --bin onrouter
-python tools/soak_test.py --minutes 20
+python tools/soak_test.py --minutes 21
 ```
 
 `soak_test.py` 的结论口径：
@@ -830,12 +1062,37 @@ python tools/soak_test.py --minutes 20
 | 冷层账目（结束时） | 落盘 81,723 / 冷命中 80,986 / 提升 80,986 / 索引 256 条 |
 | 冷层异常账目 | `spill_skipped` 0、`corrupt` 0、`cold_error` 0、`never_read` 0、`pending_jobs` 0 |
 
+1.0.2 的这一轮（同一口径、同一份 `conf/soak.conf`，跑在发布二进制上）：
+
+| 指标 | 数值 |
+|---|---|
+| 结论 | **PASS**（`failures` 为空） |
+| 实际时长 / 平均吞吐 | 20.92 min / 1812.8 req/s（24 短连接 + 4 keep-alive worker） |
+| 请求总数 / 失败 / 回源 | 2,275,361 / **0** / 1,728,933 |
+| 私有内存 | 20.47 MiB → 20.96 MiB（**+0.49 MiB**，峰值 22.33 MiB） |
+| 私有内存斜率 | +0.055 MiB/min（阈值 1.0，预热后 192 个样本） |
+| RSS | 27.77 MiB → 29.20 MiB |
+| 冷层账目（结束时） | 落盘 83,363 / 冷命中 82,632 / 提升 82,632；`corrupt` 0、`never_read` 0、`pending_jobs` 0 |
+
+顺带修掉一个会把冷层账目弄脏的压测器缺陷：`soak_test.py` 过去只清 `logs/soak_cache`，
+而配置里还有 `logs/soak_cold disk=on`——上一轮留下的 256 个冷层文件会在启动扫描时被记成
+`corrupt`，让"异常账目全零"这条证据失真。现在清理目录是从配置里读 `proxy_cache_path` 得到的，
+这一轮 `corrupt=0` 才是真意义上的干净。
+
 冷层的落盘量与冷命中量近乎一比一、且 `never_read=0`，说明写下去的都是真被读回来的对象，
 不是"往磁盘倾倒垃圾"；`pending_jobs` 收尾归零说明异步写线程没被拖在后面。
 这一轮跑的是 1.0.1 的全部改动（冷层 + `proxy_cache_revalidate` + server 级 REWRITE），产物：
 `target/soak_report_v101.json`、`target/soak_metrics_end_v101.txt`；冷层单独验证的那一轮（只有冷层）
 保留为 `target/soak_report_v101_coldtier.json`，两条曲线一致（+1.07 MiB 与 +0.71 MiB，都在噪声量级）。
-全量回归 `python run_regression.py reg_101_roll.txt` → `TOTAL 86 scripts, nonzero=0`。
+全量回归 `python run_regression.py reg_101_roll.txt` → `TOTAL 86 scripts, nonzero=1`：那一条非零是
+`smoke_suite.py`（退出码 1，日志里 28/28 通过——脚本自己的退出码判定与断言结果不一致），
+在 1.0.2 的同一条上它是 `EXIT 0`，1.0.1 当时到底是断言之外的什么问题没有留下证据，
+所以这里记成"当时那条不为零"而不是"全绿"。
+
+1.0.2 的发布闸门跑在最终二进制上：`python run_regression.py reg_102_ship.txt` →
+`TOTAL 94 scripts, nonzero=0`（比 1.0.1 多出 `expires`、`limit_key`、`herd`、`game_udp`、
+`course_selection`、`flash_sale`、`production_shape`、`quic_business` 这八条业务形状套件；
+`random_scenarios_e2e` 仍然按 §13.1 记在 `run_regression.py` 的 `SKIP` 里，不是"忘了它"）。
 
 ### 13.2 上线前压测建议
 
@@ -892,9 +1149,9 @@ tail -n 200 conf/logs/error.log
 
 ---
 
-## 16. 升级、回滚与 1.0.0 发布检查
+## 16. 升级、回滚与发布检查
 
-### 16.1 从 0.8.x 升到 1.0.0
+### 16.1 从旧版本升上来要做什么
 
 1. 备份当前二进制、配置、证书与插件；
 2. 用新二进制对**旧配置**跑 `-t`，确认告警与退出码；
@@ -903,17 +1160,21 @@ tail -n 200 conf/logs/error.log
 5. 全量替换：停旧进程 → 起新进程；有 LB 时先摘流再停，避免连接被重置；
 6. 回滚：换回旧二进制 + 旧配置，`-t` 后启动。
 
-1.0.0 新增的配置都是**可选**的：`worker_threads`/`worker_cpu_affinity`、`lazy_rejoin`、
-`circuit_breaker`、`canary`、`wasm_plugin` 等不写就不改变原有行为。唯一需要注意的是
-`proxy_split_failover` 与灰度变量的 `-t` 校验更严格：写错的灰度配置现在会在检查阶段失败，
-而不是线上 500。
+1.0.x 各版新增的配置都是**可选**的：`worker_threads`/`worker_cpu_affinity`、`lazy_rejoin`、
+`circuit_breaker`、`canary`、`wasm_plugin`、`expires`、`limit_req_queue`、`stream` 里的
+`udp`/`proxy_responses`/`udp_max_sessions` 等，不写就不改变原有行为。真正会变的是**校验变严**：
+`proxy_split_failover` 与灰度变量、`limit_*_zone` 的 key、`expires` 的取值写错时现在会在 `-t`
+阶段失败并点名，而不是线上 500 或静默放行。升级时用新二进制对**旧配置**跑一次 `-t`，
+逐条读告警，就是这一版的全部迁移成本。
 
 ### 16.2 发布前检查表
 
 - [ ] `cargo test --workspace` 全绿；
 - [ ] `cargo clippy --workspace --all-targets` 无 error；
-- [ ] 五项 E2E 全绿（canary/wasm/resilience/affinity/proxy_split）；
-- [ ] 20 分钟 soak 通过，私有内存预热后走平；
+- [ ] 全量回归 `python run_regression.py <本次发布名>.txt` 记录零非零退出（`random_scenarios_e2e`
+      除外，原因写在脚本顶部的 `SKIP` 里，不是"忘了"）；
+- [ ] CI 的两个 E2E 步骤（功能契约 + 业务形状）在 Linux 上全绿；
+- [ ] 21 分钟 soak 通过，私有内存预热后走平；
 - [ ] 发布包内二进制的 `-V` 与 `Cargo.toml` 版本一致；
 - [ ] 用发布包里的二进制跑 `-t` 与一次真实请求；
 - [ ] 备份旧版本，准备回滚命令；
@@ -922,7 +1183,7 @@ tail -n 200 conf/logs/error.log
 ### 16.3 打包
 
 ```powershell
-# Windows：生成 target\dist\archives\onrouter-v1.0.0-x86_64-pc-windows-msvc.zip
+# Windows：生成 target\dist\archives\onrouter-v1.0.2-x86_64-pc-windows-msvc.zip
 powershell -ExecutionPolicy Bypass -File .\build-release.ps1 build
 python tools\release_verify.py
 ```

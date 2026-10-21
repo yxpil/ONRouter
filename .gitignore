@@ -41,3 +41,18 @@ natb.exe
 
 # Linux A/B 临时 OpenResty 前缀（tools/linux_ab.sh）
 /.bench_openresty/
+
+# 测试夹具的生成物（各 e2e 脚本每次跑都重建，不进版本库）
+/certs_random/
+/public_prodshape/
+/public_course/
+/public_expires/
+/public_flash/
+/public_qbiz/
+/conf/logs/qbiz_cache/
+/conf/logs/qbiz*
+/logs/qbiz_out.log
+/conf/production_shape.conf
+/conf/random_scenarios.conf
+/conf/limit_key_t.conf
+/conf/course_sim.conf

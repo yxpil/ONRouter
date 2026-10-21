@@ -57,8 +57,10 @@ impl LocationKind {
                 path: pattern.to_string(),
                 caret: true,
             },
-            Some("~") => LocationKind::Regex(regex::Regex::new(pattern)
-                .map_err(|e| AppError::Other(format!("location 正则错误 {pattern}: {e}")))?),
+            Some("~") => LocationKind::Regex(
+                regex::Regex::new(pattern)
+                    .map_err(|e| AppError::Other(format!("location 正则错误 {pattern}: {e}")))?,
+            ),
             Some("~*") => LocationKind::RegexI(
                 regex::RegexBuilder::new(pattern)
                     .case_insensitive(true)
@@ -228,8 +230,12 @@ pub struct Location {
     pub autoindex: bool,
     pub error_pages: HashMap<u16, String>,
     pub add_headers: Vec<(String, String)>,
+    /// `expires`：本级写了就整条生效（含 `off`，它表示"不要上级的过期策略"）
+    pub expires: Option<Expires>,
     /// PREACCESS 阶段限流
     pub limit_req: Vec<ReqRule>,
+    /// location 级并发限制：写了就替换 server 的同名规则（nginx 的继承口径）
+    pub limit_conn: Vec<ConnRule>,
     /// `internal;` 只允许内部重定向访问
     pub internal: bool,
     /// `client_max_body_size` 的 location 级覆盖
@@ -319,6 +325,8 @@ pub struct Server {
     pub error_pages: HashMap<u16, String>,
     pub client_max_body_size: Option<u64>,
     pub add_headers: Vec<(String, String)>,
+    /// server 级 `expires`，被未自写的 location 继承
+    pub expires: Option<Expires>,
     /// server 级 proxy_set_header，作为 location 的默认值
     pub proxy_set_headers: Vec<(String, String)>,
     /// server 级并发限制
@@ -374,6 +382,14 @@ pub struct SniMatch {
 #[derive(Debug, Clone)]
 pub struct StreamServer {
     pub listen: SocketAddr,
+    /// `listen <addr> udp;`：这一条监听是数据报入口（游戏/语音/状态同步那类"四层 UDP 服务"）
+    pub udp: bool,
+    /// `proxy_responses <n>;`：每个客户端数据报期望几个后端回包；0 = 不等回包（fire-and-forget）
+    pub proxy_responses: u32,
+    /// `udp_max_sessions <n>;`：本条 UDP 监听同时最多维持多少条会话；0 = 不设上限（nginx 语义）。
+    /// 一条会话=一个 fd，也从 `worker_connections` 里扣额度——源地址可伪造的 UDP 洪水
+    /// 因此能吃光整台进程的额度、把七层一起饿死。这个旋钮是 ONRouter 的扩展，nginx 没有。
+    pub udp_max_sessions: usize,
     pub ssl_preread: bool,
     pub sni_matches: Vec<SniMatch>,
     /// `proxy_pass` 的默认目标（命名 upstream 或 host:port）；也是 SNI 未命中的回落。
@@ -390,6 +406,9 @@ impl Default for StreamServer {
         use std::time::Duration;
         StreamServer {
             listen: SocketAddr::from(([0, 0, 0, 0], 0)),
+            udp: false,
+            proxy_responses: 1,
+            udp_max_sessions: 0,
             ssl_preread: false,
             sni_matches: Vec::new(),
             default_target: None,
@@ -492,6 +511,7 @@ struct ServerTemplate {
     error_pages: HashMap<u16, String>,
     client_max_body_size: Option<u64>,
     add_headers: Vec<(String, String)>,
+    expires: Option<Expires>,
     proxy_set_headers: Vec<(String, String)>,
     proxy_connect_timeout: std::time::Duration,
     proxy_read_timeout: std::time::Duration,
@@ -539,6 +559,7 @@ struct ListenFlags {
     ssl: bool,
     http2: bool,
     quic: bool,
+    udp: bool,
     default_server: bool,
     backlog: Option<u32>,
     ipv6only: Option<bool>,
@@ -583,6 +604,9 @@ fn parse_listen(directive: &Directive) -> Result<(SocketAddr, ListenFlags), AppE
                 f.ssl = true;
             }
             "default_server" => f.default_server = true,
+            // 四层 UDP 入口（游戏/语音/实时状态同步这类"数据报服务"）。
+            // `quic` 是 HTTP/3 自己的 UDP 端点，与这条无关，所以不隐含 ssl。
+            "udp" => f.udp = true,
             other => {
                 if let Some(v) = other.strip_prefix("backlog=") {
                     f.backlog = Some(v.parse().map_err(|_| {
@@ -601,7 +625,7 @@ fn parse_listen(directive: &Directive) -> Result<(SocketAddr, ListenFlags), AppE
                 } else {
                     // reuseport/proxy_protocol/setfib 等尚未实现，明确报错而不是静默忽略
                     return Err(AppError::Other(format!(
-                        "listen 暂不支持参数 '{other}'（已支持 ssl / http2 / quic / default_server / backlog=N / ipv6only=on|off）"
+                        "listen 暂不支持参数 '{other}'（已支持 ssl / http2 / quic / udp / default_server / backlog=N / ipv6only=on|off）"
                     )));
                 }
             }
@@ -642,7 +666,9 @@ fn front_header_name(raw: Option<&str>) -> Option<String> {
     }
     let norm = crate::realip::normalize_header_name(s);
     let ok = !norm.is_empty()
-        && norm.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        && norm
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     ok.then_some(norm)
 }
 
@@ -687,6 +713,172 @@ fn parse_body_limit(v: &str) -> Option<u64> {
     parse_size(v).map(|n| if n == 0 { u64::MAX } else { n })
 }
 
+/// nginx `expires`：`off | epoch | max | @<hh:mm:ss> | [+|-]<time> | <任意文本>`。
+///
+/// 它是**响应头策略**，不是缓存开关：真正的缓存在 proxy_cache / 静态服务那一侧，
+/// 这里只负责按 nginx 的口径把 `Cache-Control` 与 `Expires` 落到响应头上。
+/// 之所以值得单独一个类型而不是存字符串：`off` 必须能表达"这一级不要继承上级的过期策略"，
+/// 而 `Option,None` 已经被"本级没写"占用了。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expires {
+    /// 完全不干预响应头
+    Off,
+    /// `Cache-Control: no-store` + 一个已经过期的 Expires
+    Epoch,
+    /// `Cache-Control: public, max-age=315360000`
+    Max,
+    /// 相对时长（秒）；负值按 nginx 语义落 `no-cache`
+    After(i64),
+    /// `@hh:mm:ss`：当天 UTC 的那个时刻（已过则等价 no-cache）
+    At(i64),
+    /// 其余写法按 nginx 语义原样作为 Cache-Control 的值
+    Text(String),
+}
+
+/// nginx 只在可缓存的状态码上改写过期头，其余响应一字不动。
+/// `expires` 生效的状态码。逐条对照 nginx `ngx_http_headers_filter_module.c` 里的
+/// `safe_status` 分支：200/201/**204**/206/301/302/303/304/307/308——包括 204（空响应也
+/// 允许被缓存/过期），而 4xx/5xx 一律不写。少一个码的后果是"以为站点的静态资源都设了
+/// 过期，实际某类响应从来没被设过"。
+const EXPIRES_STATUSES: &[u16] = &[200, 201, 204, 206, 301, 302, 303, 304, 307, 308];
+
+/// 一年的秒数，nginx 的 `max` 就用它
+const EXPIRES_MAX_AGE: i64 = 315_360_000;
+
+impl Expires {
+    /// 解析 `expires` 的取值。带单位但数字写坏（`1x`、`3d0`）要硬失败：
+    /// 那种配置下去的后果是"运维以为缓存了一年，实际响应里写着 Cache-Control: 1x"。
+    pub fn parse(v: &str) -> Result<Expires, String> {
+        let s = v.trim();
+        if s.is_empty() {
+            return Err("expires 需要一个值（off / epoch / max / <时间>）".into());
+        }
+        match s.to_ascii_lowercase().as_str() {
+            "off" => return Ok(Expires::Off),
+            "epoch" => return Ok(Expires::Epoch),
+            "max" => return Ok(Expires::Max),
+            _ => {}
+        }
+        if let Some(rest) = s.strip_prefix('@') {
+            return parse_tod(rest)
+                .map(Expires::At)
+                .ok_or_else(|| format!("'{rest}' 不是 @hh:mm:ss 形式的时刻"));
+        }
+        let (sign, body) = match s.as_bytes().first() {
+            Some(b'-') => (-1i64, &s[1..]),
+            Some(b'+') => (1, &s[1..]),
+            _ => (1, s),
+        };
+        // 以数字开头才是时间值；其余按 nginx 原样当 Cache-Control 文本
+        if body.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return parse_expires_secs(body).map(|n| Expires::After(sign * n));
+        }
+        Ok(Expires::Text(s.to_string()))
+    }
+
+    /// 这个响应该写的过期头；空 = 不动。`now` 为 unix 秒（传进来才能单测）。
+    pub fn headers_for(&self, status: u16, now: i64) -> Vec<(String, String)> {
+        if matches!(self, Expires::Off) || !EXPIRES_STATUSES.contains(&status) {
+            return Vec::new();
+        }
+        match self {
+            Expires::Off => Vec::new(),
+            Expires::Epoch => vec![
+                ("cache-control".into(), "no-store".into()),
+                // nginx 对 `epoch` 就是发到 1970-01-01T00:00:01Z
+                ("expires".into(), crate::lua_engine::http_time(1)),
+            ],
+            Expires::Max => vec![
+                (
+                    "cache-control".into(),
+                    format!("public, max-age={EXPIRES_MAX_AGE}"),
+                ),
+                (
+                    "expires".into(),
+                    crate::lua_engine::http_time(now + EXPIRES_MAX_AGE),
+                ),
+            ],
+            Expires::After(secs) if *secs < 0 => vec![
+                ("cache-control".into(), "no-cache".into()),
+                ("expires".into(), crate::lua_engine::http_time(now + secs)),
+            ],
+            Expires::After(secs) => vec![
+                ("cache-control".into(), format!("max-age={secs}")),
+                ("expires".into(), crate::lua_engine::http_time(now + secs)),
+            ],
+            Expires::At(tod) => {
+                // 当天 00:00Z + 时刻差；已经过了就等价 no-cache（nginx 同判定）
+                let target = now - now.rem_euclid(86_400) + tod;
+                let mut h = vec![("expires".into(), crate::lua_engine::http_time(target))];
+                if target > now {
+                    h.insert(
+                        0,
+                        ("cache-control".into(), format!("max-age={}", target - now)),
+                    );
+                } else {
+                    h.insert(0, ("cache-control".into(), "no-cache".into()));
+                }
+                h
+            }
+            Expires::Text(t) => vec![("cache-control".into(), t.clone())],
+        }
+    }
+}
+
+/// 从 server / location 块里取 `expires`。值写坏直接否决：这类配置的后果是
+/// "运维以为资产缓存了一年，响应里其实一个过期头都没有"，只留告警太轻。
+fn parse_expires(d: &Directive, ctx: &str) -> Result<Option<Expires>, AppError> {
+    let Some(e) = d.find("expires") else {
+        return Ok(None);
+    };
+    let Some(v) = e.arg(0) else {
+        return Err(AppError::Other(format!(
+            "第 {} 行 {ctx} 的 expires 缺少值（off / epoch / max / <时间>）",
+            e.line
+        )));
+    };
+    Expires::parse(v)
+        .map(Some)
+        .map_err(|why| AppError::Other(format!("第 {} 行 {ctx} 的 expires '{v}'：{why}", e.line)))
+}
+
+/// nginx 时间字面量（expires 口径）：`s m h d w M(30天) y(365天)`，裸数字为秒。
+fn parse_expires_secs(v: &str) -> Result<i64, String> {
+    let v = v.trim();
+    let (num, mult): (&str, i64) = match v.chars().last() {
+        Some('s') => (&v[..v.rfind('s').unwrap()], 1),
+        Some('m') => (&v[..v.rfind('m').unwrap()], 60),
+        Some('h') => (&v[..v.rfind('h').unwrap()], 3_600),
+        Some('d') => (&v[..v.rfind('d').unwrap()], 86_400),
+        Some('w') => (&v[..v.rfind('w').unwrap()], 604_800),
+        Some('M') => (&v[..v.rfind('M').unwrap()], 2_592_000),
+        Some('y') => (&v[..v.rfind('y').unwrap()], 31_536_000),
+        _ => (v, 1),
+    };
+    num.trim()
+        .parse::<i64>()
+        .map(|n| n * mult)
+        .map_err(|_| format!("'{v}' 不是 nginx 时间值（支持 s/m/h/d/w/M/y，如 30d、12h）"))
+}
+
+/// `@` 后面的 hh:mm:ss[.SSS] → 当天内的秒数
+fn parse_tod(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let h: i64 = parts[0].parse().ok()?;
+    let m: i64 = parts[1].parse().ok()?;
+    let sec: i64 = match parts.get(2) {
+        Some(v) => v.split('.').next()?.parse().ok()?,
+        None => 0,
+    };
+    if !(0..24).contains(&h) || !(0..60).contains(&m) || !(0..60).contains(&sec) {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + sec)
+}
+
 fn parse_on_off(v: &str) -> Option<bool> {
     match v.trim().to_ascii_lowercase().as_str() {
         "on" | "true" | "1" => Some(true),
@@ -711,7 +903,9 @@ fn parse_rewrite_steps(
                 let mut then = Vec::new();
                 for g in &c.block {
                     match g.name.as_str() {
-                        "rewrite" => then.push(RewriteStep::Rewrite(parse_rewrite_rule(g, warnings)?)),
+                        "rewrite" => {
+                            then.push(RewriteStep::Rewrite(parse_rewrite_rule(g, warnings)?))
+                        }
                         "set" => then.push(parse_set(g)?),
                         "return" => then.push(RewriteStep::Return(parse_return(g)?)),
                         "if" => {
@@ -771,7 +965,10 @@ fn parse_set(d: &Directive) -> Result<RewriteStep, AppError> {
         .arg(0)
         .ok_or_else(|| AppError::Other(format!("第 {} 行 set 缺少 $变量名", d.line)))?;
     let name = raw.strip_prefix('$').ok_or_else(|| {
-        AppError::Other(format!("第 {} 行 set 的目标必须是 $变量，写成 '{raw}'", d.line))
+        AppError::Other(format!(
+            "第 {} 行 set 的目标必须是 $变量，写成 '{raw}'",
+            d.line
+        ))
     })?;
     if name.is_empty()
         || name.as_bytes()[0].is_ascii_digit()
@@ -798,13 +995,36 @@ fn parse_set(d: &Directive) -> Result<RewriteStep, AppError> {
 /// 引号里的内容不会被并进括号 token（`"a")` 会拆成 Quoted("a") + Word(")")），因此安全。
 fn strip_if_parens(args: &[String]) -> Vec<String> {
     let mut v: Vec<String> = args.to_vec();
+    // 括号在词法里可能是独立 token（`if ($x = "")` 切出来是 ["($x","=",""",")"]），
+    // 也可能粘在相邻 token 上。两种都要拆掉，但**绝不能顺手把所有空串滤掉**：
+    // 中间那个空串就是 `""` 这个右值本身。旧实现用一句 `retain(!is_empty)` 同时处理
+    // 这两件事，于是 nginx 里最常见的一条判定 `if ($x = "")`（"没带这个头/Cookie"）
+    // 被判成"缺少右值"，整个 vhost 起不来。
+    while v
+        .first()
+        .map(|t| !t.is_empty() && t.bytes().all(|b| b == b'('))
+        .unwrap_or(false)
+    {
+        v.remove(0);
+    }
+    if v.first().map(|t| t.is_empty()).unwrap_or(false) {
+        // 只有 `(` 一个字符的 token 被 trim 后留下的空段：摘掉；引号空串不在此列
+        // （它不会以 '(' 开头，因此上面那条不触发；这里只处理首元素为空的畸形写法）
+        v.remove(0);
+    }
     if let Some(first) = v.first_mut() {
         *first = first.trim_start_matches('(').to_string();
+    }
+    while v
+        .last()
+        .map(|t| !t.is_empty() && t.bytes().all(|b| b == b')'))
+        .unwrap_or(false)
+    {
+        v.pop();
     }
     if let Some(last) = v.last_mut() {
         *last = last.trim_end_matches(')').to_string();
     }
-    v.retain(|s| !s.is_empty());
     v
 }
 
@@ -817,10 +1037,7 @@ fn parse_if_cond(d: &Directive) -> Result<IfCond, AppError> {
     }
     let toks = strip_if_parens(&d.args);
     let Some(first) = toks.first() else {
-        return Err(AppError::Other(format!(
-            "第 {} 行 if 缺少条件变量",
-            d.line
-        )));
+        return Err(AppError::Other(format!("第 {} 行 if 缺少条件变量", d.line)));
     };
     if first.starts_with('-') || first.starts_with("!-") {
         return Err(AppError::Other(format!(
@@ -857,9 +1074,9 @@ fn parse_if_cond(d: &Directive) -> Result<IfCond, AppError> {
         None
     };
     // 空右值一律拒绝：nginx 里 `if ($x = )` 是语法错误，而不是"和空串比"
-    let rhs = rhs_text.as_deref().ok_or_else(|| {
-        AppError::Other(format!("第 {} 行 if 的比较 '{op}' 缺少右值", d.line))
-    })?;
+    let rhs = rhs_text
+        .as_deref()
+        .ok_or_else(|| AppError::Other(format!("第 {} 行 if 的比较 '{op}' 缺少右值", d.line)))?;
     let build = |pat: &str, ci: bool| -> Result<regex::Regex, AppError> {
         regex::RegexBuilder::new(pat)
             .case_insensitive(ci)
@@ -903,10 +1120,7 @@ fn parse_return(d: &Directive) -> Result<ReturnAction, AppError> {
                 code: 302,
                 text: Some(url.to_string()),
             }),
-            None => Err(AppError::Other(format!(
-                "第 {} 行 return 缺少参数",
-                d.line
-            ))),
+            None => Err(AppError::Other(format!("第 {} 行 return 缺少参数", d.line))),
         },
     }
 }
@@ -1084,7 +1298,10 @@ fn parse_proxy_ssl_directives(
     if let Some(v) = d.find("proxy_ssl_name").and_then(|x| x.arg(0)) {
         policy.server_name = Some(v.to_string());
     }
-    if let Some(v) = d.find("proxy_ssl_trusted_certificate").and_then(|x| x.arg(0)) {
+    if let Some(v) = d
+        .find("proxy_ssl_trusted_certificate")
+        .and_then(|x| x.arg(0))
+    {
         let p = crate::resolve_path(v, base_dir);
         policy.trusted_cert = Some(p.to_string_lossy().into_owned());
     }
@@ -1199,15 +1416,15 @@ fn parse_cache_directives(d: &Directive, warnings: &mut Vec<String>) -> CacheSet
     if let Some(v) = d.find("proxy_cache_lock").and_then(|x| x.arg(0)) {
         match parse_on_off(v) {
             Some(b) => cs.lock = Some(b),
-            None => warnings.push(format!("proxy_cache_lock 只接受 on/off（收到 '{v}'），保持 off")),
+            None => warnings.push(format!(
+                "proxy_cache_lock 只接受 on/off（收到 '{v}'），保持 off"
+            )),
         }
     }
     if let Some(v) = d.find("proxy_cache_lock_timeout").and_then(|x| x.arg(0)) {
         match crate::settings::parse_duration(v) {
             Some(dur) => cs.lock_timeout = Some(dur),
-            None => warnings.push(format!(
-                "proxy_cache_lock_timeout 时长非法 '{v}'，保持 5s"
-            )),
+            None => warnings.push(format!("proxy_cache_lock_timeout 时长非法 '{v}'，保持 5s")),
         }
     }
     if let Some(u) = d.find("proxy_cache_use_stale") {
@@ -1216,7 +1433,8 @@ fn parse_cache_directives(d: &Directive, warnings: &mut Vec<String>) -> CacheSet
             let t = a.to_ascii_lowercase();
             let valid = matches!(
                 t.as_str(),
-                "off" | "error"
+                "off"
+                    | "error"
                     | "timeout"
                     | "updating"
                     | "invalid_header"
@@ -1303,7 +1521,11 @@ fn parse_still_online_directives(
         allow_credentials: None,
     };
     if let Some(v) = d.find("still_online").and_then(|x| x.arg(0)) {
-        s.zone = Some(if v == "off" { None } else { Some(v.to_string()) });
+        s.zone = Some(if v == "off" {
+            None
+        } else {
+            Some(v.to_string())
+        });
     }
     if let Some(v) = d.find("still_online_max_age").and_then(|x| x.arg(0)) {
         match crate::settings::parse_duration(v) {
@@ -1385,16 +1607,19 @@ impl Router {
     fn parse_maps(config: &Config, warnings: &mut Vec<String>) -> Result<Vec<MapDef>, AppError> {
         let mut defs = Vec::new();
         for d in config.root.block.iter().filter(|d| d.name == "map") {
-            let source = d.arg(0).ok_or_else(|| {
-                AppError::Other(format!("map（第 {} 行）缺少源变量", d.line))
+            let source = d
+                .arg(0)
+                .ok_or_else(|| AppError::Other(format!("map（第 {} 行）缺少源变量", d.line)))?;
+            let dest = d.arg(1).ok_or_else(|| {
+                AppError::Other(format!("map {source}（第 {} 行）缺少目标变量", d.line))
             })?;
-            let dest = d
-                .arg(1)
-                .ok_or_else(|| AppError::Other(format!("map {source}（第 {} 行）缺少目标变量", d.line)))?;
             let source = source.trim_start_matches('$').to_string();
             let dest = dest.trim_start_matches('$').to_string();
             if dest.is_empty() || source.is_empty() {
-                return Err(AppError::Other(format!("map 需要源与目标两个变量（第 {} 行）", d.line)));
+                return Err(AppError::Other(format!(
+                    "map 需要源与目标两个变量（第 {} 行）",
+                    d.line
+                )));
             }
             let mut default: Option<String> = None;
             let mut cases: Vec<MapCase> = Vec::new();
@@ -1409,21 +1634,41 @@ impl Router {
                         .case_insensitive(true)
                         .build()
                         .map_err(|e| AppError::Other(format!("map {dest} 正则错误 {pat}: {e}")))?;
-                    cases.push(MapCase { literal: None, regex: Some(re), result });
+                    cases.push(MapCase {
+                        literal: None,
+                        regex: Some(re),
+                        result,
+                    });
                 } else if let Some(pat) = c.name.strip_prefix('~') {
                     let re = regex::Regex::new(pat)
                         .map_err(|e| AppError::Other(format!("map {dest} 正则错误 {pat}: {e}")))?;
-                    cases.push(MapCase { literal: None, regex: Some(re), result });
+                    cases.push(MapCase {
+                        literal: None,
+                        regex: Some(re),
+                        result,
+                    });
                 } else {
                     // 精确串匹配（含 `=` 前缀的显式精确写法与空串 `""`）
                     let lit = c.name.strip_prefix('=').unwrap_or(&c.name).to_string();
-                    cases.push(MapCase { literal: Some(lit), regex: None, result });
+                    cases.push(MapCase {
+                        literal: Some(lit),
+                        regex: None,
+                        result,
+                    });
                 }
             }
             if !default.is_some() && cases.is_empty() {
-                warnings.push(format!("map {source} → {dest}（第 {} 行）没有任何分支，目标恒为空串", d.line));
+                warnings.push(format!(
+                    "map {source} → {dest}（第 {} 行）没有任何分支，目标恒为空串",
+                    d.line
+                ));
             }
-            defs.push(MapDef { dest, source, default, cases });
+            defs.push(MapDef {
+                dest,
+                source,
+                default,
+                cases,
+            });
         }
         Ok(defs)
     }
@@ -1447,7 +1692,10 @@ impl Router {
             let source = source_raw.trim_start_matches('$').to_string();
             let dest = dest_raw.trim_start_matches('$').to_string();
             if dest.is_empty() || source.is_empty() {
-                return Err(AppError::Other(format!("geo 目标/源变量为空（第 {} 行）", d.line)));
+                return Err(AppError::Other(format!(
+                    "geo 目标/源变量为空（第 {} 行）",
+                    d.line
+                )));
             }
             let mut default: Option<String> = None;
             let mut rules: Vec<GeoRule> = Vec::new();
@@ -1463,7 +1711,10 @@ impl Router {
                     None => (c.name.as_str(), None),
                 };
                 let ip: std::net::IpAddr = addr_str.parse().map_err(|_| {
-                    AppError::Other(format!("geo {dest} 非法 IP '{addr_str}'（第 {} 行）", c.line))
+                    AppError::Other(format!(
+                        "geo {dest} 非法 IP '{addr_str}'（第 {} 行）",
+                        c.line
+                    ))
                 })?;
                 let width: u8 = if ip.is_ipv4() { 32 } else { 128 };
                 let prefix: u8 = match prefix_str {
@@ -1483,9 +1734,17 @@ impl Router {
             // 最长前缀优先；前缀相同保持声明顺序（稳定排序）
             rules.sort_by(|a, b| b.prefix.cmp(&a.prefix));
             if default.is_none() && rules.is_empty() {
-                warnings.push(format!("geo {source} → {dest}（第 {} 行）没有任何规则，目标恒为空串", d.line));
+                warnings.push(format!(
+                    "geo {source} → {dest}（第 {} 行）没有任何规则，目标恒为空串",
+                    d.line
+                ));
             }
-            defs.push(GeoDef { dest, source, default, rules });
+            defs.push(GeoDef {
+                dest,
+                source,
+                default,
+                rules,
+            });
         }
         Ok(defs)
     }
@@ -1500,8 +1759,14 @@ impl Router {
         warnings: &mut Vec<String>,
     ) -> Result<Vec<std::sync::Arc<crate::front_proxy::FrontProfile>>, AppError> {
         use crate::front_proxy::{FrontProfile, Probe};
-        const INNER: &[&str] =
-            &["probe", "ip_header", "country_header", "proto_header", "host_header", "trust"];
+        const INNER: &[&str] = &[
+            "probe",
+            "ip_header",
+            "country_header",
+            "proto_header",
+            "host_header",
+            "trust",
+        ];
         let mut out: Vec<std::sync::Arc<FrontProfile>> = Vec::new();
         for d in config.root.block.iter().filter(|d| d.name == "front_proxy") {
             let name = d
@@ -1578,9 +1843,11 @@ impl Router {
                 }
                 p.ip_headers.push(header);
             }
-            for (directive, slot) in
-                [("country_header", 0usize), ("proto_header", 1), ("host_header", 2)]
-            {
+            for (directive, slot) in [
+                ("country_header", 0usize),
+                ("proto_header", 1),
+                ("host_header", 2),
+            ] {
                 let hits: Vec<&Directive> =
                     d.block.iter().filter(|x| x.name == directive).collect();
                 let Some(first) = hits.first() else { continue };
@@ -1640,16 +1907,21 @@ impl Router {
     /// 解析顶层 `split_clients <key> $dest { ... }` 块为 SplitDef 列表。
     /// 分支语法：`<percent>% <result>;` 与 `* <result>;`（兜底桶）。
     /// 权重按声明顺序累加落桶（对齐 ngx_split_clients）。
-    fn parse_splits(config: &Config, warnings: &mut Vec<String>) -> Result<Vec<SplitDef>, AppError> {
+    fn parse_splits(
+        config: &Config,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<SplitDef>, AppError> {
         let mut defs = Vec::new();
-        for d in config.root.block.iter().filter(|d| d.name == "split_clients") {
+        for d in config
+            .root
+            .block
+            .iter()
+            .filter(|d| d.name == "split_clients")
+        {
             let key = d
                 .arg(0)
                 .ok_or_else(|| {
-                    AppError::Other(format!(
-                        "split_clients（第 {} 行）缺少键模板",
-                        d.line
-                    ))
+                    AppError::Other(format!("split_clients（第 {} 行）缺少键模板", d.line))
                 })?
                 .to_string();
             let dest_raw = d.arg(1).ok_or_else(|| {
@@ -1705,11 +1977,15 @@ impl Router {
             if sum > 100.0001 {
                 warnings.push(format!(
                     "split_clients {dest}（第 {} 行）权重合计 {:.3}% 超过 100%，超出部分永不命中",
-                    d.line,
-                    sum
+                    d.line, sum
                 ));
             }
-            defs.push(SplitDef { dest, key, buckets, star });
+            defs.push(SplitDef {
+                dest,
+                key,
+                buckets,
+                star,
+            });
         }
         Ok(defs)
     }
@@ -1767,8 +2043,7 @@ impl Router {
                     d.line
                 )));
             }
-            if crate::engine::is_static_var_name(&dest)
-                || crate::engine::is_derived_var_name(&dest)
+            if crate::engine::is_static_var_name(&dest) || crate::engine::is_derived_var_name(&dest)
             {
                 return Err(AppError::Other(format!(
                     "canary 目标变量 ${dest}（第 {} 行）与 nginx 内置变量同名，会把内置变量遮蔽掉；\
@@ -1896,16 +2171,17 @@ impl Router {
                                 c.line
                             )));
                         }
-                        let pct: f64 = c.args[0]
-                            .trim_end_matches('%')
-                            .trim()
-                            .parse()
-                            .map_err(|_| {
-                                AppError::Other(format!(
-                                    "canary {dest}（第 {} 行）非法百分比 '{}'",
-                                    c.line, c.args[0]
-                                ))
-                            })?;
+                        let pct: f64 =
+                            c.args[0]
+                                .trim_end_matches('%')
+                                .trim()
+                                .parse()
+                                .map_err(|_| {
+                                    AppError::Other(format!(
+                                        "canary {dest}（第 {} 行）非法百分比 '{}'",
+                                        c.line, c.args[0]
+                                    ))
+                                })?;
                         if !pct.is_finite() || pct < 0.0 {
                             return Err(bad(format!(
                                 "canary {dest}（第 {} 行）的百分比不能为负数：{}",
@@ -2038,12 +2314,17 @@ impl Router {
             let mut memory = crate::wasm::DEFAULT_MEMORY;
             for opt in &d.args[2..] {
                 if let Some(v) = opt.strip_prefix("fuel=") {
-                    fuel = v.trim().parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| {
-                        AppError::Other(format!(
-                            "wasm_plugin {name}（第 {} 行）的 fuel='{v}' 不是正整数",
-                            d.line
-                        ))
-                    })?;
+                    fuel = v
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| {
+                            AppError::Other(format!(
+                                "wasm_plugin {name}（第 {} 行）的 fuel='{v}' 不是正整数",
+                                d.line
+                            ))
+                        })?;
                 } else if let Some(v) = opt.strip_prefix("memory=") {
                     memory = parse_size(v).filter(|n| *n >= 64 * 1024).ok_or_else(|| {
                         AppError::Other(format!(
@@ -2087,10 +2368,7 @@ impl Router {
         }
         // 花括号形式必须先判：`strip_prefix('$')` 会把 `${route}` 削成 `{route}`，
         // 于是文档里写明的 `${route}` 在 -t 被当成拼串拒掉。
-        let name = if let Some(inner) = host
-            .strip_prefix("${")
-            .and_then(|s| s.strip_suffix('}'))
-        {
+        let name = if let Some(inner) = host.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
             inner.to_string()
         } else if let Some(n) = host.strip_prefix('$') {
             n.to_string()
@@ -2179,10 +2457,10 @@ impl Router {
                     }
                 }
                 "proxy_split_failover" => {
-                    if let Some(t) = d
-                        .arg(0)
-                        .and_then(|f| f.strip_prefix("http://").or_else(|| f.strip_prefix("https://")))
-                    {
+                    if let Some(t) = d.arg(0).and_then(|f| {
+                        f.strip_prefix("http://")
+                            .or_else(|| f.strip_prefix("https://"))
+                    }) {
                         if let Some(h) = literal_host(t) {
                             out.insert(h);
                         }
@@ -2254,8 +2532,7 @@ impl Router {
         crate::engine::install_geos(geos);
 
         // 顶层 `front_proxy` 块：前置代理 profile 表（识别证据 + 授权网段），同理原子替换，热重载安全
-        let front_profiles =
-            std::sync::Arc::new(Self::parse_front_proxies(config, &mut warnings)?);
+        let front_profiles = std::sync::Arc::new(Self::parse_front_proxies(config, &mut warnings)?);
         crate::front_proxy::install(front_profiles.as_ref().clone());
         let mut front_proxy_used = false;
 
@@ -2284,8 +2561,12 @@ impl Router {
             .block
             .iter()
             .filter(|d| d.name == "limit_req_zone" || d.name == "limit_conn_zone")
-            .filter_map(|d| d.args.iter().find_map(|a| a.strip_prefix("zone="))
-                .map(|z| z.split(':').next().unwrap_or(z).to_string()))
+            .filter_map(|d| {
+                d.args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("zone="))
+                    .map(|z| z.split(':').next().unwrap_or(z).to_string())
+            })
             .collect();
 
         // The name table of the scheduled windows: a `schedule_access <name>;` referencing an undeclared window
@@ -2293,9 +2574,9 @@ impl Router {
         // `Scheduler::parse_all`, an earlier and stricter step.
         let schedule_declared = crate::schedule::Scheduler::declared_names(config);
 
-        // 限流区的 key 决定"按什么计数"。本实现只会按客户端地址计数：写成别的变量
-        // （$http_x_api_key、$uri…）时请求路径根本不展开它，配置看着生效、实际按 IP 限——
-        // 这种"写了但那一维不存在"是静默的放行失败，`-t` 必须直接否决（审计 S11）。
+        // 限流区的 key 决定"按什么计数"。支持客户端地址与请求期变量（头/Cookie/URL 参数/$uri…），
+        // 但判定时刻展开不出值的写法（响应期变量、$server_name、set 出来的变量…）必须硬否决：
+        // 它们会让每个请求都落到同一个空 key 桶里，是比"按 IP 限"更静默的放行失败（审计 S11）。
         for d in config
             .root
             .block
@@ -2303,9 +2584,9 @@ impl Router {
             .filter(|d| matches!(d.name.as_str(), "limit_req_zone" | "limit_conn_zone"))
         {
             if let Some(var) = crate::limit::zone_key_var(d) {
-                if !crate::limit::addr_var(&var) {
+                if let Err(why) = crate::limit::check_key_var(&var) {
                     return Err(AppError::Other(format!(
-                        "第 {} 行 {} 的 key '{var}' 不支持：限流区只支持 $remote_addr / $binary_remote_addr（按客户端地址计数）。这个变量在请求路径上不会展开，写下去只会变成按 IP 限流，请改用地址或删除本区域",
+                        "第 {} 行 {} 的 key '{var}'：{why}",
                         d.line, d.name
                     )));
                 }
@@ -2333,32 +2614,94 @@ impl Router {
         for d in config.servers() {
             Self::warn_unknown(
                 d,
-                &["listen", "server_name", "root", "index", "autoindex", "try_files",
-                   "error_page", "client_max_body_size", "return", "rewrite", "set", "if", "add_header",
-                   "proxy_pass", "proxy_set_header", "proxy_read_timeout", "proxy_connect_timeout",
-                   "proxy_send_timeout", "proxy_next_upstream", "proxy_next_upstream_tries",
-                   "proxy_next_upstream_timeout", "proxy_request_buffering", "limit_conn", "http2",
-                   "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
-                   "proxy_cache_revalidate", "proxy_cache_lock", "proxy_cache_lock_timeout", "proxy_cache_use_stale",
-                   "proxy_cache_bypass", "proxy_no_cache", "proxy_ignore_headers",
-                   "still_online", "still_online_max_age", "still_online_max_body",
-                   "still_online_retry", "still_online_retry_max",
-                   "still_online_retry_deadline", "still_online_allow_credentials",
-                   "proxy_ssl_verify", "proxy_ssl_server_name", "proxy_ssl_name", "proxy_ssl_trusted_certificate",
-                   "proxy_ssl_certificate", "proxy_ssl_certificate_key",
-                   "ssl_certificate", "ssl_certificate_key", "ssl_min_version", "ssl_protocols",
-                   "ssl_certificate_by_lua", "ssl_certificate_by_lua_file",
-                   "location", "content_by_lua", "content_by_lua_file", "access_by_lua",
-                   "access_by_lua_file", "rewrite_by_lua", "rewrite_by_lua_file",
-                   "header_filter_by_lua", "header_filter_by_lua_file",
-                   "body_filter_by_lua", "body_filter_by_lua_file",
-                   "access_by_wasm", "header_filter_by_wasm", "body_filter_by_wasm",
-                   "log_by_lua", "log_by_lua_file",
-                   "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
-                   "allow", "deny", "auth_basic", "auth_basic_user_file",
-                   "schedule_access",
-                   "set_real_ip_from", "real_ip_header", "real_ip_recursive",
-                   "front_proxy_mode", "front_proxy_auto_trust"],
+                &[
+                    "listen",
+                    "server_name",
+                    "root",
+                    "index",
+                    "autoindex",
+                    "try_files",
+                    "error_page",
+                    "client_max_body_size",
+                    "return",
+                    "rewrite",
+                    "set",
+                    "if",
+                    "add_header",
+                    "expires",
+                    "proxy_pass",
+                    "proxy_set_header",
+                    "proxy_read_timeout",
+                    "proxy_connect_timeout",
+                    "proxy_send_timeout",
+                    "proxy_next_upstream",
+                    "proxy_next_upstream_tries",
+                    "proxy_next_upstream_timeout",
+                    "proxy_request_buffering",
+                    "limit_conn",
+                    "http2",
+                    "proxy_cache",
+                    "proxy_cache_key",
+                    "proxy_cache_methods",
+                    "proxy_cache_valid",
+                    "proxy_cache_min_uses",
+                    "proxy_cache_revalidate",
+                    "proxy_cache_lock",
+                    "proxy_cache_lock_timeout",
+                    "proxy_cache_use_stale",
+                    "proxy_cache_bypass",
+                    "proxy_no_cache",
+                    "proxy_ignore_headers",
+                    "still_online",
+                    "still_online_max_age",
+                    "still_online_max_body",
+                    "still_online_retry",
+                    "still_online_retry_max",
+                    "still_online_retry_deadline",
+                    "still_online_allow_credentials",
+                    "proxy_ssl_verify",
+                    "proxy_ssl_server_name",
+                    "proxy_ssl_name",
+                    "proxy_ssl_trusted_certificate",
+                    "proxy_ssl_certificate",
+                    "proxy_ssl_certificate_key",
+                    "ssl_certificate",
+                    "ssl_certificate_key",
+                    "ssl_min_version",
+                    "ssl_protocols",
+                    "ssl_certificate_by_lua",
+                    "ssl_certificate_by_lua_file",
+                    "location",
+                    "content_by_lua",
+                    "content_by_lua_file",
+                    "access_by_lua",
+                    "access_by_lua_file",
+                    "rewrite_by_lua",
+                    "rewrite_by_lua_file",
+                    "header_filter_by_lua",
+                    "header_filter_by_lua_file",
+                    "body_filter_by_lua",
+                    "body_filter_by_lua_file",
+                    "access_by_wasm",
+                    "header_filter_by_wasm",
+                    "body_filter_by_wasm",
+                    "log_by_lua",
+                    "log_by_lua_file",
+                    "content_by_rust",
+                    "access_by_rust",
+                    "rewrite_by_rust",
+                    "log_by_rust",
+                    "allow",
+                    "deny",
+                    "auth_basic",
+                    "auth_basic_user_file",
+                    "schedule_access",
+                    "set_real_ip_from",
+                    "real_ip_header",
+                    "real_ip_recursive",
+                    "front_proxy_mode",
+                    "front_proxy_auto_trust",
+                ],
                 "server",
                 &mut warnings,
             );
@@ -2387,7 +2730,17 @@ impl Router {
 
             let mut listens: Vec<(SocketAddr, ListenFlags)> = Vec::new();
             for l in d.block.iter().filter(|x| x.name == "listen") {
-                listens.push(parse_listen(l)?);
+                let (addr, flags) = parse_listen(l)?;
+                // HTTP 层能收 UDP 的只有 QUIC。写了 `udp` 却不写 `quic`，是想要一个
+                // 七层不会说的数据报入口——宁可当场否决，也不要"配了监听却没 UDP"。
+                if flags.udp {
+                    return Err(AppError::Other(format!(
+                        "第 {} 行 listen 的 udp 只在 stream{{}} 里支持（四层数据报代理）。HTTP 层的 UDP \
+                         只有 QUIC：要 HTTP/3 请写 listen <addr> quic;（隐含 TLS1.3）",
+                        l.line
+                    )));
+                }
+                listens.push((addr, flags));
             }
             if listens.is_empty() {
                 listens.push((
@@ -2423,17 +2776,18 @@ impl Router {
                         // 同一地址已有 ssl server，确保证书齐全
                     }
                     ep.ssl = true;
-                    let cert = tmpl
-                        .ssl_cert
-                        .clone()
-                        .ok_or_else(|| AppError::Other(format!(
+                    let cert = tmpl.ssl_cert.clone().ok_or_else(|| {
+                        AppError::Other(format!(
                             "{addr} 声明了 listen ssl，但 server '{}' 缺少 ssl_certificate",
                             tmpl.server_name
-                        )))?;
-                    let key = tmpl.ssl_key.clone().ok_or_else(|| AppError::Other(format!(
-                        "{addr} 声明了 listen ssl，但 server '{}' 缺少 ssl_certificate_key",
-                        tmpl.server_name
-                    )))?;
+                        ))
+                    })?;
+                    let key = tmpl.ssl_key.clone().ok_or_else(|| {
+                        AppError::Other(format!(
+                            "{addr} 声明了 listen ssl，但 server '{}' 缺少 ssl_certificate_key",
+                            tmpl.server_name
+                        ))
+                    })?;
                     tls_specs.entry(addr).or_default().push(CertSpec {
                         names: tmpl.server_names.clone(),
                         cert,
@@ -2470,6 +2824,7 @@ impl Router {
                     error_pages: tmpl.error_pages.clone(),
                     client_max_body_size: tmpl.client_max_body_size,
                     add_headers: tmpl.add_headers.clone(),
+                    expires: tmpl.expires.clone(),
                     proxy_set_headers: tmpl.proxy_set_headers.clone(),
                     limit_conn: tmpl.limit_conn.clone(),
                     access_rules: tmpl.access_rules.clone(),
@@ -2502,7 +2857,9 @@ impl Router {
                 protocols: e.protocols.clone(),
                 session: session.clone(),
             });
-            if ep.map(|e| e.ssl).unwrap_or(false) && tls.as_ref().map(|t| t.specs.is_empty()).unwrap_or(true) {
+            if ep.map(|e| e.ssl).unwrap_or(false)
+                && tls.as_ref().map(|t| t.specs.is_empty()).unwrap_or(true)
+            {
                 return Err(AppError::Other(format!("{addr} 需要 TLS 但没有加载到证书")));
             }
             listeners.push(Listener {
@@ -2590,6 +2947,36 @@ impl Router {
                         break;
                     }
                 }
+            }
+            // 同上暴露另一条根：信誉与队列的记分键就是限流区的 key。key 取头/Cookie/参数时，
+            // "换一个新客户"的成本等于改一个自报值——攒信誉、拿队列上限、蹭缓存驻留都是零成本。
+            // 这不是放行判定（信誉从不参与放行），所以同样是告警而不是否决。
+            let mut keyed: Vec<String> = Vec::new();
+            for d in config
+                .root
+                .block
+                .iter()
+                .filter(|x| matches!(x.name.as_str(), "limit_req_zone" | "limit_conn_zone"))
+            {
+                if let Some(v) = crate::limit::zone_key_var(d) {
+                    if !crate::limit::addr_var(&v) {
+                        let zone = d
+                            .args
+                            .iter()
+                            .find_map(|a| a.strip_prefix("zone="))
+                            .map(|z| z.split(':').next().unwrap_or(z).to_string())
+                            .unwrap_or_default();
+                        keyed.push(format!("{zone}({v})"));
+                    }
+                }
+            }
+            if !keyed.is_empty() {
+                warnings.push(format!(
+                    "vip_learning 与按非地址键的限流区同时出现：{} —— 信誉/队列上限记在这些键上，\
+                     而键来自客户端自报的头/Cookie/参数，换一个值就是一个新的\"重要客户\"。\
+                     只有服务端签发的会话标识才当得起这个信任根（不影响是否放行）",
+                    keyed.join("、")
+                ));
             }
         }
 
@@ -2695,11 +3082,7 @@ impl Router {
             .iter()
             .filter(|d| d.name == "proxy_cache_path")
         {
-            let Some(kz) = d
-                .args
-                .iter()
-                .find_map(|a| a.strip_prefix("keys_zone="))
-            else {
+            let Some(kz) = d.args.iter().find_map(|a| a.strip_prefix("keys_zone=")) else {
                 warnings.push(format!(
                     "顶层第 {} 行 proxy_cache_path 缺少 keys_zone=<名称>:<容量>，已忽略",
                     d.line
@@ -2799,7 +3182,9 @@ impl Router {
                 max_value: 4 * 1024 * 1024,
             };
             for a in &d.args {
-                let Some((k, v)) = a.split_once('=') else { continue };
+                let Some((k, v)) = a.split_once('=') else {
+                    continue;
+                };
                 let (k, v) = (k.trim(), v.trim());
                 match k {
                     "max_size" => match parse_size(v) {
@@ -2920,14 +3305,26 @@ impl Router {
 
     /// 解析顶层 `stream { server { listen …; proxy_pass …; [ssl_preread on;] [sni_match …;] } }`。
     /// 每个 stream server 的每条 listen 生成一个 `StreamServer`（四层，独立于 HTTP 路由）。
-    fn parse_streams(config: &Config, warnings: &mut Vec<String>) -> Result<Vec<StreamServer>, AppError> {
+    fn parse_streams(
+        config: &Config,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<StreamServer>, AppError> {
         let mut out = Vec::new();
         for sd in config.root.block.iter().filter(|d| d.name == "stream") {
             for srv in sd.block.iter().filter(|x| x.name == "server") {
                 Self::warn_unknown(
                     srv,
-                    &["listen", "ssl_preread", "proxy_pass", "sni_match",
-                       "proxy_connect_timeout", "proxy_timeout", "preread_timeout"],
+                    &[
+                        "listen",
+                        "ssl_preread",
+                        "proxy_pass",
+                        "sni_match",
+                        "proxy_responses",
+                        "udp_max_sessions",
+                        "proxy_connect_timeout",
+                        "proxy_timeout",
+                        "preread_timeout",
+                    ],
                     "stream server",
                     warnings,
                 );
@@ -2937,7 +3334,8 @@ impl Router {
                         Some(b) => base.ssl_preread = b,
                         None => warnings.push(format!(
                             "ssl_preread 需要 on|off，已忽略 '{:?}'（第 {} 行）",
-                            v.arg(0), v.line
+                            v.arg(0),
+                            v.line
                         )),
                     }
                 }
@@ -2949,9 +3347,10 @@ impl Router {
                     .map(|s| s.trim_matches('"').to_string());
                 for m in srv.block.iter().filter(|x| x.name == "sni_match") {
                     match (m.arg(0), m.arg(1)) {
-                        (Some(p), Some(t)) => base
-                            .sni_matches
-                            .push(SniMatch { pattern: p.trim_matches('"').to_string(), target: t.trim_matches('"').to_string() }),
+                        (Some(p), Some(t)) => base.sni_matches.push(SniMatch {
+                            pattern: p.trim_matches('"').to_string(),
+                            target: t.trim_matches('"').to_string(),
+                        }),
                         _ => warnings.push(format!(
                             "sni_match 需要 <name> <target> 两个参数（第 {} 行）",
                             m.line
@@ -2963,17 +3362,41 @@ impl Router {
                     ("proxy_timeout", &mut base.proxy_timeout),
                     ("preread_timeout", &mut base.pread_timeout),
                 ] {
-                    if let Some(v) = srv.block.iter().find(|x| x.name == name).and_then(|x| x.arg(0)) {
+                    if let Some(v) = srv
+                        .block
+                        .iter()
+                        .find(|x| x.name == name)
+                        .and_then(|x| x.arg(0))
+                    {
                         match crate::settings::parse_duration(v) {
                             Some(d) => *slot = d,
                             None => warnings.push(format!("{name} 时间值无法解析 '{v}'（已忽略）")),
                         }
                     }
                 }
-                let mut listens: Vec<SocketAddr> = Vec::new();
+                if let Some(v) = srv
+                    .block
+                    .iter()
+                    .find(|x| x.name == "proxy_responses")
+                    .and_then(|x| x.arg(0))
+                {
+                    base.proxy_responses = v.parse::<u32>().map_err(|_| {
+                        AppError::Other(format!("proxy_responses 需要非负整数（收到 '{v}'）"))
+                    })?;
+                }
+                if let Some(v) = srv
+                    .block
+                    .iter()
+                    .find(|x| x.name == "udp_max_sessions")
+                    .and_then(|x| x.arg(0))
+                {
+                    base.udp_max_sessions = v.parse::<usize>().map_err(|_| {
+                        AppError::Other(format!("udp_max_sessions 需要非负整数（收到 '{v}'）"))
+                    })?;
+                }
+                let mut listens: Vec<(SocketAddr, ListenFlags)> = Vec::new();
                 for l in srv.block.iter().filter(|x| x.name == "listen") {
-                    let (addr, _flags) = parse_listen(l)?;
-                    listens.push(addr);
+                    listens.push(parse_listen(l)?);
                 }
                 if listens.is_empty() {
                     return Err(AppError::Other(format!(
@@ -2981,14 +3404,35 @@ impl Router {
                         srv.line
                     )));
                 }
-                for addr in listens {
+                for (addr, flags) in listens {
                     let mut s = base.clone();
                     s.listen = addr;
+                    s.udp = flags.udp;
                     if s.default_target.is_none() && s.sni_matches.is_empty() {
                         return Err(AppError::Other(format!(
                             "stream {addr}（第 {} 行）既无 proxy_pass 也无 sni_match，无转发目标",
                             srv.line
                         )));
+                    }
+                    // UDP 入口的能力边界要在 -t 就说清，而不是运行期悄悄忽略另一半配置：
+                    // ssl_preread / sni_match 读的是 TLS ClientHello，而数据报上的"握手"
+                    // 分片可以乱序、可以丢，解析 SNI 不是一次安全操作。DTLS 另说。
+                    if flags.udp {
+                        if !s.sni_matches.is_empty() {
+                            return Err(AppError::Other(format!(
+                                "stream {addr}（第 {} 行）listen 写了 udp，就不能再用 sni_match：\
+                                 SNI 窥探依赖字节流语义（数据报会乱序/丢失）。UDP 入口按 proxy_pass \
+                                 整体转发；要按名字分流请为每个服务另开一个 udp 监听",
+                                srv.line
+                            )));
+                        }
+                        if s.ssl_preread {
+                            return Err(AppError::Other(format!(
+                                "stream {addr}（第 {} 行）listen 写了 udp，ssl_preread 不适用\
+                                 （它读的是 TCP 上的 TLS ClientHello）",
+                                srv.line
+                            )));
+                        }
                     }
                     out.push(s);
                 }
@@ -3044,12 +3488,7 @@ impl Router {
         Ok(found)
     }
 
-    fn warn_unknown(
-        d: &Directive,
-        known: &[&str],
-        ctx: &str,
-        warnings: &mut Vec<String>,
-    ) {
+    fn warn_unknown(d: &Directive, known: &[&str], ctx: &str, warnings: &mut Vec<String>) {
         for child in &d.block {
             if child.name == "location" {
                 continue;
@@ -3068,28 +3507,69 @@ impl Router {
     /// 因此未识别的顶层指令必须在启动/重载日志里显式出现。
     fn warn_unknown_top_level(config: &Config, warnings: &mut Vec<String>) {
         const KNOWN: &[&str] = &[
-            "server", "stream", "upstream",
-            "map", "geo", "split_clients", "canary",
-            "limit_req_zone", "limit_conn_zone", "limit_req_status", "limit_conn_status",
-            "lua_shared_dict", "init_by_lua", "init_by_lua_file",
-            "init_worker_by_lua", "init_worker_by_lua_file", "lua_package_path",
+            "server",
+            "stream",
+            "upstream",
+            "map",
+            "geo",
+            "split_clients",
+            "canary",
+            "limit_req_zone",
+            "limit_conn_zone",
+            "limit_req_status",
+            "limit_conn_status",
+            "lua_shared_dict",
+            "init_by_lua",
+            "init_by_lua_file",
+            "init_worker_by_lua",
+            "init_worker_by_lua_file",
+            "lua_package_path",
             "lua_slice_instructions",
-            "error_log", "error_log_max_size", "error_log_keep",
-            "access_log", "access_log_max_size", "access_log_keep",
-            "resolver", "resolver_timeout", "pid",
-            "worker_connections", "worker_threads", "worker_cpu_affinity",
-            "client_header_timeout", "client_body_timeout",
-            "keepalive_timeout", "tls_handshake_timeout", "shutdown_grace",
-            "keepalive_requests", "server_tokens", "tcp_nodelay", "accept_backlog",
-            "gzip", "gzip_min_length", "gzip_comp_level", "gzip_types", "reload",
-            "ssl_session_cache", "ssl_session_tickets", "proxy_cache_path",
+            "error_log",
+            "error_log_max_size",
+            "error_log_keep",
+            "access_log",
+            "access_log_max_size",
+            "access_log_keep",
+            "resolver",
+            "resolver_timeout",
+            "pid",
+            "worker_connections",
+            "worker_threads",
+            "worker_cpu_affinity",
+            "client_header_timeout",
+            "client_body_timeout",
+            "keepalive_timeout",
+            "tls_handshake_timeout",
+            "shutdown_grace",
+            "keepalive_requests",
+            "server_tokens",
+            "tcp_nodelay",
+            "accept_backlog",
+            "gzip",
+            "gzip_min_length",
+            "gzip_comp_level",
+            "gzip_types",
+            "reload",
+            "ssl_session_cache",
+            "ssl_session_tickets",
+            "proxy_cache_path",
             "still_online_zone",
-            "learning", "learning_memory_budget", "proxy_cache_learning",
-            "limit_req_queue", "limit_req_learning", "vip_learning",
-            "front_proxy", "wasm_plugin",
+            "learning",
+            "learning_memory_budget",
+            "proxy_cache_learning",
+            "limit_req_queue",
+            "limit_req_learning",
+            "vip_learning",
+            "front_proxy",
+            "wasm_plugin",
             "schedule_window",
-            "cache_governor", "cache_governor_low", "cache_governor_high",
-            "cache_governor_hold", "cache_governor_tier", "cache_governor_learn",
+            "cache_governor",
+            "cache_governor_low",
+            "cache_governor_high",
+            "cache_governor_hold",
+            "cache_governor_tier",
+            "cache_governor_learn",
             "cache_governor_lead",
         ];
         for d in &config.root.block {
@@ -3133,6 +3613,7 @@ impl Router {
             error_pages: HashMap::new(),
             client_max_body_size: Some(1024 * 1024),
             add_headers: Vec::new(),
+            expires: None,
             proxy_set_headers: Vec::new(),
             proxy_connect_timeout: std::time::Duration::from_secs(3),
             proxy_read_timeout: std::time::Duration::from_secs(60),
@@ -3234,7 +3715,9 @@ impl Router {
         }
         // ssl_protocols：显式启用集合（nginx 语义），出现即以它为准，覆盖 ssl_min_version。
         if let Some(p) = d.find("ssl_protocols") {
-            let mut set = TlsProtocols { enabled: Vec::new() };
+            let mut set = TlsProtocols {
+                enabled: Vec::new(),
+            };
             for tok in &p.args {
                 match TlsVersion::from_nginx_token(tok) {
                     Some(ver) => set.set(ver),
@@ -3251,7 +3734,8 @@ impl Router {
                 }
             }
             if set.enabled.is_empty() {
-                warnings.push("ssl_protocols 未列出任何可用协议，回落默认 TLSv1.2 TLSv1.3".to_string());
+                warnings
+                    .push("ssl_protocols 未列出任何可用协议，回落默认 TLSv1.2 TLSv1.3".to_string());
             } else {
                 tmpl.protocols = set;
             }
@@ -3384,8 +3868,8 @@ impl Router {
         }
         tmpl.error_pages = parse_error_pages(d);
         tmpl.add_headers = parse_add_headers(d);
-        let (a_rules, a_realm, a_file) =
-            parse_access_directives(d, base_dir, "server", warnings)?;
+        tmpl.expires = parse_expires(d, "server")?;
+        let (a_rules, a_realm, a_file) = parse_access_directives(d, base_dir, "server", warnings)?;
         tmpl.access_rules = a_rules;
         tmpl.auth_basic_realm = a_realm;
         tmpl.auth_basic_user_file = a_file;
@@ -3394,7 +3878,12 @@ impl Router {
         // realip 模块：set_real_ip_from（可重复）/ real_ip_header / real_ip_recursive
         {
             let mut ri = crate::realip::RealIpConf::default();
-            for h in d.block.iter().filter(|x| x.name == "real_ip_header").take(1) {
+            for h in d
+                .block
+                .iter()
+                .filter(|x| x.name == "real_ip_header")
+                .take(1)
+            {
                 if let Some(v) = h.arg(0) {
                     ri.header = crate::realip::normalize_header_name(v);
                 }
@@ -3410,7 +3899,12 @@ impl Router {
                     }
                 }
             }
-            for r in d.block.iter().filter(|x| x.name == "real_ip_recursive").take(1) {
+            for r in d
+                .block
+                .iter()
+                .filter(|x| x.name == "real_ip_recursive")
+                .take(1)
+            {
                 match r.arg(0) {
                     Some("on") => ri.recursive = true,
                     Some("off") => ri.recursive = false,
@@ -3432,8 +3926,11 @@ impl Router {
                 profiles: std::sync::Arc::clone(front_profiles),
                 ..Default::default()
             };
-            let mode_hits: Vec<&Directive> =
-                d.block.iter().filter(|x| x.name == "front_proxy_mode").collect();
+            let mode_hits: Vec<&Directive> = d
+                .block
+                .iter()
+                .filter(|x| x.name == "front_proxy_mode")
+                .collect();
             if mode_hits.len() > 1 {
                 warnings.push(format!(
                     "第 {} 行写了 {} 条 front_proxy_mode，只有第一条生效：这一档决定要不要改写取值，\
@@ -3522,10 +4019,16 @@ impl Router {
         }
 
         for loc in d.block.iter().filter(|x| x.name == "location") {
-            tmpl.locations
-                .push(Self::build_location(
-                    loc, base_dir, &tmpl, limits, windows, var_targets, derived, warnings,
-                )?);
+            tmpl.locations.push(Self::build_location(
+                loc,
+                base_dir,
+                &tmpl,
+                limits,
+                windows,
+                var_targets,
+                derived,
+                warnings,
+            )?);
         }
         Ok(tmpl)
     }
@@ -3592,7 +4095,9 @@ impl Router {
             autoindex: false,
             error_pages: HashMap::new(),
             add_headers: parse_add_headers(d),
+            expires: None,
             limit_req: Vec::new(),
+            limit_conn: Vec::new(),
             internal: false,
             client_max_body_size: None,
             access_rules: Vec::new(),
@@ -3606,32 +4111,91 @@ impl Router {
         };
         Self::warn_unknown(
             d,
-            &["rewrite", "set", "if", "return", "proxy_pass", "proxy_split_failover", "proxy_set_header", "proxy_read_timeout",
-               "proxy_connect_timeout", "proxy_send_timeout", "proxy_next_upstream",
-               "proxy_next_upstream_tries", "proxy_next_upstream_timeout",
-               "proxy_request_buffering",
-               "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
-               "proxy_cache_revalidate", "proxy_cache_lock", "proxy_cache_lock_timeout", "proxy_cache_use_stale",
-               "proxy_cache_bypass", "proxy_no_cache", "proxy_ignore_headers",
-               "still_online", "still_online_max_age", "still_online_max_body",
-               "still_online_retry", "still_online_retry_max",
-               "still_online_retry_deadline", "still_online_allow_credentials",
-               "proxy_ssl_verify", "proxy_ssl_server_name", "proxy_ssl_name", "proxy_ssl_trusted_certificate",
-                   "proxy_ssl_certificate", "proxy_ssl_certificate_key",
-               "root",
-               "alias", "index", "try_files", "autoindex", "error_page", "add_header",
-               "limit_req", "internal", "client_max_body_size", "content_by_lua",
-               "content_by_lua_file", "access_by_lua", "access_by_lua_file", "rewrite_by_lua",
-               "rewrite_by_lua_file", "header_filter_by_lua", "header_filter_by_lua_file",
-               "body_filter_by_lua", "body_filter_by_lua_file",
-               "access_by_wasm", "header_filter_by_wasm", "body_filter_by_wasm",
-               "log_by_lua", "log_by_lua_file",
-               "balancer_by_lua", "balancer_by_lua_file",
-               "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
-               "allow", "deny", "auth_basic", "auth_basic_user_file",
-               "schedule_access",
-               "sub_filter", "sub_filter_once", "sub_filter_types",
-               "proxy_redirect", "proxy_cookie_domain", "proxy_cookie_path"],
+            &[
+                "rewrite",
+                "set",
+                "if",
+                "return",
+                "proxy_pass",
+                "proxy_split_failover",
+                "proxy_set_header",
+                "proxy_read_timeout",
+                "proxy_connect_timeout",
+                "proxy_send_timeout",
+                "proxy_next_upstream",
+                "proxy_next_upstream_tries",
+                "proxy_next_upstream_timeout",
+                "proxy_request_buffering",
+                "proxy_cache",
+                "proxy_cache_key",
+                "proxy_cache_methods",
+                "proxy_cache_valid",
+                "proxy_cache_min_uses",
+                "proxy_cache_revalidate",
+                "proxy_cache_lock",
+                "proxy_cache_lock_timeout",
+                "proxy_cache_use_stale",
+                "proxy_cache_bypass",
+                "proxy_no_cache",
+                "proxy_ignore_headers",
+                "still_online",
+                "still_online_max_age",
+                "still_online_max_body",
+                "still_online_retry",
+                "still_online_retry_max",
+                "still_online_retry_deadline",
+                "still_online_allow_credentials",
+                "proxy_ssl_verify",
+                "proxy_ssl_server_name",
+                "proxy_ssl_name",
+                "proxy_ssl_trusted_certificate",
+                "proxy_ssl_certificate",
+                "proxy_ssl_certificate_key",
+                "root",
+                "alias",
+                "index",
+                "try_files",
+                "autoindex",
+                "error_page",
+                "add_header",
+                "limit_req",
+                "limit_conn",
+                "internal",
+                "client_max_body_size",
+                "expires",
+                "content_by_lua",
+                "content_by_lua_file",
+                "access_by_lua",
+                "access_by_lua_file",
+                "rewrite_by_lua",
+                "rewrite_by_lua_file",
+                "header_filter_by_lua",
+                "header_filter_by_lua_file",
+                "body_filter_by_lua",
+                "body_filter_by_lua_file",
+                "access_by_wasm",
+                "header_filter_by_wasm",
+                "body_filter_by_wasm",
+                "log_by_lua",
+                "log_by_lua_file",
+                "balancer_by_lua",
+                "balancer_by_lua_file",
+                "content_by_rust",
+                "access_by_rust",
+                "rewrite_by_rust",
+                "log_by_rust",
+                "allow",
+                "deny",
+                "auth_basic",
+                "auth_basic_user_file",
+                "schedule_access",
+                "sub_filter",
+                "sub_filter_once",
+                "sub_filter_types",
+                "proxy_redirect",
+                "proxy_cookie_domain",
+                "proxy_cookie_path",
+            ],
             &format!("location '{}'", loc.pattern),
             warnings,
         );
@@ -3640,6 +4204,31 @@ impl Router {
         }
         if let Some(v) = d.find("alias").and_then(|x| x.arg(0)) {
             loc.alias = Some(crate::resolve_path(v, base_dir));
+        }
+        {
+            let ctx = format!("location '{}'", loc.pattern);
+            loc.expires = parse_expires(d, &ctx)?;
+        }
+        // location 级 limit_conn：nginx 允许写在 location 里，且一旦写了就整组替换 server 的。
+        // 引用未声明的区同样硬失败——写错区名不该变成"这条路由看起来有限制、其实没有"。
+        for c in d.block.iter().filter(|x| x.name == "limit_conn") {
+            match crate::limit::parse_conn_rule(c) {
+                Some(rule) => {
+                    if !limits.contains(&rule.zone) {
+                        return Err(AppError::Other(format!(
+                            "第 {} 行 location 的 limit_conn 引用了未声明的区域 '{}'",
+                            c.line, rule.zone
+                        )));
+                    }
+                    loc.limit_conn.push(rule);
+                }
+                None => {
+                    return Err(AppError::Other(format!(
+                        "第 {} 行 limit_conn 需要 `<zone> <number>`",
+                        c.line
+                    )))
+                }
+            }
         }
         if let Some(ix) = d.find("index") {
             if !ix.args.is_empty() {
@@ -3669,8 +4258,12 @@ impl Router {
         {
             loc.client_max_body_size = Some(v);
         }
-        let (rules, realm, user_file) =
-            parse_access_directives(d, base_dir, &format!("location '{}'", loc.pattern), warnings)?;
+        let (rules, realm, user_file) = parse_access_directives(
+            d,
+            base_dir,
+            &format!("location '{}'", loc.pattern),
+            warnings,
+        )?;
         loc.access_rules = rules;
         loc.auth_basic_realm = realm;
         loc.auth_basic_user_file = user_file;
@@ -3704,7 +4297,10 @@ impl Router {
                 } else {
                     SubPattern::Literal(m)
                 };
-                filters.push(SubFilter { pattern, replacement: r });
+                filters.push(SubFilter {
+                    pattern,
+                    replacement: r,
+                });
             }
             if !filters.is_empty() {
                 let once = match d
@@ -3719,7 +4315,11 @@ impl Router {
                     Some(t) if !t.args.is_empty() => t.args.clone(),
                     _ => vec!["text/html".to_string()], // nginx 默认 text/html
                 };
-                loc.sub_filter = Some(SubFilterConf { filters, once, types });
+                loc.sub_filter = Some(SubFilterConf {
+                    filters,
+                    once,
+                    types,
+                });
             }
         }
         if let Some(pp) = d.find("proxy_pass").and_then(|x| x.arg(0)) {
@@ -3892,7 +4492,9 @@ impl Router {
                                 // $cookie_route 都是请求可控的），所以挂上落点白名单：运行期解析出的目标
                                 // 必须是配置里列得出来的落点，否则不回源。
                                 loc.var_targets = Some(Arc::clone(var_targets));
-                                if split_failover_declared && loc.split_failover != SplitFailover::Off {
+                                if split_failover_declared
+                                    && loc.split_failover != SplitFailover::Off
+                                {
                                     return Err(AppError::Other(format!(
                                         "location '{}'：proxy_pass http://${name}（第 {} 行）里的 ${name} 不是 \
                                          split_clients/canary 的目标，网关列不出候选分支，proxy_split_failover \
@@ -3999,10 +4601,9 @@ impl Router {
                                     remove,
                                 });
                             }
-                            None => warnings.push(format!(
-                                "{name} 正则错误 {old}（第 {} 行）",
-                                cd.line
-                            )),
+                            None => {
+                                warnings.push(format!("{name} 正则错误 {old}（第 {} 行）", cd.line))
+                            }
                         }
                     }
                     None => warnings.push(format!("{name} 缺少参数（第 {} 行）", cd.line)),
@@ -4051,7 +4652,11 @@ impl Router {
                 Some(b) => loc.proxy_request_buffering = b,
                 None => warnings.push(format!(
                     "proxy_request_buffering 只接受 on/off（收到 '{v}'），保持 {}",
-                    if loc.proxy_request_buffering { "on" } else { "off" }
+                    if loc.proxy_request_buffering {
+                        "on"
+                    } else {
+                        "off"
+                    }
                 )),
             }
         }
@@ -4179,7 +4784,10 @@ impl Router {
         // 模块必须导出对应阶段的函数 —— 两条都在 -t 拦下，别等线上第一个请求才 500。
         for (dir_name, phase) in [
             ("access_by_wasm", crate::wasm::WasmPhase::Access),
-            ("header_filter_by_wasm", crate::wasm::WasmPhase::HeaderFilter),
+            (
+                "header_filter_by_wasm",
+                crate::wasm::WasmPhase::HeaderFilter,
+            ),
             ("body_filter_by_wasm", crate::wasm::WasmPhase::BodyFilter),
         ] {
             for dir in d.block.iter().filter(|x| x.name == dir_name) {
@@ -4190,8 +4798,7 @@ impl Router {
                     ))
                 })?;
                 let Some(plugin) = derived.wasm.get(plugin_name) else {
-                    let mut names: Vec<&str> =
-                        derived.wasm.keys().map(|s| s.as_str()).collect();
+                    let mut names: Vec<&str> = derived.wasm.keys().map(|s| s.as_str()).collect();
                     names.sort_unstable();
                     return Err(AppError::Other(format!(
                         "location '{}'（第 {} 行）的 {dir_name} 引用了未声明的 WASM 插件 '{plugin_name}'\
@@ -4264,7 +4871,10 @@ impl Router {
     pub fn describe_listeners(&self) -> Vec<String> {
         let mut out = Vec::new();
         for l in &self.listeners {
+            // `listen … quic` 必须在 -t/启动横幅里说出来：运维要能看出这个端点除了 TCP
+            // 还吃同号端口的 UDP，否则"开了 h3"是一件只能从外部探测才知道的事。
             let tls = match &l.tls {
+                Some(_) if l.quic => " TLS+HTTP/3(同端口 UDP)",
                 Some(_) => " TLS",
                 None => "",
             };
@@ -4288,9 +4898,11 @@ impl Router {
 
     /// 选择 location（nginx 算法）
     pub fn match_location<'s>(server: &'s Server, path: &str) -> Option<&'s Location> {
-        if let Some(l) = server.locations.iter().find(|l| {
-            matches!(&l.kind, LocationKind::Exact(p) if p == path)
-        }) {
+        if let Some(l) = server
+            .locations
+            .iter()
+            .find(|l| matches!(&l.kind, LocationKind::Exact(p) if p == path))
+        {
             return Some(l);
         }
         let mut best_prefix: Option<(&Location, usize)> = None;
@@ -4367,6 +4979,22 @@ fn best_wildcard<'a>(
 }
 
 /// location 级 add_header 为空时回退到 server 级（nginx：location 一旦有 add_header 就完全覆盖 server 级）
+/// 生效的 `limit_conn` 规则：location 自写任一条就整组替换 server 的（nginx 继承语义）。
+/// 合并两组会让"这条路由每人最多 1 个并发"被 server 级那条放宽，语义就错了。
+pub fn effective_limit_conn<'a>(loc: Option<&'a Location>, server: &'a Server) -> &'a [ConnRule] {
+    match loc {
+        Some(l) if !l.limit_conn.is_empty() => &l.limit_conn,
+        _ => &server.limit_conn,
+    }
+}
+
+/// 生效的 `expires`：location 写了就用 location 的（含 `off`），否则用 server 的。
+/// 与 nginx 的指令继承一致：子级一旦写出就整条替换，不是合并。
+pub fn effective_expires<'a>(loc: Option<&'a Location>, server: &'a Server) -> Option<&'a Expires> {
+    loc.and_then(|l| l.expires.as_ref())
+        .or(server.expires.as_ref())
+}
+
 pub fn effective_add_headers<'a>(
     loc: Option<&'a Location>,
     server: &'a Server,
@@ -4398,13 +5026,27 @@ fn parse_access_directives(
     base_dir: &PathBuf,
     where_name: &str,
     warnings: &mut Vec<String>,
-) -> Result<(Vec<crate::access::AccessRule>, Option<String>, Option<PathBuf>), AppError> {
+) -> Result<
+    (
+        Vec<crate::access::AccessRule>,
+        Option<String>,
+        Option<PathBuf>,
+    ),
+    AppError,
+> {
     let mut rules = Vec::new();
     // 保持 allow/deny 出现的相对顺序：遍历 block，按 name 分派
-    for x in d.block.iter().filter(|x| x.name == "allow" || x.name == "deny") {
+    for x in d
+        .block
+        .iter()
+        .filter(|x| x.name == "allow" || x.name == "deny")
+    {
         let allow = x.name == "allow";
         if x.args.is_empty() {
-            warnings.push(format!("{where_name} 第 {} 行 {} 缺少地址参数，忽略", x.line, x.name));
+            warnings.push(format!(
+                "{where_name} 第 {} 行 {} 缺少地址参数，忽略",
+                x.line, x.name
+            ));
             continue;
         }
         let refs: Vec<&str> = x.args.iter().map(|s| s.as_str()).collect();
@@ -4413,33 +5055,30 @@ fn parse_access_directives(
             None => {
                 return Err(AppError::Other(format!(
                     "{where_name} 第 {} 行 {} 的地址无法解析（需 IPv4/IPv6/CIDR/all，收到 {:?}）",
-                    x.line,
-                    x.name,
-                    x.args
+                    x.line, x.name, x.args
                 )))
             }
         }
     }
 
     // realm 三态：None=本层未设置（继承上层），Some("off")=显式关闭，Some(其它)=启用
-    let realm = d
-        .find("auth_basic")
-        .and_then(|a| a.arg(0))
-        .map(|s| {
-            let t = s.trim();
-            if t.is_empty() || t.eq_ignore_ascii_case("off") {
-                "off".to_string()
-            } else {
-                t.to_string()
-            }
-        });
+    let realm = d.find("auth_basic").and_then(|a| a.arg(0)).map(|s| {
+        let t = s.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("off") {
+            "off".to_string()
+        } else {
+            t.to_string()
+        }
+    });
     let user_file = d
         .find("auth_basic_user_file")
         .and_then(|a| a.arg(0))
         .map(|p| crate::resolve_path(p, base_dir));
 
     if realm.as_deref().is_some_and(|v| v != "off") && user_file.is_none() {
-        warnings.push(format!("{where_name} 配置了 auth_basic 却没有 auth_basic_user_file，认证将始终失败"));
+        warnings.push(format!(
+            "{where_name} 配置了 auth_basic 却没有 auth_basic_user_file，认证将始终失败"
+        ));
     }
     Ok((rules, realm, user_file))
 }
@@ -4492,7 +5131,10 @@ mod tests {
              }",
         ));
         for want in ["pool_a", "127.0.0.1:18002", "127.0.0.1:18003"] {
-            assert!(set.contains(want), "{want} 是配置里写下来的落点，应在集合里：{set:?}");
+            assert!(
+                set.contains(want),
+                "{want} 是配置里写下来的落点，应在集合里：{set:?}"
+            );
         }
         // 池里的节点地址不是"落点"（那是池内部的事），没写过的地址更不能凭空出现在集合里
         for absent in ["127.0.0.1:18001", "127.0.0.1:19999", "$arg_port"] {
@@ -4523,8 +5165,7 @@ mod tests {
 
     #[test]
     fn parse_canary_conditions_percent_and_default() {
-        let c = cfg(
-            r#"canary $release "${cookie_sid}${remote_addr}" {
+        let c = cfg(r#"canary $release "${cookie_sid}${remote_addr}" {
                  cookie home_beta=1 beta;
                  cookie early_access beta;
                  header X-Client-Channel=CANARY beta;
@@ -4533,8 +5174,7 @@ mod tests {
                  os ios beta;
                  percent 10 beta;
                  default stable;
-               }"#,
-        );
+               }"#);
         let mut w = Vec::new();
         let defs = Router::parse_canaries(&c, &mut w).unwrap();
         assert!(w.is_empty(), "{w:?}");
@@ -4599,8 +5239,7 @@ mod tests {
 
     #[test]
     fn canary_variable_becomes_an_enumerable_route_split() {
-        let c = cfg(
-            "canary $release {
+        let c = cfg("canary $release {
                  cookie beta=1 127.0.0.1:18141;
                  os ios 127.0.0.1:18141;
                  percent 10 127.0.0.1:18141;
@@ -4608,24 +5247,23 @@ mod tests {
              }
              server { listen 127.0.0.1:18140;
                location / { proxy_pass http://$release; }
-             }",
-        );
+             }");
         let r = Router::build(&c, &PathBuf::from(".")).unwrap();
         let loc = loc_at(&r, 18140, 0);
         let sp = loc.route_split.as_ref().expect("灰度变量应接上 RouteSplit");
         assert_eq!(sp.dest, "release");
         assert_eq!(sp.star.as_deref(), Some("127.0.0.1:18142"));
         assert!(
-            sp.summary.as_ref().unwrap().contains("os ios→127.0.0.1:18141"),
+            sp.summary
+                .as_ref()
+                .unwrap()
+                .contains("os ios→127.0.0.1:18141"),
             "{:?}",
             sp.summary
         );
         assert_eq!(
             sp.all_targets(),
-            vec![
-                "127.0.0.1:18141".to_string(),
-                "127.0.0.1:18142".to_string()
-            ],
+            vec!["127.0.0.1:18141".to_string(), "127.0.0.1:18142".to_string()],
             "条件/百分比目标要全部可枚举，default 在最后"
         );
         assert!(
@@ -4640,26 +5278,296 @@ mod tests {
         );
     }
 
-    /// S11：限流区的 key 写了运行期根本不展开的变量，配置"看着生效"、实际按 IP 限。
-    /// 这类静默的按预期失败放行不许只留一行告警：`-t` 直接否决，且点名那个 key。
+    /// nginx `expires` 的每种写法各自落什么头。口径：只在可缓存的状态码上动；
+    /// 负时长与"已经过去的 @时刻"都是 no-cache；裸文本原样进 Cache-Control；
+    /// off 一字不动（它同时是"本级不要上级过期策略"的写法）。
     #[test]
-    fn non_address_limit_zone_key_is_a_hard_error() {
+    fn expires_writes_the_nginx_header_pair() {
+        let now = 1_700_000_000; // 2023-11-14T22:13:20Z
+        let base = now - now % 86_400;
+        let tod = now - base;
+        assert_eq!(Expires::parse("1h").unwrap(), Expires::After(3600));
+        assert_eq!(Expires::parse("+30d").unwrap(), Expires::After(30 * 86_400));
+        assert_eq!(Expires::parse("-1h").unwrap(), Expires::After(-3600));
+        assert_eq!(Expires::parse("60").unwrap(), Expires::After(60));
+        assert_eq!(Expires::parse("1y").unwrap(), Expires::After(31_536_000));
+        assert_eq!(Expires::parse("2w").unwrap(), Expires::After(14 * 86_400));
+        assert_eq!(Expires::parse("1M").unwrap(), Expires::After(30 * 86_400));
+        assert_eq!(Expires::parse("@23:00:00").unwrap(), Expires::At(23 * 3600));
+        assert_eq!(
+            Expires::parse("public, immutable").unwrap(),
+            Expires::Text("public, immutable".into())
+        );
+        assert_eq!(Expires::parse("MAX").unwrap(), Expires::Max);
+
+        let h = Expires::parse("1h").unwrap().headers_for(200, now);
+        assert_eq!(h[0], ("cache-control".into(), "max-age=3600".into()));
+        assert_eq!(
+            h[1],
+            ("expires".into(), crate::lua_engine::http_time(now + 3600))
+        );
+
+        let h = Expires::parse("-1h").unwrap().headers_for(200, now);
+        assert_eq!(h[0].1, "no-cache", "负时长在 nginx 里就是 no-cache");
+
+        // 可缓存的状态码集合逐条对照 nginx 的 safe_status（ngx_http_headers_filter_module.c），
+        // 里面**包含 204**：空响应也允许被说成"能存一小时"。少写一个码 = 那类响应从来没被设过。
+        for st in [200u16, 201, 204, 206, 301, 302, 303, 304, 307, 308] {
+            assert!(
+                !Expires::parse("1h")
+                    .unwrap()
+                    .headers_for(st, now)
+                    .is_empty(),
+                "{st} 应当写上过期头"
+            );
+        }
+
+        // 不可缓存的状态码：一字不动（404 页面不该被说成能存一小时）
+        for st in [404u16, 500, 502, 403, 305, 100] {
+            assert!(
+                Expires::parse("1h")
+                    .unwrap()
+                    .headers_for(st, now)
+                    .is_empty(),
+                "{st}"
+            );
+        }
+        assert!(Expires::Off.headers_for(200, now).is_empty());
+
+        let h = Expires::Epoch.headers_for(200, now);
+        assert_eq!(h[0].1, "no-store");
+        assert_eq!(h[1].1, "Thu, 01 Jan 1970 00:00:01 GMT");
+        let h = Expires::Max.headers_for(200, now);
+        assert_eq!(h[0].1, "public, max-age=315360000");
+
+        // @：还没到 → max-age 是剩余秒数；已经过去 → no-cache
+        let h = Expires::At(tod + 60).headers_for(200, now);
+        assert_eq!(h[0].1, "max-age=60");
+        let h = Expires::At(tod - 1).headers_for(200, now);
+        assert_eq!(h[0].1, "no-cache");
+
+        assert_eq!(
+            Expires::Text("private, no-cache".into()).headers_for(200, now),
+            vec![("cache-control".into(), "private, no-cache".into())]
+        );
+    }
+
+    /// 时间值写坏必须在 `-t` 就否决：`expires 1x;` 落不下去，但配置"看着是缓了一天"。
+    /// 裸文本是 nginx 合法的 Cache-Control 值，不该报错。
+    #[test]
+    fn broken_expires_value_is_a_hard_error() {
+        for bad in ["1x", "3d0", "@25:00:00", "@12:65:00"] {
+            let e = Router::build(
+                &cfg(&format!(
+                    "server {{ listen 127.0.0.1:18080; expires {bad}; location / {{ root htdocs; }} }}"
+                )),
+                &PathBuf::from("."),
+            )
+            .expect_err("{bad} 不是合法时间，该被否决");
+            assert!(e.to_string().contains(bad), "{bad} → {e}");
+        }
+        build(
+            r#"server { listen 127.0.0.1:18080; expires "private, no-store";
+                 location / { root htdocs; } }"#,
+        );
+    }
+
+    /// location 一旦写了 `expires` 就整条替换 server 的（含写成 off 关掉）；没写才继承。
+    #[test]
+    fn expires_inheritance_follows_nginx() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18080; expires 1h;
+                 location /inherited { root htdocs; }
+                 location /own       { root htdocs; expires max; }
+                 location /off       { root htdocs; expires off; } }
+            server { listen 127.0.0.1:18081; location / { root htdocs; } }"#,
+        );
+        let s = r
+            .match_server("127.0.0.1:18080".parse().unwrap(), None)
+            .unwrap()
+            .clone();
+        let at = |p: &str| {
+            let srv = &s;
+            effective_expires(Router::match_location(srv, p), srv).cloned()
+        };
+        assert_eq!(
+            at("/inherited"),
+            Some(Expires::After(3600)),
+            "未自写的 location 继承 server"
+        );
+        assert_eq!(at("/own"), Some(Expires::Max));
+        assert_eq!(at("/off"), Some(Expires::Off), "off 是显式关闭，不是没写");
+        let s2 = r
+            .match_server("127.0.0.1:18081".parse().unwrap(), None)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            effective_expires(Router::match_location(&s2, "/"), &s2),
+            None,
+            "两级都没写就不动响应头"
+        );
+    }
+
+    /// location 级 `limit_conn` 整组替换 server 级：把两组"合并"会让"这条路由每人只许 1 个
+    /// 并发"被上级那条 10 放宽，语义就反了。没自写才继承；区名写错照样硬失败。
+    #[test]
+    fn location_limit_conn_replaces_server_rules() {
+        let r = build(
+            r#"limit_conn_zone $remote_addr zone=sa:1m;
+               limit_conn_zone $http_x_client zone=sb:1m;
+               server { listen 127.0.0.1:18080; limit_conn sa 10;
+                 location /own       { limit_conn sb 1; return 200 ok; }
+                 location /two       { limit_conn sa 2; limit_conn sb 3; return 200 ok; }
+                 location /inherited { return 200 ok; } }"#,
+        );
+        let s = r
+            .match_server("127.0.0.1:18080".parse().unwrap(), None)
+            .unwrap()
+            .clone();
+        fn as_rows(rules: &[ConnRule]) -> Vec<(&str, u32)> {
+            rules.iter().map(|c| (c.zone.as_str(), c.number)).collect()
+        }
+        let own = Router::match_location(&s, "/own").unwrap();
+        assert_eq!(
+            as_rows(effective_limit_conn(Some(own), &s)),
+            vec![("sb", 1)],
+            "location 自写时不该把 server 那条一起带进来"
+        );
+        let two = Router::match_location(&s, "/two").unwrap();
+        assert_eq!(
+            as_rows(effective_limit_conn(Some(two), &s)),
+            vec![("sa", 2), ("sb", 3)]
+        );
+        let inh = Router::match_location(&s, "/inherited").unwrap();
+        assert_eq!(
+            as_rows(effective_limit_conn(Some(inh), &s)),
+            vec![("sa", 10)]
+        );
+        assert!(
+            std::ptr::eq(
+                effective_limit_conn(None, &s).as_ptr(),
+                s.limit_conn.as_ptr()
+            ),
+            "没有 location 时直接借 server 的那一组，不该另开一份"
+        );
+
+        let e = Router::build(
+            &cfg("limit_conn_zone $remote_addr zone=sa:1m;\n\
+                 server { listen 127.0.0.1:18080; location /x { limit_conn nope 3; } }"),
+            &PathBuf::from("."),
+        )
+        .expect_err("引用未声明的区该被否决");
+        assert!(e.to_string().contains("未声明"), "{e}");
+    }
+
+    /// S11 的延伸：限流 key 支持请求期变量（按头/Cookie/URL 参数/URI 计数，选课系统这类
+    /// "按学生而不是按 IP 限"的写法必须能用），但判定时刻取不到值的写法仍然硬失败——
+    /// `$status`/`$request_body` 当 key 会让每个请求落到同一个空 key 桶，比"按 IP 限"更静默。
+    /// `-t` 不许只留一行告警：点名那个变量并说明它为什么不行。
+    #[test]
+    fn limit_zone_keys_are_checked_against_the_request_phase() {
         for (dir, bad) in [
-            ("limit_req_zone", "$http_x_api_key"),
-            ("limit_req_zone", "$uri"),
-            ("limit_conn_zone", "$server_name"),
+            ("limit_req_zone", "$status"),
+            ("limit_req_zone", "$request_body"),
+            ("limit_req_zone", "$server_name"),
+            ("limit_conn_zone", "$upstream_addr"),
         ] {
             let e = Router::build(
                 &cfg(&format!("{dir} {bad} zone=k:1m rate=10r/s;")),
                 &PathBuf::from("."),
             )
-            .expect_err("{bad} 不是客户端地址，这份配置该被否决");
+            .expect_err("{bad} 在限流判定时刻取不到值，这份配置该被否决");
             let msg = e.to_string();
-            assert!(msg.contains(bad) && msg.contains("只支持"), "{msg}");
+            assert!(msg.contains(bad) && msg.contains(dir), "{msg}");
         }
-        // 对照组：两个地址写法照常通过
-        build("limit_req_zone $binary_remote_addr zone=k:1m rate=10r/s;");
-        build("limit_req_zone $remote_addr zone=k:1m rate=10r/s;");
+        // 对照组：地址与请求期维度照常通过
+        for ok in [
+            "$remote_addr",
+            "$binary_remote_addr",
+            "$http_x_api_key",
+            "$cookie_sid",
+            "$arg_token",
+            "$cookie_sid$remote_addr",
+        ] {
+            Router::build(
+                &cfg(&format!("limit_req_zone {ok} zone=k:1m rate=10r/s;")),
+                &PathBuf::from("."),
+            )
+            .unwrap_or_else(|e| panic!("{ok} 是请求期变量，不该被否决：{e}"));
+        }
+    }
+
+    /// 信誉/队列的记分键现在可以是客户端自报的头/Cookie/参数（S11 之后）。
+    /// 换一个值就是一个"新的"重要客户，所以这条信任根必须和 realip 那条一样在 -t 里说清楚
+    /// ——告警，不否决：信誉从不参与放行判定。
+    #[test]
+    fn vip_learning_with_a_client_asserted_key_warns_about_that_root() {
+        let nl = std::str::from_utf8(&[10u8]).unwrap();
+        let conf = format!(
+            "vip_learning table=8k min=10 decay=30s;{nl}limit_req_zone $http_x_api_key zone=byapp:1m rate=10r/s;{nl}limit_req_zone $binary_remote_addr zone=byip:1m rate=10r/s;{nl}server {{ listen 127.0.0.1:18199; server_name v.test; location / {{ return 200 ok; }} }}"
+        );
+        let r = Router::build(&cfg(&conf), &PathBuf::from(".")).unwrap();
+        let hit: Vec<&String> = r
+            .warnings
+            .iter()
+            .filter(|w| w.contains("vip_learning") && w.contains("byapp"))
+            .collect();
+        assert_eq!(hit.len(), 1, "{:?}", r.warnings);
+        assert!(hit[0].contains("$http_x_api_key"), "{}", hit[0]);
+        assert!(!hit[0].contains("byip"), "按地址的区不该被点名：{}", hit[0]);
+    }
+
+    /// 四层 UDP 入口的 `-t` 契约。`udp` 只在 `stream{}` 里有意义；与 `ssl_preread`/
+    /// `sni_match` 同时出现要否决——数据报会乱序、会丢，从"半条 ClientHello"里取 SNI
+    /// 不是一次安全操作，所以这条能力边界必须在配置期说清楚，而不是运行期静默忽略。
+    #[test]
+    fn udp_stream_listen_contract() {
+        let ok = r#"upstream gameq { server 127.0.0.1:18761; }
+            stream { server { listen 18760 udp; proxy_pass gameq; } }"#;
+        let r = Router::build(&cfg(ok), &PathBuf::from(".")).unwrap();
+        assert_eq!(r.stream.len(), 1, "stream 监听要成一条");
+        assert!(r.stream[0].udp, "listen ... udp 要落到 StreamServer.udp");
+        assert_eq!(r.stream[0].proxy_responses, 1, "nginx 默认等 1 个回包");
+
+        let ff = r#"stream { server { listen 18760 udp; proxy_pass 127.0.0.1:18761; proxy_responses 0; } }"#;
+        let r = Router::build(&cfg(ff), &PathBuf::from(".")).unwrap();
+        assert_eq!(r.stream[0].proxy_responses, 0, "0 = 不等回包，是合法写法");
+
+        let bad = r#"stream { server { listen 18760 udp; proxy_pass 127.0.0.1:18761; proxy_responses x; } }"#;
+        let e = Router::build(&cfg(bad), &PathBuf::from(".")).unwrap_err();
+        assert!(e.to_string().contains("非负整数"), "{e}");
+
+        for clash in [
+            r#"stream { server { listen 18760 udp; proxy_pass 127.0.0.1:1; ssl_preread on; } }"#,
+            r#"stream { server { listen 18760 udp; proxy_pass 127.0.0.1:1; sni_match "a.b" 127.0.0.1:2; } }"#,
+        ] {
+            let e = Router::build(&cfg(clash), &PathBuf::from(".")).unwrap_err();
+            let msg = e.to_string();
+            assert!(
+                msg.contains("udp") && (msg.contains("ssl_preread") || msg.contains("sni_match")),
+                "{msg}"
+            );
+        }
+
+        // `udp_max_sessions`：ONRouter 的扩展旋钮（nginx 没有），默认 0 = 不设上限
+        let capped = r#"stream { server { listen 18760 udp; proxy_pass 127.0.0.1:1; udp_max_sessions 64; } }"#;
+        let r = Router::build(&cfg(capped), &PathBuf::from(".")).unwrap();
+        assert_eq!(r.stream[0].udp_max_sessions, 64);
+        let e = Router::build(
+            &cfg(r#"stream { server { listen 18760 udp; proxy_pass 127.0.0.1:1; udp_max_sessions 6x; } }"#),
+            &PathBuf::from("."),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("udp_max_sessions"), "{e}");
+
+        // HTTP 层写 udp：否决，并把"要 UDP 的 HTTP 只有 QUIC"这条指出来
+        let e = Router::build(
+            &cfg("server { listen 18762 udp; location / { return 200 ok; } }"),
+            &PathBuf::from("."),
+        )
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("stream") && msg.contains("quic"), "{msg}");
     }
 
     /// S12 的信任根暴露：realip 与信誉表同时出现时 `-t` 要说清楚（但照常通过——
@@ -4743,9 +5651,15 @@ mod tests {
     #[test]
     fn session_options_share_ticketer_and_store() {
         let mut w = Vec::new();
-        assert!(parse_session_tickets(&cfg("ssl_session_tickets on;"), &mut w));
+        assert!(parse_session_tickets(
+            &cfg("ssl_session_tickets on;"),
+            &mut w
+        ));
         let mut w = Vec::new();
-        assert!(!parse_session_tickets(&cfg("ssl_session_tickets off;"), &mut w));
+        assert!(!parse_session_tickets(
+            &cfg("ssl_session_tickets off;"),
+            &mut w
+        ));
 
         let opts = parse_session_options(
             &cfg("ssl_session_cache shared:SSL:1m; ssl_session_tickets on;"),
@@ -4790,8 +5704,7 @@ mod tests {
             }
             "#,
         );
-        let loc = &r.groups[&"127.0.0.1:18196".parse::<std::net::SocketAddr>().unwrap()]
-            .servers[0]
+        let loc = &r.groups[&"127.0.0.1:18196".parse::<std::net::SocketAddr>().unwrap()].servers[0]
             .locations[0];
         assert!(loc.proxy_cache_lock);
         assert_eq!(
@@ -4802,7 +5715,10 @@ mod tests {
             loc.proxy_cache_use_stale,
             vec!["error", "timeout", "http_502", "updating"]
         );
-        assert_eq!(loc.proxy_cache_bypass, vec!["$cookie_nocache", "$arg_nocache"]);
+        assert_eq!(
+            loc.proxy_cache_bypass,
+            vec!["$cookie_nocache", "$arg_nocache"]
+        );
         assert_eq!(loc.proxy_no_cache, vec!["$arg_nocache"]);
         assert_eq!(loc.proxy_cache_min_uses, 2);
         // 16m keys_zone → 16*1024*1024/128 = 131072 条
@@ -4831,8 +5747,7 @@ mod tests {
             }
         "#;
         let r = build(conf);
-        let srv = &r.groups[&"127.0.0.1:18196".parse::<std::net::SocketAddr>().unwrap()]
-            .servers[0];
+        let srv = &r.groups[&"127.0.0.1:18196".parse::<std::net::SocketAddr>().unwrap()].servers[0];
         assert_eq!(srv.locations[0].proxy_cache_use_stale, vec!["error"]);
         assert!(
             srv.locations[1].proxy_cache_use_stale.is_empty(),
@@ -4974,10 +5889,8 @@ mod tests {
     #[test]
     fn proxy_cache_disk_two_zones_one_directory_hard_fails() {
         // 同一目录两套索引会互相踩（同 key 同哈希），与 lua_shared_dict 同一先例：-t 就拦
-        let conf = cfg(
-            "proxy_cache_path cache/same keys_zone=a:1m disk=on;
-             proxy_cache_path cache/same keys_zone=b:1m disk=on;",
-        );
+        let conf = cfg("proxy_cache_path cache/same keys_zone=a:1m disk=on;
+             proxy_cache_path cache/same keys_zone=b:1m disk=on;");
         let mut w = Vec::new();
         let r = Router::parse_cache_disk(&conf, &PathBuf::from("."), &mut w);
         let Err(e) = r else {
@@ -5047,10 +5960,19 @@ mod tests {
         assert_eq!(d.default.as_deref(), Some("fallback"));
         // 精确（含空串）+ 正则 + 大小写不敏感正则共 4 个分支
         assert_eq!(d.cases.len(), 4);
-        assert!(d.cases.iter().any(|c| c.literal.as_deref() == Some("exact1")));
+        assert!(d
+            .cases
+            .iter()
+            .any(|c| c.literal.as_deref() == Some("exact1")));
         assert!(d.cases.iter().any(|c| c.literal.as_deref() == Some("")));
-        assert!(d.cases.iter().any(|c| c.regex.as_ref().is_some_and(|r| r.as_str() == "^/reg")));
-        assert!(d.cases.iter().any(|c| c.regex.as_ref().is_some_and(|r| r.as_str() == "CI$")));
+        assert!(d
+            .cases
+            .iter()
+            .any(|c| c.regex.as_ref().is_some_and(|r| r.as_str() == "^/reg")));
+        assert!(d
+            .cases
+            .iter()
+            .any(|c| c.regex.as_ref().is_some_and(|r| r.as_str() == "CI$")));
     }
 
     #[test]
@@ -5087,7 +6009,10 @@ mod tests {
         // 按前缀降序：/32(127.0.0.1) 与 /32(2001:db8) 先于 /16 先于 /8
         let prefixes: Vec<u8> = g.rules.iter().map(|r| r.prefix).collect();
         assert_eq!(prefixes, vec![32, 32, 16, 8]);
-        assert!(g.rules.iter().any(|r| r.ip.to_string() == "127.0.0.1" && r.result == "loopback"));
+        assert!(g
+            .rules
+            .iter()
+            .any(|r| r.ip.to_string() == "127.0.0.1" && r.result == "loopback"));
         assert!(g.rules.iter().any(|r| r.ip.to_string() == "2001:db8::"));
     }
 
@@ -5114,12 +6039,14 @@ mod tests {
             }
         "#;
         let r = build(conf);
-        let loc = &r.groups[&"127.0.0.1:18193".parse::<std::net::SocketAddr>().unwrap()]
-            .servers[0]
+        let loc = &r.groups[&"127.0.0.1:18193".parse::<std::net::SocketAddr>().unwrap()].servers[0]
             .locations[0];
         let sf = loc.sub_filter.as_ref().expect("sub_filter 应启用");
         assert!(!sf.once, "sub_filter_once off 应被解析");
-        assert_eq!(sf.types, vec!["text/html".to_string(), "application/json".to_string()]);
+        assert_eq!(
+            sf.types,
+            vec!["text/html".to_string(), "application/json".to_string()]
+        );
         assert_eq!(sf.filters.len(), 2);
         assert!(matches!(
             &sf.filters[0].pattern,
@@ -5150,8 +6077,7 @@ mod tests {
             }
         "#;
         let r = build(conf);
-        let loc = &r.groups[&"127.0.0.1:18194".parse::<std::net::SocketAddr>().unwrap()]
-            .servers[0]
+        let loc = &r.groups[&"127.0.0.1:18194".parse::<std::net::SocketAddr>().unwrap()].servers[0]
             .locations[0];
         // proxy_redirect：default 合成 + 字面量 + 正则，共 3 条；未 off
         assert!(!loc.proxy_redirect.off);
@@ -5161,11 +6087,21 @@ mod tests {
             crate::resp_rewrite::MatchPattern::Literal(s) if s == "http://10.0.0.5:8080"
         ));
         assert_eq!(loc.proxy_redirect.rules[0].replacement, "/api/");
-        assert_eq!(loc.proxy_redirect.rules[1].replacement, "http://public.example");
-        assert!(matches!(&loc.proxy_redirect.rules[2].m, crate::resp_rewrite::MatchPattern::Regex(_)));
+        assert_eq!(
+            loc.proxy_redirect.rules[1].replacement,
+            "http://public.example"
+        );
+        assert!(matches!(
+            &loc.proxy_redirect.rules[2].m,
+            crate::resp_rewrite::MatchPattern::Regex(_)
+        ));
         // default 合成产出相对 Location
         assert_eq!(
-            crate::resp_rewrite::apply_redirect(&loc.proxy_redirect.rules, "http://10.0.0.5:8080/login").as_deref(),
+            crate::resp_rewrite::apply_redirect(
+                &loc.proxy_redirect.rules,
+                "http://10.0.0.5:8080/login"
+            )
+            .as_deref(),
             Some("/api/login")
         );
         // proxy_cookie_domain：两条规则，第二条 none → remove
@@ -5185,8 +6121,7 @@ mod tests {
             server { listen 127.0.0.1:18195; location /api/ { proxy_pass http://10.0.0.5:8080; } }
         "#;
         let r = build(conf);
-        let loc = &r.groups[&"127.0.0.1:18195".parse::<std::net::SocketAddr>().unwrap()]
-            .servers[0]
+        let loc = &r.groups[&"127.0.0.1:18195".parse::<std::net::SocketAddr>().unwrap()].servers[0]
             .locations[0];
         assert!(loc.proxy_redirect.rules.is_empty());
         assert!(!loc.proxy_redirect.off);
@@ -5207,7 +6142,10 @@ mod tests {
         "#;
         let r = build(conf);
         let srv = &r.groups[&"127.0.0.1:18196".parse::<std::net::SocketAddr>().unwrap()].servers[0];
-        assert_eq!(srv.real_ip.header, "x-forwarded-for", "real_ip_header 规范化为小写");
+        assert_eq!(
+            srv.real_ip.header, "x-forwarded-for",
+            "real_ip_header 规范化为小写"
+        );
         assert!(srv.real_ip.recursive, "real_ip_recursive on");
         assert_eq!(srv.real_ip.trusted.len(), 2, "两条 set_real_ip_from 累加");
         assert_eq!(srv.real_ip.trusted[0].prefix, 8);
@@ -5235,8 +6173,7 @@ mod tests {
             server { listen 127.0.0.1:18192; location / { sub_filter a b; return 200 ok; } }
         "#;
         let r = build(conf);
-        let loc = &r.groups[&"127.0.0.1:18192".parse::<std::net::SocketAddr>().unwrap()]
-            .servers[0]
+        let loc = &r.groups[&"127.0.0.1:18192".parse::<std::net::SocketAddr>().unwrap()].servers[0]
             .locations[0];
         let sf = loc.sub_filter.as_ref().unwrap();
         assert!(sf.once);
@@ -5284,12 +6221,10 @@ mod tests {
     fn zero_percent_bucket_is_declared_but_negative_is_an_error() {
         let mut warns = Vec::new();
         let defs = Router::parse_splits(
-            &cfg(
-                r#"
+            &cfg(r#"
                 split_clients "${http_x_key}" $r { 0% legacy; 70% a; * b; }
                 server { listen 127.0.0.1:18193; location / { return 200 ok; } }
-            "#,
-            ),
+            "#),
             &mut warns,
         )
         .expect("0% 是合法的：只当改投落点");
@@ -5306,12 +6241,10 @@ mod tests {
         .expect("改投到 0% 那一路应当在比例声明之内");
 
         let e = Router::parse_splits(
-            &cfg(
-                r#"
+            &cfg(r#"
                 split_clients "${http_x_key}" $n { -1% a; * b; }
                 server { listen 127.0.0.1:18193; location / { return 200 ok; } }
-            "#,
-            ),
+            "#),
             &mut Vec::new(),
         )
         .expect_err("负权重是配置错误");
@@ -5357,7 +6290,10 @@ mod tests {
         )
         .expect_err("改投目标不能是变量");
         let msg = e.to_string();
-        assert!(msg.contains("$fallback") && msg.contains("不能是变量"), "{msg}");
+        assert!(
+            msg.contains("$fallback") && msg.contains("不能是变量"),
+            "{msg}"
+        );
 
         // 目标是写死的服务，却声明了改投策略：一行都不会生效，直接否决
         let e = Router::build(
@@ -5380,7 +6316,11 @@ mod tests {
     /// 并发单测里读不到稳定的表，用全局表做断言会抖。
     #[test]
     fn split_branch_targets_must_be_enumerable_hosts() {
-        let ok = ["v1".to_string(), "127.0.0.1:9000".to_string(), "canary".to_string()];
+        let ok = [
+            "v1".to_string(),
+            "127.0.0.1:9000".to_string(),
+            "canary".to_string(),
+        ];
         for failover in [
             SplitFailover::On,
             SplitFailover::Off,
@@ -5391,8 +6331,9 @@ mod tests {
         }
         // 主机位里不能带路径、空格、制表符或变量
         for bad in ["v1/api", "v1 v2", "v1\tv2", "http://$inner"] {
-            let e = Router::check_split_branch_targets("v", &[bad.to_string()], &SplitFailover::On, 7)
-                .expect_err("'{bad}' 不是可枚举的主机位");
+            let e =
+                Router::check_split_branch_targets("v", &[bad.to_string()], &SplitFailover::On, 7)
+                    .expect_err("'{bad}' 不是可枚举的主机位");
             assert!(e.contains(bad) && e.contains("主机位"), "{e}");
         }
         // 显式改投目标必须在这套比例之内；要退到外面就把它写成 0% 的那一路
@@ -5433,11 +6374,15 @@ mod tests {
         let a: SocketAddr = "127.0.0.1:18080".parse().unwrap();
         let b: SocketAddr = "127.0.0.1:18081".parse().unwrap();
         assert_eq!(
-            r.match_server(a, Some("b.example.com")).unwrap().server_name,
+            r.match_server(a, Some("b.example.com"))
+                .unwrap()
+                .server_name,
             "b.example.com"
         );
         assert_eq!(
-            r.match_server(b, Some("b.example.com")).unwrap().server_name,
+            r.match_server(b, Some("b.example.com"))
+                .unwrap()
+                .server_name,
             "c.example.com",
             "另一个监听地址上的 vhost 不应串到这里"
         );
@@ -5448,7 +6393,9 @@ mod tests {
         let r = build(TWO_HOSTS);
         let a: SocketAddr = "127.0.0.1:18080".parse().unwrap();
         assert_eq!(
-            r.match_server(a, Some("a.example.com:18080")).unwrap().server_name,
+            r.match_server(a, Some("a.example.com:18080"))
+                .unwrap()
+                .server_name,
             "a.example.com"
         );
     }
@@ -5462,8 +6409,12 @@ mod tests {
                server { listen 127.0.0.1:18087 default_server; server_name fallback; location / { return 200 default; } }"#,
         );
         let addr: SocketAddr = "127.0.0.1:18087".parse().unwrap();
-        let pick =
-            |h: &str| r.match_server(addr, Some(h)).unwrap().server_name.to_string();
+        let pick = |h: &str| {
+            r.match_server(addr, Some(h))
+                .unwrap()
+                .server_name
+                .to_string()
+        };
         // 1. 精确名赢过所有通配
         assert_eq!(pick("hit.example.com"), "hit.example.com");
         // 2. 前缀通配命中
@@ -5539,9 +6490,7 @@ mod tests {
 
     #[test]
     fn listeners_follow_config_order() {
-        let r = build(
-            "server { listen 18082; } server { listen 18081; } server { listen 18083; }",
-        );
+        let r = build("server { listen 18082; } server { listen 18081; } server { listen 18083; }");
         let ports: Vec<u16> = r.listeners.iter().map(|l| l.addr.port()).collect();
         assert_eq!(ports, vec![18082, 18081, 18083]);
     }
@@ -5622,7 +6571,10 @@ mod tests {
             r#"server { listen 127.0.0.1:18080; proxy_set_header X-A 1; proxy_set_header X-B 1;
                  location /p/ { proxy_pass http://127.0.0.1:1; proxy_set_header X-B 2; } }"#,
         );
-        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        let s = r
+            .match_server("127.0.0.1:18080".parse().unwrap(), None)
+            .unwrap()
+            .clone();
         let loc = Router::match_location(&s, "/p/x").unwrap();
         let merged = effective_proxy_headers(loc, &s);
         assert!(merged.contains(&("X-A", "1")));
@@ -5638,14 +6590,32 @@ mod tests {
                  location /forced-on  { proxy_pass http://127.0.0.1:1; proxy_request_buffering on; } }
             server { listen 127.0.0.1:18081; location / { proxy_pass http://127.0.0.1:1; } }"#,
         );
-        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        let s = r
+            .match_server("127.0.0.1:18080".parse().unwrap(), None)
+            .unwrap()
+            .clone();
         // server 级 off 被 location 继承
-        assert!(!Router::match_location(&s, "/inherited").unwrap().proxy_request_buffering);
+        assert!(
+            !Router::match_location(&s, "/inherited")
+                .unwrap()
+                .proxy_request_buffering
+        );
         // location 级 on 覆盖 server 级 off
-        assert!(Router::match_location(&s, "/forced-on").unwrap().proxy_request_buffering);
+        assert!(
+            Router::match_location(&s, "/forced-on")
+                .unwrap()
+                .proxy_request_buffering
+        );
         // 未声明时默认 on（nginx 一致）
-        let s2 = r.match_server("127.0.0.1:18081".parse().unwrap(), None).unwrap().clone();
-        assert!(Router::match_location(&s2, "/").unwrap().proxy_request_buffering);
+        let s2 = r
+            .match_server("127.0.0.1:18081".parse().unwrap(), None)
+            .unwrap()
+            .clone();
+        assert!(
+            Router::match_location(&s2, "/")
+                .unwrap()
+                .proxy_request_buffering
+        );
     }
 
     #[test]
@@ -5653,9 +6623,23 @@ mod tests {
         let r = build(
             "server { listen 127.0.0.1:18080; proxy_request_buffering maybe; location / { proxy_pass http://127.0.0.1:1; } }",
         );
-        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
-        assert!(Router::match_location(&s, "/").unwrap().proxy_request_buffering, "非法取值应回落默认 on");
-        assert!(r.warnings.iter().any(|w| w.contains("proxy_request_buffering")), "{:?}", r.warnings);
+        let s = r
+            .match_server("127.0.0.1:18080".parse().unwrap(), None)
+            .unwrap()
+            .clone();
+        assert!(
+            Router::match_location(&s, "/")
+                .unwrap()
+                .proxy_request_buffering,
+            "非法取值应回落默认 on"
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("proxy_request_buffering")),
+            "{:?}",
+            r.warnings
+        );
     }
 
     #[test]
@@ -5668,7 +6652,10 @@ mod tests {
                      proxy_ssl_verify on; proxy_ssl_name from-loc; } }
             server { listen 127.0.0.1:18081; location / { proxy_pass http://127.0.0.1:1; } }"#,
         );
-        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        let s = r
+            .match_server("127.0.0.1:18080".parse().unwrap(), None)
+            .unwrap()
+            .clone();
         // server 级 off + name 被 location 继承
         let inh = Router::match_location(&s, "/inherited").unwrap();
         assert!(!inh.proxy_tls.verify);
@@ -5678,7 +6665,10 @@ mod tests {
         assert!(ovr.proxy_tls.verify);
         assert_eq!(ovr.proxy_tls.server_name.as_deref(), Some("from-loc"));
         // 未声明时默认 verify on、发 SNI、无覆盖名/无 trusted cert
-        let s2 = r.match_server("127.0.0.1:18081".parse().unwrap(), None).unwrap().clone();
+        let s2 = r
+            .match_server("127.0.0.1:18081".parse().unwrap(), None)
+            .unwrap()
+            .clone();
         let dflt = Router::match_location(&s2, "/").unwrap();
         assert!(dflt.proxy_tls.verify);
         assert!(dflt.proxy_tls.send_sni);
@@ -5691,12 +6681,19 @@ mod tests {
         let r = build(
             "server { listen 127.0.0.1:18080; proxy_ssl_verify maybe; location / { proxy_pass https://127.0.0.1:1; } }",
         );
-        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        let s = r
+            .match_server("127.0.0.1:18080".parse().unwrap(), None)
+            .unwrap()
+            .clone();
         assert!(
             Router::match_location(&s, "/").unwrap().proxy_tls.verify,
             "非法取值应回落默认 verify on"
         );
-        assert!(r.warnings.iter().any(|w| w.contains("proxy_ssl_verify")), "{:?}", r.warnings);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("proxy_ssl_verify")),
+            "{:?}",
+            r.warnings
+        );
     }
 
     #[test]
@@ -5716,7 +6713,10 @@ mod tests {
                  location /a { add_header X-L 1; }
                  location /b { return 200 x; } }"#,
         );
-        let s = r.match_server("127.0.0.1:18080".parse().unwrap(), None).unwrap().clone();
+        let s = r
+            .match_server("127.0.0.1:18080".parse().unwrap(), None)
+            .unwrap()
+            .clone();
         let loc_a = Router::match_location(&s, "/a").unwrap();
         assert_eq!(effective_add_headers(Some(loc_a), &s).len(), 1);
         let loc_b = Router::match_location(&s, "/b").unwrap();
@@ -5737,12 +6737,16 @@ mod tests {
             .clone();
         assert_eq!(s.client_max_body_size, Some(1024 * 1024), "nginx 默认 1m");
         assert_eq!(
-            Router::match_location(&s, "/small").unwrap().client_max_body_size,
+            Router::match_location(&s, "/small")
+                .unwrap()
+                .client_max_body_size,
             None,
             "location 未显式配置时继承 server"
         );
         assert_eq!(
-            Router::match_location(&s, "/big").unwrap().client_max_body_size,
+            Router::match_location(&s, "/big")
+                .unwrap()
+                .client_max_body_size,
             Some(u64::MAX),
             "0 = 不限制，需覆盖继承的 1m"
         );
@@ -5752,7 +6756,11 @@ mod tests {
             .match_server("127.0.0.1:18081".parse().unwrap(), None)
             .unwrap()
             .clone();
-        assert_eq!(s2.client_max_body_size, Some(u64::MAX), "server 级 0 同样不限制");
+        assert_eq!(
+            s2.client_max_body_size,
+            Some(u64::MAX),
+            "server 级 0 同样不限制"
+        );
     }
 
     #[test]
@@ -5801,15 +6809,19 @@ mod tests {
 
         // 显式单版本集合：可裁剪掉另一版本
         assert_eq!(
-            tls_of(r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
-                 ssl_certificate_key k.pem; ssl_protocols TLSv1.2; }"#)
-                .enabled,
+            tls_of(
+                r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
+                 ssl_certificate_key k.pem; ssl_protocols TLSv1.2; }"#
+            )
+            .enabled,
             vec![TlsVersion::Tls12]
         );
         assert_eq!(
-            tls_of(r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
-                 ssl_certificate_key k.pem; ssl_protocols TLSv1.3; }"#)
-                .enabled,
+            tls_of(
+                r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
+                 ssl_certificate_key k.pem; ssl_protocols TLSv1.3; }"#
+            )
+            .enabled,
             vec![TlsVersion::Tls13]
         );
         // 四个都写：升序去重，含旧版本
@@ -5819,23 +6831,32 @@ mod tests {
         );
         assert_eq!(
             all.enabled,
-            vec![TlsVersion::Tls10, TlsVersion::Tls11, TlsVersion::Tls12, TlsVersion::Tls13]
+            vec![
+                TlsVersion::Tls10,
+                TlsVersion::Tls11,
+                TlsVersion::Tls12,
+                TlsVersion::Tls13
+            ]
         );
         assert!(all.wants_legacy());
 
         // 默认（不写任何 TLS 协议指令）= TLS1.2 + TLS1.3
         assert_eq!(
-            tls_of(r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
-                 ssl_certificate_key k.pem; }"#)
-                .enabled,
+            tls_of(
+                r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
+                 ssl_certificate_key k.pem; }"#
+            )
+            .enabled,
             vec![TlsVersion::Tls12, TlsVersion::Tls13]
         );
 
         // ssl_min_version 别名仍生效：min=TLSv1.3 → 只剩 1.3
         assert_eq!(
-            tls_of(r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
-                 ssl_certificate_key k.pem; ssl_min_version TLSv1.3; }"#)
-                .enabled,
+            tls_of(
+                r#"server { listen 127.0.0.1:18443 ssl; ssl_certificate c.pem;
+                 ssl_certificate_key k.pem; ssl_min_version TLSv1.3; }"#
+            )
+            .enabled,
             vec![TlsVersion::Tls13]
         );
 
@@ -5856,7 +6877,10 @@ mod tests {
                server { listen 127.0.0.1:18080 default_server; server_name chosen; }"#,
         );
         let a: SocketAddr = "127.0.0.1:18080".parse().unwrap();
-        assert_eq!(r.match_server(a, Some("unknown.com")).unwrap().server_name, "chosen");
+        assert_eq!(
+            r.match_server(a, Some("unknown.com")).unwrap().server_name,
+            "chosen"
+        );
         assert_eq!(r.match_server(a, None).unwrap().server_name, "chosen");
     }
 
@@ -5882,16 +6906,23 @@ mod tests {
             }
         "#;
         let (r1, fresh1) =
-            Router::rebuild_routing_with_specs(&cfg(updated), &PathBuf::from("."), &bound)
-                .unwrap();
+            Router::rebuild_routing_with_specs(&cfg(updated), &PathBuf::from("."), &bound).unwrap();
 
         let a: SocketAddr = "127.0.0.1:18090".parse().unwrap();
         // 路由表更新：新增的 location 现在能命中，正文也换成新值
         let srv = r1.match_server(a, Some("reload.test")).unwrap();
         let loc = Router::match_location(srv, "/added").unwrap();
-        assert!(loc.ret.as_ref().and_then(|r| r.text.as_ref()).is_some_and(|b| b.contains("added")));
+        assert!(loc
+            .ret
+            .as_ref()
+            .and_then(|r| r.text.as_ref())
+            .is_some_and(|b| b.contains("added")));
         let loc_x = Router::match_location(srv, "/x").unwrap();
-        assert!(loc_x.ret.as_ref().and_then(|r| r.text.as_ref()).is_some_and(|b| b.contains("new")));
+        assert!(loc_x
+            .ret
+            .as_ref()
+            .and_then(|r| r.text.as_ref())
+            .is_some_and(|b| b.contains("new")));
 
         // 监听集合原样保留（即便新配置里没提这个地址，也不新增/删除 socket）
         let addrs = |ls: &[Listener]| ls.iter().map(|l| l.addr).collect::<Vec<_>>();
@@ -5907,7 +6938,11 @@ mod tests {
         let (r2, fresh2) =
             Router::rebuild_routing_with_specs(&cfg(with_new_port), &PathBuf::from("."), &bound)
                 .unwrap();
-        assert_eq!(addrs(&r2.listeners), addrs(&bound), "热重载不绑定新监听地址（需重启）");
+        assert_eq!(
+            addrs(&r2.listeners),
+            addrs(&bound),
+            "热重载不绑定新监听地址（需重启）"
+        );
         assert_eq!(
             fresh2.len(),
             2,
@@ -5922,7 +6957,10 @@ mod tests {
             .match_server(format!("127.0.0.1:{port}").parse().unwrap(), None)
             .unwrap()
             .clone();
-        Router::match_location(&s, path).unwrap().rewrite_steps.clone()
+        Router::match_location(&s, path)
+            .unwrap()
+            .rewrite_steps
+            .clone()
     }
 
     fn step_kind(st: &RewriteStep) -> &'static str {
@@ -5960,7 +6998,9 @@ mod tests {
             other => panic!("期望 set，实际 {other:?}"),
         }
         assert!(
-            r.warnings.iter().all(|w| !w.contains("'set'") && !w.contains("'if'")),
+            r.warnings
+                .iter()
+                .all(|w| !w.contains("'set'") && !w.contains("'if'")),
             "set/if 不该再被当成未知指令：{:?}",
             r.warnings
         );
@@ -6042,6 +7082,42 @@ mod tests {
         }
     }
 
+    /// nginx 里最常见的一条判定是"这个头没带"：`if ($x = "")`。括号清理若顺手把所有空串
+    /// 滤掉，空串右值就消失了，整条 vhost 被判成"缺少右值"起不来。右值真的缺失时仍要报错。
+    #[test]
+    fn if_accepts_an_empty_string_right_side() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18078;
+                 location /a { if ($http_x_key = "") { return 401; } }
+                 location /b { if ($cookie_sid != "") { return 200; } }
+                 location /c { if ( $http_x_key = "" ) { return 401; } }
+               }"#,
+        );
+        let cond = |p: &str| match &steps_of(&r, 18078, p)[0] {
+            RewriteStep::If { cond, .. } => cond.clone(),
+            other => panic!("{p}: 期望 if，实际 {other:?}"),
+        };
+        assert_eq!(cond("/a").lhs, "$http_x_key");
+        assert_eq!(cond("/a").rhs.as_deref(), Some(""), "引号空串就是右值本身");
+        assert_eq!(cond("/b").rhs.as_deref(), Some(""));
+        assert_eq!(
+            cond("/c").rhs.as_deref(),
+            Some(""),
+            "括号与 token 间的空格不该改变语义"
+        );
+        // 真的少了右值：= 是二元比较，不能退化成"非空即真"
+        for tail in [
+            "if ($http_x_key =) { return 401; } }",
+            "if ($http_x_key != ) { return 401; } }",
+        ] {
+            let conf = format!("server {{ listen 127.0.0.1:18079; location / {{ {tail} }}");
+            assert!(
+                Router::build(&cfg(&conf), &PathBuf::from(".")).is_err(),
+                "应当拒绝：{tail}"
+            );
+        }
+    }
+
     /// server 级 REWRITE 相位：过去只留一行"已被忽略"的告警，于是
     /// `server { return 301 https://…; }` 这种跳转专用 vhost 静默变成 404。
     /// 现在这四条真的进结构体（顺序与形态由 parse_* 把关）。
@@ -6076,9 +7152,8 @@ mod tests {
 
     #[test]
     fn server_level_rewrite_without_return_leaves_ret_none() {
-        let r = build(
-            r#"server { listen 127.0.0.1:18075; set $a 1; location / { return 200 ok; } }"#,
-        );
+        let r =
+            build(r#"server { listen 127.0.0.1:18075; set $a 1; location / { return 200 ok; } }"#);
         let addr = "127.0.0.1:18075".parse().unwrap();
         let srv = &r.groups[&addr].servers[0];
         assert_eq!(srv.rewrite_steps.len(), 1);
@@ -6162,16 +7237,25 @@ mod tests {
         assert_eq!(r.still_zones.get("lkg"), Some(&(32 * 1024 * 1024)));
 
         let a = loc_at(&r, 18081, 0);
-        assert_eq!(a.still_online, None, "没写 still_online 的 location 默认关闭");
+        assert_eq!(
+            a.still_online, None,
+            "没写 still_online 的 location 默认关闭"
+        );
         assert_eq!(a.still_online_max_age, STILL_ONLINE_DEFAULT_MAX_AGE);
         assert_eq!(a.still_online_max_body, STILL_ONLINE_DEFAULT_MAX_BODY);
         assert_eq!(a.still_online_retry, std::time::Duration::from_secs(5));
-        assert_eq!(a.still_online_retry_max, std::time::Duration::from_secs(300));
+        assert_eq!(
+            a.still_online_retry_max,
+            std::time::Duration::from_secs(300)
+        );
         assert_eq!(
             a.still_online_retry_deadline,
             std::time::Duration::from_secs(1800)
         );
-        assert!(!a.still_online_allow_credentials, "凭证闸门默认关，且只能显式 on 打开");
+        assert!(
+            !a.still_online_allow_credentials,
+            "凭证闸门默认关，且只能显式 on 打开"
+        );
 
         let b = loc_at(&r, 18081, 1);
         assert_eq!(b.still_online.as_deref(), Some("lkg"));
@@ -6202,7 +7286,11 @@ mod tests {
         "#;
         let r = build(conf);
         let a = loc_at(&r, 18082, 0);
-        assert_eq!(a.still_online.as_deref(), Some("lkg"), "server 级开区，location 继承");
+        assert_eq!(
+            a.still_online.as_deref(),
+            Some("lkg"),
+            "server 级开区，location 继承"
+        );
         assert_eq!(a.still_online_max_age, std::time::Duration::from_secs(3600));
 
         let b = loc_at(&r, 18082, 1);
@@ -6210,7 +7298,11 @@ mod tests {
 
         let c = loc_at(&r, 18082, 2);
         assert_eq!(c.still_online, None, "off 必须能单点关掉继承来的副本区");
-        assert!(r.warnings.is_empty(), "继承区里写子参数不该告警：{:?}", r.warnings);
+        assert!(
+            r.warnings.is_empty(),
+            "继承区里写子参数不该告警：{:?}",
+            r.warnings
+        );
     }
 
     #[test]
@@ -6233,13 +7325,11 @@ mod tests {
         // apply_learning 只遍历已经存在的区：区名写错，这行学习配置一行都不会生效，
         // 所以按队列学习/副本区的先例硬失败，而不是让运维去 /metrics 里猜。
         let err = Router::build(
-            &cfg(
-                r#"
+            &cfg(r#"
                 proxy_cache_path /tmp/c keys_zone=pages:16m;
                 proxy_cache_learning ghost sketch=8k;
                 server { listen 127.0.0.1:18086; location / { proxy_pass http://127.0.0.1:1; } }
-            "#,
-            ),
+            "#),
             &PathBuf::from("."),
         )
         .unwrap_err();
@@ -6255,7 +7345,9 @@ mod tests {
             "#,
         );
         assert!(
-            r.warnings.iter().all(|w| !w.contains("proxy_cache_learning")),
+            r.warnings
+                .iter()
+                .all(|w| !w.contains("proxy_cache_learning")),
             "区名写对不该有意见：{:?}",
             r.warnings
         );
@@ -6327,7 +7419,10 @@ mod tests {
         let p = &srv.front_proxy.profiles[0];
         assert_eq!(p.probes.len(), 2);
         assert_eq!(p.probes[1].substr.as_deref(), Some("edge-sub"));
-        assert_eq!(p.ip_headers, vec!["x-real-client".to_string(), "x-forwarded-for".to_string()]);
+        assert_eq!(
+            p.ip_headers,
+            vec!["x-real-client".to_string(), "x-forwarded-for".to_string()]
+        );
         assert_eq!(p.trust.len(), 1);
         assert_eq!(p.country_header.as_deref(), Some("x-front-country"));
 
@@ -6346,13 +7441,15 @@ mod tests {
         // 一个可信网段都没有的 egress：出口优化一条都不会生效
         let no_root = "front_proxy edge_d { probe x; ip_header y; }
                        server { listen 127.0.0.1:18261; front_proxy_mode egress; }";
-        let e = Router::build(&cfg(no_root), &PathBuf::from(".")).expect_err("无授权根的 egress 是空转");
+        let e = Router::build(&cfg(no_root), &PathBuf::from("."))
+            .expect_err("无授权根的 egress 是空转");
         assert!(e.to_string().contains("不会生效"), "{e}");
 
         // auto_trust 写在非 egress 档上：读起来像"已经在按 profile 的网段改地址"，运行时一行不跑
         let idle_trust = "front_proxy edge_i { probe x; ip_header y; trust 10.0.0.0/8; }
                           server { listen 127.0.0.1:18261; front_proxy_mode detect; front_proxy_auto_trust on; }";
-        let e = Router::build(&cfg(idle_trust), &PathBuf::from(".")).expect_err("detect 档下的 auto_trust 是空转");
+        let e = Router::build(&cfg(idle_trust), &PathBuf::from("."))
+            .expect_err("detect 档下的 auto_trust 是空转");
         let msg = e.to_string();
         assert!(msg.contains("永远不生效") && msg.contains("detect"), "{e}");
 
@@ -6367,9 +7464,14 @@ mod tests {
         "#;
         let r = Router::build(&cfg(twice), &PathBuf::from(".")).unwrap();
         let addr3: SocketAddr = "127.0.0.1:18264".parse().unwrap();
-        assert_eq!(r.groups[&addr3].servers[0].front_proxy.mode, FrontProxyMode::Detect);
+        assert_eq!(
+            r.groups[&addr3].servers[0].front_proxy.mode,
+            FrontProxyMode::Detect
+        );
         assert!(
-            r.warnings.iter().any(|w| w.contains("front_proxy_mode") && w.contains("只有第一条生效")),
+            r.warnings
+                .iter()
+                .any(|w| w.contains("front_proxy_mode") && w.contains("只有第一条生效")),
             "{:?}",
             r.warnings
         );
@@ -6382,7 +7484,8 @@ mod tests {
         let dup = "front_proxy edge_e { probe x; trust 10.0.0.0/8; }
                    front_proxy edge_E { probe y; trust 10.0.0.0/8; }
                    server { listen 127.0.0.1:18261; front_proxy_mode detect; }";
-        let e = Router::build(&cfg(dup), &PathBuf::from(".")).expect_err("同名（不分大小写）该否决");
+        let e =
+            Router::build(&cfg(dup), &PathBuf::from(".")).expect_err("同名（不分大小写）该否决");
         assert!(e.to_string().contains("重复声明"), "{e}");
 
         // 三条只留痕的：没有探针、没有 ip_header、声明了却没有任何 vhost 启用
@@ -6424,7 +7527,8 @@ mod tests {
     /// shapes this codebase refuses to let merely "look configured".
     #[test]
     fn schedule_gate_references_are_resolved_at_build_time() {
-        let win = "schedule_window office { tz +08:00; open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; }";
+        let win =
+            "schedule_window office { tz +08:00; open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; }";
         let good = format!(
             "{win}\nserver {{ listen 127.0.0.1:18331;\n  schedule_access office;\n  location / {{ return 200; }}\n  location /open {{ schedule_access office; return 200; }}\n}}\n"
         );
@@ -6443,27 +7547,34 @@ mod tests {
 
         // misspelled name: hard-fail, and the error must spell out which name it is and which ones exist.
         let typo = format!("{win}\nserver {{ listen 127.0.0.1:18332; location / {{ schedule_access offic; return 200; }} }}");
-        let e = Router::build(&cfg(&typo), &PathBuf::from(".")).expect_err("a misspelled window name should be rejected");
+        let e = Router::build(&cfg(&typo), &PathBuf::from("."))
+            .expect_err("a misspelled window name should be rejected");
         let msg = e.to_string();
         assert!(msg.contains("offic") && msg.contains("office"), "{msg}");
 
         // writing schedule_access with no window declared at all: rejected the same way, not "open forever".
-        let orphan = "server { listen 127.0.0.1:18333; location / { schedule_access office; return 200; } }";
-        let e = Router::build(&cfg(orphan), &PathBuf::from(".")).expect_err("no window declared should be rejected");
+        let orphan =
+            "server { listen 127.0.0.1:18333; location / { schedule_access office; return 200; } }";
+        let e = Router::build(&cfg(orphan), &PathBuf::from("."))
+            .expect_err("no window declared should be rejected");
         assert!(e.to_string().contains("no schedule_window at all"), "{e}");
 
         // a missing argument and a duplicate both stop at -t.
         let noarg = format!("{win}\nserver {{ listen 127.0.0.1:18334; location / {{ schedule_access; return 200; }} }}");
         assert!(Router::build(&cfg(&noarg), &PathBuf::from(".")).is_err());
         let twice = format!("{win}\nserver {{ listen 127.0.0.1:18335; location / {{ schedule_access office; schedule_access office; return 200; }} }}");
-        let e = Router::build(&cfg(&twice), &PathBuf::from(".")).expect_err("two windows on one route should be rejected");
+        let e = Router::build(&cfg(&twice), &PathBuf::from("."))
+            .expect_err("two windows on one route should be rejected");
         assert!(e.to_string().contains("more than once"), "{e}");
 
         // declared but referenced by nobody => a warning (the window still flips but no route is blocked).
-        let unused = format!("{win}\nserver {{ listen 127.0.0.1:18336; location / {{ return 200; }} }}");
+        let unused =
+            format!("{win}\nserver {{ listen 127.0.0.1:18336; location / {{ return 200; }} }}");
         let r = build(&unused);
         assert!(
-            r.warnings.iter().any(|w| w.contains("office") && w.contains("schedule_access")),
+            r.warnings
+                .iter()
+                .any(|w| w.contains("office") && w.contains("schedule_access")),
             "declared but unreferenced yet no warning: {:?}",
             r.warnings
         );

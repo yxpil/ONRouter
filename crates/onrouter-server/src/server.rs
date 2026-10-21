@@ -27,9 +27,7 @@ use bytes::{Buf, Bytes};
 use futures_util::{FutureExt, StreamExt};
 use http_body_util::{BodyExt, BodyStream, Empty, Full};
 use hyper::body::{Body, Frame, Incoming};
-use hyper::header::{
-    HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE, SERVER, VARY,
-};
+use hyper::header::{HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE, SERVER, VARY};
 use hyper::server::conn::{http1, http2};
 use hyper::service::Service;
 use hyper::{Method, Request, Response, StatusCode, Version};
@@ -39,9 +37,7 @@ use tokio::sync::{watch, OwnedSemaphorePermit};
 
 use crate::access_log::{AccessLog, LogRecord};
 use crate::compress::{accepts_gzip, GzipBody};
-use crate::engine::{
-    self, HandlerRegistry, Phase, RequestCtx, StreamEvent, StreamSink,
-};
+use crate::engine::{self, HandlerRegistry, Phase, RequestCtx, StreamEvent, StreamSink};
 use crate::lua_engine::LuaEngine;
 use crate::proxy::{ProxyBody, ProxyEngine, ProxyOpts, ProxyTimeouts};
 use crate::proxy_cache::CacheHit;
@@ -68,7 +64,6 @@ fn unix_now() -> f64 {
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
 }
-
 
 /// 响应体错误类型：hyper::Error 无公开构造器，代理层无法在响应体中途表达
 /// “上游读超时”这类自定义错误，因此统一擦除成盒装错误（hyper/h3 都接受该类型）。
@@ -156,10 +151,7 @@ impl AppState {
 
     /// 热重载成功后更新证书文件清单（新配置可能换路径）。
     pub fn set_cert_files(&self, files: Vec<std::path::PathBuf>) {
-        *self
-            .cert_files
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = files;
+        *self.cert_files.write().unwrap_or_else(|p| p.into_inner()) = files;
     }
 }
 
@@ -193,7 +185,10 @@ fn empty_body() -> RespBody {
 // ==================== 监听与 accept 循环 ====================
 
 /// 按配置地址创建监听 socket（backlog、ipv6only、SO_REUSEADDR）
-pub fn bind_listener(l: &crate::router::Listener, default_backlog: u32) -> Result<TcpListener, AppError> {
+pub fn bind_listener(
+    l: &crate::router::Listener,
+    default_backlog: u32,
+) -> Result<TcpListener, AppError> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
     let addr = l.addr;
@@ -243,26 +238,29 @@ pub async fn serve(
 ) {
     let addr = listener.addr;
     let tls: Option<TlsAcceptor> = match &listener.tls {
-        Some(opts) => match tls::make_acceptor(opts, &listener.ssl_cert_scripts, Arc::clone(&state.lua)) {
-            Ok(acc) => {
-                let names: Vec<String> = opts
-                    .specs
-                    .iter()
-                    .flat_map(|s| s.names.clone())
-                    .collect();
-                let protos = format!("{:?}", opts.protocols.normalized().enabled);
-                log_info!(
-                    "{addr} TLS 就绪（协议 {protos}，ALPN {:?}，证书名 {names:?}）",
-                    if opts.http2 { "h2,http/1.1" } else { "http/1.1" }
-                );
-                Some(acc)
+        Some(opts) => {
+            match tls::make_acceptor(opts, &listener.ssl_cert_scripts, Arc::clone(&state.lua)) {
+                Ok(acc) => {
+                    let names: Vec<String> =
+                        opts.specs.iter().flat_map(|s| s.names.clone()).collect();
+                    let protos = format!("{:?}", opts.protocols.normalized().enabled);
+                    log_info!(
+                        "{addr} TLS 就绪（协议 {protos}，ALPN {:?}，证书名 {names:?}）",
+                        if opts.http2 {
+                            "h2,http/1.1"
+                        } else {
+                            "http/1.1"
+                        }
+                    );
+                    Some(acc)
+                }
+                Err(e) => {
+                    // 证书有问题就不能"降级成明文"继续服务——那会让 https 的调用方拿到意外结果
+                    log_error!("{addr} TLS 配置无效: {e}，该监听退出");
+                    return;
+                }
             }
-            Err(e) => {
-                // 证书有问题就不能"降级成明文"继续服务——那会让 https 的调用方拿到意外结果
-                log_error!("{addr} TLS 配置无效: {e}，该监听退出");
-                return;
-            }
-        },
+        }
         None => None,
     };
     let scheme = if tls.is_some() { "https" } else { "http" };
@@ -277,7 +275,10 @@ pub async fn serve(
     } else {
         None
     };
-    log_info!("监听 {scheme}://{addr}（backlog={})", listener.backlog.unwrap_or(state.settings.accept_backlog));
+    log_info!(
+        "监听 {scheme}://{addr}（backlog={})",
+        listener.backlog.unwrap_or(state.settings.accept_backlog)
+    );
 
     let mut tasks = tokio::task::JoinSet::new();
     let mut backoff = Duration::from_millis(1);
@@ -342,7 +343,10 @@ pub(crate) async fn drain_connections(
     if tasks.is_empty() {
         return;
     }
-    log_info!("{addr} 停止接收，等待 {} 条在途连接结束（最多 {grace:?}）", tasks.len());
+    log_info!(
+        "{addr} 停止接收，等待 {} 条在途连接结束（最多 {grace:?}）",
+        tasks.len()
+    );
     let started = Instant::now();
     while !tasks.is_empty() {
         let remaining = grace.saturating_sub(started.elapsed());
@@ -389,7 +393,11 @@ fn spawn_connection(
             None => {
                 // 明文且监听开了 http2：嗅探 HTTP/2 客户端连接前导（prior-knowledge h2c），
                 // 命中就按 h2c 服务，否则回落到 HTTP/1.1（peek 不消费字节，h1 仍能完整读请求行）
-                let h2c = if enable_h2c { sniff_h2c_preface(&stream).await } else { false };
+                let h2c = if enable_h2c {
+                    sniff_h2c_preface(&stream).await
+                } else {
+                    false
+                };
                 let meta = Arc::new(ConnMeta {
                     listener,
                     peer: Some(peer),
@@ -401,8 +409,10 @@ fn spawn_connection(
                 drive(state, TokioIo::new(stream), meta, shutdown).await;
             }
             Some(acceptor) => {
-                let handshake =
-                    tokio::time::timeout(state.settings.tls_handshake_timeout, acceptor.accept(stream));
+                let handshake = tokio::time::timeout(
+                    state.settings.tls_handshake_timeout,
+                    acceptor.accept(stream),
+                );
                 let (tls_stream, h2) = match handshake.await {
                     Ok(Ok(pair)) => pair,
                     Ok(Err(e)) => {
@@ -412,7 +422,10 @@ fn spawn_connection(
                     }
                     Err(_) => {
                         crate::metrics::get().on_tls_handshake_failure();
-                        log_debug!("TLS 握手超时（{:.0?}）{peer}", state.settings.tls_handshake_timeout);
+                        log_debug!(
+                            "TLS 握手超时（{:.0?}）{peer}",
+                            state.settings.tls_handshake_timeout
+                        );
                         return;
                     }
                 };
@@ -439,11 +452,8 @@ async fn sniff_h2c_preface(stream: &TcpStream) -> bool {
     let mut buf = [0u8; 24];
     let mut filled = 0usize;
     for _ in 0..32 {
-        let res = tokio::time::timeout(
-            Duration::from_millis(100),
-            stream.peek(&mut buf[filled..]),
-        )
-        .await;
+        let res =
+            tokio::time::timeout(Duration::from_millis(100), stream.peek(&mut buf[filled..])).await;
         match res {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => {
@@ -573,8 +583,7 @@ impl Drop for EmitGuard {
 impl Service<Request<Incoming>> for Gateway {
     type Response = BoxResponse;
     type Error = Infallible;
-    type Future =
-        Pin<Box<dyn Future<Output = Result<BoxResponse, Infallible>> + Send + 'static>>;
+    type Future = Pin<Box<dyn Future<Output = Result<BoxResponse, Infallible>> + Send + 'static>>;
 
     fn call(&self, mut req: Request<Incoming>) -> Self::Future {
         let state = Arc::clone(&self.state);
@@ -624,7 +633,8 @@ impl Service<Request<Incoming>> for Gateway {
                 .catch_unwind()
                 .await
             } else {
-                let breq = req.map(|b| b.map_err(|e| Box::new(e) as crate::proxy::BoxError).boxed());
+                let breq =
+                    req.map(|b| b.map_err(|e| Box::new(e) as crate::proxy::BoxError).boxed());
                 std::panic::AssertUnwindSafe(handle_request(
                     Arc::clone(&state),
                     Arc::clone(&meta),
@@ -684,10 +694,9 @@ fn finalize(
         parts.headers.remove(SERVER);
     }
     if must_close {
-        parts.headers.insert(
-            hyper::header::CONNECTION,
-            HeaderValue::from_static("close"),
-        );
+        parts
+            .headers
+            .insert(hyper::header::CONNECTION, HeaderValue::from_static("close"));
     }
     let head = rec.method == "HEAD";
 
@@ -728,7 +737,9 @@ fn finalize(
             // 压缩改变了字节数：移除 Content-Length（交由传输层分帧），标注 Content-Encoding: gzip，
             // 并按 nginx 追加 Vary: Accept-Encoding。
             parts.headers.remove(CONTENT_LENGTH);
-            parts.headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            parts
+                .headers
+                .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
             append_vary(&mut parts.headers);
             GzipBody::new(body, state.settings.gzip.comp_level).boxed()
         } else {
@@ -831,6 +842,15 @@ impl Drop for LoggedBody {
 /// `:authority` 伪头上，hyper 把它放进 URI 的 authority。只读 `Host` 的后果不是报错而是
 /// 静默串站：h2 上每个请求的 host 都是 None，于是永远落到 default_server（没配 default 时
 /// 全体落到 vhost 列表第一个）。绝对形式请求行（`GET http://host/ HTTP/1.1`）走同一条兜底。
+/// h2/h3 的请求体没有 `Content-Length`，也没有 `Transfer-Encoding: chunked`——字节就在
+/// DATA 帧里，流的 END_STREAM 标志就是体的结束。所以"这两个头有没有"在 h2/h3 上完全不能
+/// 用来判断"要不要读体"：实测过一个 64 KB 的 POST，`ctx.req_body` 是空的，源站收到的
+/// 请求连 Content-Length 都没有，等于**API 的写操作在 h2/h3 上被静默清空**，而 h1 一切正常。
+/// 对分帧协议一律按"可能带体"处理：没有 DATA 帧时读到的就是空字节，代价只有一次轮询。
+fn body_rides_on_framing(version: http::Version) -> bool {
+    matches!(version, http::Version::HTTP_2 | http::Version::HTTP_3)
+}
+
 fn request_host(headers: &hyper::HeaderMap, uri: &hyper::Uri) -> Option<String> {
     if let Some(h) = headers
         .get(HOST_NAME)
@@ -846,7 +866,7 @@ async fn handle_request(
     state: Arc<AppState>,
     meta: Arc<ConnMeta>,
     rec: Arc<LogRecord>,
-    req: Request<crate::proxy::ProxyReqBody>
+    req: Request<crate::proxy::ProxyReqBody>,
 ) -> BoxResponse {
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
@@ -864,13 +884,21 @@ async fn handle_request(
     }
     // 头块总额：hyper 的解析上限留了余量（见 PARSE_CEILING_BYTES），这里按 nginx 的额度自己判，
     // 才能把"URI 太长"和"头太多"分开告诉客户端
-    let head_bytes = headers
-        .iter()
-        .fold(0usize, |acc, (k, v)| acc + k.as_str().len() + v.as_bytes().len() + 4);
+    let head_bytes = headers.iter().fold(0usize, |acc, (k, v)| {
+        acc + k.as_str().len() + v.as_bytes().len() + 4
+    });
     if head_bytes > MAX_HEADER_BYTES {
         return error_page(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
     }
     if version == Version::HTTP_11 && headers.get(HOST_NAME).is_none() {
+        return error_page(StatusCode::BAD_REQUEST);
+    }
+    // RFC 9112 §6.1：一个请求**只能有一条** Host。多条时 nginx 回 400；以前我们悄悄取第一条，
+    // 而第一条常常是客户端库自动加的 `127.0.0.1:端口`（显式写的那条在后面）——于是请求落到
+    // 该端口的默认站点：一个"看起来完全正常"的跨站点内容路由错误。宁可拒掉，不猜。
+    let host_lines = headers.get_all(HOST_NAME).iter().count();
+    if host_lines > 1 {
+        log_warn!("请求带 {host_lines} 条 Host 头，按 RFC 9112 拒绝（400）");
         return error_page(StatusCode::BAD_REQUEST);
     }
     // Transfer-Encoding：只接受纯 chunked；CL+TE 并存是请求走私的经典形态，一律拒绝
@@ -894,7 +922,11 @@ async fn handle_request(
         return error_page(StatusCode::BAD_REQUEST);
     }
     if let Some(v) = cl_values.first() {
-        if v.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok()).is_none() {
+        if v.to_str()
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .is_none()
+        {
             return error_page(StatusCode::BAD_REQUEST);
         }
     }
@@ -968,17 +1000,17 @@ async fn handle_request(
     apply_front_proxy(&server, &mut ctx, meta.peer);
     // 访问日志与 $remote_addr 保持一致：日志记录的是 realip 之后的客户端地址
     rec.set_remote(ctx.remote_addr.clone());
-    let conn_guards = match acquire_conn_guards(&state, &server, &ctx.remote_addr) {
+    // ---- 请求体：默认边读边限长缓冲；`proxy_request_buffering off` 的 proxy location 走流式转发 ----
+    // location 先匹配一次：limit_conn 允许写在 location 里，请求体上限也有 location 级覆盖。
+    let loc0 = Router::match_location(&server, ctx.effective_path());
+    let conn_guards = match acquire_conn_guards(&state, &server, loc0, &ctx) {
         Ok(g) => g,
         Err(resp) => return resp,
     };
-
-    // ---- 请求体：默认边读边限长缓冲；`proxy_request_buffering off` 的 proxy location 走流式转发 ----
-    let loc0 = Router::match_location(&server, ctx.effective_path());
     let limit = loc0
         .and_then(|l| l.client_max_body_size)
         .or(server.client_max_body_size);
-    let has_body = chunked || cl_values.first().is_some();
+    let has_body = chunked || cl_values.first().is_some() || body_rides_on_framing(version);
     // 流式条件：命中带 proxy_pass 且 buffering=off 的 location，且确实带请求体
     let stream_body = has_body
         && loc0
@@ -1013,7 +1045,9 @@ async fn handle_request(
                     // 体没读完就返回：必须断开，否则残留字节会被当成下一个请求
                     return close_now(error_page(StatusCode::PAYLOAD_TOO_LARGE));
                 }
-                Err(BodyFail::Timeout) => return close_now(error_page(StatusCode::REQUEST_TIMEOUT)),
+                Err(BodyFail::Timeout) => {
+                    return close_now(error_page(StatusCode::REQUEST_TIMEOUT))
+                }
                 Err(BodyFail::Io) => return close_now(error_page(StatusCode::BAD_REQUEST)),
             }
         } else {
@@ -1136,7 +1170,7 @@ async fn start_streaming_content(
         }
     };
 
-    let Some((status, headers)) = head else {
+    let Some((status, mut headers)) = head else {
         let mut final_ctx = take_ctx(shared);
         final_ctx.stream = None;
         *ctx = final_ctx;
@@ -1161,6 +1195,8 @@ async fn start_streaming_content(
             });
         }
     }
+    // 流式的头在 Head 帧就定型了，expires 在这里补上（与缓冲路径同一份判定）
+    headers.extend(expires_pairs(Some(loc), server, status));
     StreamStart::Streamed(stream_response(status, headers, rx))
 }
 
@@ -1248,7 +1284,8 @@ async fn read_body(
 ) -> Result<Bytes, BodyFail> {
     let mut stream = BodyStream::new(body);
     let mut out: Vec<u8> = Vec::new();
-    while let Some(frame) = tokio::time::timeout(timeout, stream.next()).await
+    while let Some(frame) = tokio::time::timeout(timeout, stream.next())
+        .await
         .map_err(|_| BodyFail::Timeout)?
     {
         match frame {
@@ -1275,7 +1312,11 @@ const SUB_FILTER_MAX_BUFFER: u64 = 8 << 20;
 
 /// 只读取文件的 `[start, start+len)` 窗口，而不是整份文件。
 /// 旧实现对任意 len 都 `fs::read` 全文件——range 截断与大响应体都会多读多占。
-async fn read_file_window(path: &std::path::Path, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
+async fn read_file_window(
+    path: &std::path::Path,
+    start: u64,
+    len: u64,
+) -> std::io::Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut f = tokio::fs::File::open(path).await?;
     if start > 0 {
@@ -1406,7 +1447,8 @@ pub async fn run_capture(
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (uri.to_string(), String::new()),
     };
-    let path = decode_and_normalize(&raw_path).ok_or_else(|| "subrequest: invalid uri".to_string())?;
+    let path =
+        decode_and_normalize(&raw_path).ok_or_else(|| "subrequest: invalid uri".to_string())?;
     let router = state.routing();
     let server = router
         .match_server(listener, parent.host.as_deref())
@@ -1764,7 +1806,9 @@ async fn process(
             if let Some((zone, key)) = &cache_target {
                 let lock = state.proxy_cache.cache_lock(zone, key);
                 let mut acquired = None;
-                if stale_response.is_some() && use_stale_allows(&loc.proxy_cache_use_stale, "updating") {
+                if stale_response.is_some()
+                    && use_stale_allows(&loc.proxy_cache_use_stale, "updating")
+                {
                     match lock.clone().try_lock_owned() {
                         Ok(g) => acquired = Some(g),
                         Err(_) => {
@@ -1845,7 +1889,10 @@ async fn process(
         // 流式上传转发到一半失败时后端已经收到过数据，回放副本只会掩盖问题。
         let so_target = match (&loc.still_online, &body) {
             (Some(zone), ProxyBody::Buffered(_)) if ctx.method.eq_ignore_ascii_case("GET") => {
-                Some((zone.clone(), build_cache_key(&loc.proxy_cache_key, ctx, &target)))
+                Some((
+                    zone.clone(),
+                    build_cache_key(&loc.proxy_cache_key, ctx, &target),
+                ))
             }
             _ => None,
         };
@@ -1903,7 +1950,13 @@ async fn process(
                         // cache_target 一定是 Some：revalidate_from 只在那条路径上才会被赋值
                         let (zone, key) = cache_target.clone().unwrap();
                         return serve_revalidated(
-                            state, loc, server, ctx, stored, (&zone, &key), upstream_resp.headers(),
+                            state,
+                            loc,
+                            server,
+                            ctx,
+                            stored,
+                            (&zone, &key),
+                            upstream_resp.headers(),
                         )
                         .await;
                     }
@@ -1936,14 +1989,12 @@ async fn process(
                 // 响应并运行过滤器（对齐 nginx：响应过滤器对代理响应同样生效，代价是关闭流式）；
                 // 否则保持既有流式转发路径。
                 if cache_target.is_none() {
-                    let hf = loc
-                        .lua_phases
-                        .iter()
-                        .find(|(p, n, _)| *p == Phase::Content && n.starts_with("header_filter_by_lua"));
-                    let bf = loc
-                        .lua_phases
-                        .iter()
-                        .find(|(p, n, _)| *p == Phase::Content && n.starts_with("body_filter_by_lua"));
+                    let hf = loc.lua_phases.iter().find(|(p, n, _)| {
+                        *p == Phase::Content && n.starts_with("header_filter_by_lua")
+                    });
+                    let bf = loc.lua_phases.iter().find(|(p, n, _)| {
+                        *p == Phase::Content && n.starts_with("body_filter_by_lua")
+                    });
                     if hf.is_none()
                         && bf.is_none()
                         && !has_wasm_filter(loc)
@@ -1957,13 +2008,21 @@ async fn process(
                             Ok(v) => v,
                             Err(e) => {
                                 log_error!("代理响应体收集失败: {e}");
-                                return error_response(ctx, server, Some(loc), 502).await;
+                                return error_response(
+                                    ctx,
+                                    server,
+                                    Some(loc),
+                                    crate::proxy::upstream_error_status(&e.to_string()),
+                                )
+                                .await;
                             }
                         };
                         let (status, hdrs, body) = buffered;
                         if so_write {
                             if let Some((zone, key)) = &so_target {
-                                store_still_online(state, loc, ctx, zone, key, status, &hdrs, &body);
+                                store_still_online(
+                                    state, loc, ctx, zone, key, status, &hdrs, &body,
+                                );
                             }
                         }
                         return build_buffered_response(
@@ -1985,7 +2044,13 @@ async fn process(
                         Ok(c) => c.to_bytes(),
                         Err(e) => {
                             log_error!("代理响应体收集失败: {e}");
-                            return error_response(ctx, server, Some(loc), 502).await;
+                            return error_response(
+                                ctx,
+                                server,
+                                Some(loc),
+                                crate::proxy::upstream_error_status(&e.to_string()),
+                            )
+                            .await;
                         }
                     };
                     ctx.body = Some(collected.to_vec());
@@ -2023,19 +2088,30 @@ async fn process(
                     Ok(c) => c.to_bytes(),
                     Err(e) => {
                         log_error!("代理响应体收集失败: {e}");
-                        return error_response(ctx, server, Some(loc), 502).await;
+                        return error_response(
+                            ctx,
+                            server,
+                            Some(loc),
+                            crate::proxy::upstream_error_status(&e.to_string()),
+                        )
+                        .await;
                     }
                 };
                 // 存可回放的头：剔除 hop-by-hop 与 content-length（回发时按 body 重算）
                 let hdrs: Vec<(String, String)> = parts
                     .headers
                     .iter()
-                    .filter(|(k, _)| !is_hop_by_hop(k.as_str()) && k.as_str().to_ascii_lowercase() != "content-length")
+                    .filter(|(k, _)| {
+                        !is_hop_by_hop(k.as_str())
+                            && k.as_str().to_ascii_lowercase() != "content-length"
+                    })
                     .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect();
                 // `proxy_ignore_headers`：被点名的头不再参与"能不能缓存、缓存多久"的判定，
                 // 但它们仍然照原样存下来、透传给客户端（nginx 是"停止处理"，不是"删除"）。
-                let counts = |name: &str| crate::proxy_cache::header_counts_for_cache(name, &loc.proxy_ignore_headers);
+                let counts = |name: &str| {
+                    crate::proxy_cache::header_counts_for_cache(name, &loc.proxy_ignore_headers)
+                };
                 let has_set_cookie = hdrs
                     .iter()
                     .any(|(k, _)| k.eq_ignore_ascii_case("set-cookie") && counts(k));
@@ -2045,8 +2121,12 @@ async fn process(
                     .unwrap_or(0);
                 let decided: Vec<(String, String)> =
                     hdrs.iter().filter(|(k, _)| counts(k)).cloned().collect();
-                let ttl =
-                    crate::proxy_cache::effective_ttl(&loc.proxy_cache_valid, status, &decided, now_unix);
+                let ttl = crate::proxy_cache::effective_ttl(
+                    &loc.proxy_cache_valid,
+                    status,
+                    &decided,
+                    now_unix,
+                );
                 let cacheable = ttl.is_some()
                     && !has_set_cookie
                     && !no_cache
@@ -2120,7 +2200,7 @@ async fn process(
                     }
                 }
                 log_error!("代理失败 {}{}: {e}", target, ctx.effective_path());
-                // 流式请求体超限是客户端的问题，按 413 回（其余转发失败才是 502）
+                // 流式请求体超限是客户端的问题，按 413 回（其余转发失败按上游语义分 504/502）
                 if e.contains(STREAM_BODY_LIMIT_ERR) {
                     return error_response(ctx, server, Some(loc), 413).await;
                 }
@@ -2129,7 +2209,8 @@ async fn process(
                     return error_response(ctx, server, Some(loc), 408).await;
                 }
                 // Still ONLine：后端连不上/超时——这才是"崩了"的主形态。有副本就顶住，
-                // 并把该 key 挂进脏表等恢复后重取；没有副本仍按 502 回（不编造内容）。
+                // 并把该 key 挂进脏表等恢复后重取；没有副本仍按上游失败的原始语义回
+                // （超时 504、连不上/坏响应 502，不编造内容）。
                 if so_read {
                     if let Some((zone, key)) = &so_target {
                         if let Some(resp) = serve_still_online(state, loc, server, ctx, zone, key) {
@@ -2141,9 +2222,10 @@ async fn process(
                         }
                     }
                 }
-                error_response(ctx, server, Some(loc), 502).await
+                let code = crate::proxy::upstream_error_status(&e);
+                error_response(ctx, server, Some(loc), code).await
             }
-        }
+        };
     }
 
     if let Some((_, name, src)) = loc.lua_phases.iter().find(|(p, _, _)| *p == Phase::Content) {
@@ -2187,21 +2269,26 @@ async fn process(
         if !ctx.done && ctx.body.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
             return serve_static_flow(state, ctx, server, loc, body, scope).await;
         }
-        
+
         // 执行 header_filter_by_lua（如果存在，用于修改响应头）
-        if let Some((_, hfilter_name, hfilter_src)) = loc.lua_phases.iter().find(|(p, n, _)| *p == Phase::Content && (n == "header_filter_by_lua" || n == "header_filter_by_lua_file")) {
+        if let Some((_, hfilter_name, hfilter_src)) = loc.lua_phases.iter().find(|(p, n, _)| {
+            *p == Phase::Content
+                && (n == "header_filter_by_lua" || n == "header_filter_by_lua_file")
+        }) {
             if run_lua(state, ctx, hfilter_name, hfilter_src).await {
                 log_error!("header_filter_by_lua 执行失败");
             }
         }
-        
+
         // 执行 body_filter_by_lua（如果存在）
-        if let Some((_, filter_name, filter_src)) = loc.lua_phases.iter().find(|(p, n, _)| *p == Phase::Content && (n == "body_filter_by_lua" || n == "body_filter_by_lua_file")) {
+        if let Some((_, filter_name, filter_src)) = loc.lua_phases.iter().find(|(p, n, _)| {
+            *p == Phase::Content && (n == "body_filter_by_lua" || n == "body_filter_by_lua_file")
+        }) {
             if let Some(response_body) = ctx.body.clone() {
                 // 设置 filter 参数
                 ctx.filter_chunk = Some(response_body);
                 ctx.filter_eof = true;
-                
+
                 // 执行过滤器
                 if run_lua(state, ctx, filter_name, filter_src).await {
                     log_error!("body_filter_by_lua 执行失败");
@@ -2209,7 +2296,7 @@ async fn process(
                     ctx.body = None;
                     return finish_response(ctx, server, Some(loc));
                 }
-                
+
                 // 读取修改后的 chunk
                 if let Some(modified_chunk) = ctx.filter_chunk.take() {
                     ctx.body = Some(modified_chunk);
@@ -2357,22 +2444,28 @@ async fn check_limit_req(
         let Some(zone) = state.limits.req_zone(&rule.zone) else {
             continue;
         };
-        let retry_after = match zone.admit(&ctx.remote_addr, rule.burst, vip.as_ref()) {
+        // key 按区声明的模板算：$remote_addr 是快路径，$cookie_sid/$http_x/$arg_ 走插值。
+        // 这一维上没值的请求不参与本区计数（nginx 同义），否则匿名流量会共用一个桶。
+        let Some(key) = crate::limit::zone_key(&zone.key_var, ctx) else {
+            log_debug!(
+                "limit_req '{}' 无 key（{} 展开为空），本区不限流",
+                rule.zone,
+                zone.key_var
+            );
+            continue;
+        };
+        let retry_after = match zone.admit(&key, rule.burst, vip.as_ref()) {
             crate::limit::Admit::Pass => continue,
             crate::limit::Admit::Reject { retry_after_secs } => retry_after_secs,
             crate::limit::Admit::Queued { wait_ms, permit } => {
-                log_debug!(
-                    "limit_req '{}' 排队 {wait_ms}ms: {}",
-                    rule.zone,
-                    ctx.remote_addr
-                );
+                log_debug!("limit_req '{}' 排队 {wait_ms}ms: {key}", rule.zone);
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                 // 名额用完立刻归还；预留的令牌不退（见 limit::Admit::Queued）
                 drop(permit);
                 continue;
             }
         };
-        log_debug!("limit_req '{}' 命中: {}", rule.zone, ctx.remote_addr);
+        log_debug!("limit_req '{}' 命中: {key}", rule.zone);
         crate::metrics::get().on_limit_req_rejected();
         ctx.status = state.limits.req_status;
         let mut resp = status_page(state.limits.req_status);
@@ -2392,7 +2485,12 @@ fn apply_realip(server: &Server, ctx: &mut RequestCtx, peer: Option<std::net::So
     }
     if let Some(peer) = peer {
         if let Some(real) = server.real_ip.apply(peer.ip(), &ctx.req_headers) {
-            log_debug!("realip：{} → {}（源自 ${}", peer, real, server.real_ip.header);
+            log_debug!(
+                "realip：{} → {}（源自 ${}",
+                peer,
+                real,
+                server.real_ip.header
+            );
             ctx.remote_addr = real;
         }
     }
@@ -2418,7 +2516,12 @@ fn apply_front_proxy(server: &Server, ctx: &mut RequestCtx, peer: Option<std::ne
         trusted: &server.real_ip.trusted,
         recursive: server.real_ip.recursive,
     };
-    let d = fp::decide(&server.front_proxy, &ctx.req_headers, peer.map(|p| p.ip()), &realip);
+    let d = fp::decide(
+        &server.front_proxy,
+        &ctx.req_headers,
+        peer.map(|p| p.ip()),
+        &realip,
+    );
     let Some(name) = d.profile else {
         return;
     };
@@ -2446,22 +2549,31 @@ fn apply_front_proxy(server: &Server, ctx: &mut RequestCtx, peer: Option<std::ne
     }
 }
 
-/// limit_conn：在 ACCESS 之前按客户端 IP 占用并发额度；超限返回 nginx 风格错误页。
+/// limit_conn：在 ACCESS 之前按区声明的 key（客户端地址或请求期变量）占用并发额度；
+/// 超限返回 nginx 风格错误页。key 在这一维上没值的请求不计数，与 limit_req 同一口径。
+///
+/// `loc` 是按**改写前的原始 URI** 匹配出来的那一级：额度必须在读请求体之前就占住，
+/// 而 REWRITE 要到 `run_ingress` 里才跑。nginx 在 PREACCESS 相位判定，那时改写已经发生，
+/// 所以"用 rewrite 把流量搬进另一个带不同 limit_conn 的 location"这一种配置上两边不同——
+/// 绝大多数配置没有这种改写，写了 limit_conn 的那一级就是请求实际落到的那一级。
 fn acquire_conn_guards(
     state: &AppState,
     server: &Server,
-    remote_addr: &str,
+    loc: Option<&Location>,
+    ctx: &RequestCtx,
 ) -> Result<Vec<crate::limit::ConnGuard>, BoxResponse> {
     let mut guards = Vec::new();
-    for rule in &server.limit_conn {
-        match state
-            .limits
-            .conn_zone(&rule.zone)
-            .and_then(|z| z.try_acquire(remote_addr, rule.number))
-        {
+    for rule in router::effective_limit_conn(loc, server) {
+        let Some(zone) = state.limits.conn_zone(&rule.zone) else {
+            continue;
+        };
+        let Some(key) = crate::limit::zone_key(&zone.key_var, ctx) else {
+            continue;
+        };
+        match zone.try_acquire(&key, rule.number) {
             Some(g) => guards.push(g),
             None => {
-                log_debug!("limit_conn '{}' 命中: {}", rule.zone, remote_addr);
+                log_debug!("limit_conn '{}' 命中: {key}", rule.zone);
                 crate::metrics::get().on_limit_conn_rejected();
                 return Err(close_now(status_page(state.limits.conn_status)));
             }
@@ -2497,7 +2609,10 @@ async fn check_access_and_auth(
                 }
             }
             Err(_) => {
-                log_error!("allow/deny 无法解析对端地址 {}，按拒绝处理", ctx.remote_addr);
+                log_error!(
+                    "allow/deny 无法解析对端地址 {}，按拒绝处理",
+                    ctx.remote_addr
+                );
                 ctx.status = 403;
                 return Some(status_page(403));
             }
@@ -2515,7 +2630,10 @@ async fn check_access_and_auth(
         // The state is only an atomic bit: the decision path takes no lock, reads no timezone, touches no calendar.
         if !state.schedule.is_open(name) {
             state.schedule.on_denied(name);
-            log_debug!("schedule_access '{name}' window closed, rejecting {}", ctx.remote_addr);
+            log_debug!(
+                "schedule_access '{name}' window closed, rejecting {}",
+                ctx.remote_addr
+            );
             ctx.status = 403;
             return Some(status_page(403));
         }
@@ -2552,9 +2670,8 @@ async fn check_access_and_auth(
     let header = ctx.header("authorization").map(str::to_string);
     let path = file.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::access::load_htpasswd(&path).map(|users| {
-            crate::access::check_auth_header(header.as_deref(), &users)
-        })
+        crate::access::load_htpasswd(&path)
+            .map(|users| crate::access::check_auth_header(header.as_deref(), &users))
     })
     .await
     .ok()
@@ -2584,7 +2701,11 @@ async fn check_access_and_auth(
 fn basic_challenge(realm: &str) -> BoxResponse {
     let escaped = realm.replace('\\', "\\\\").replace('"', "\\\"");
     let mut resp = status_page(401);
-    set_header(&mut resp, "www-authenticate", &format!("Basic realm=\"{escaped}\""));
+    set_header(
+        &mut resp,
+        "www-authenticate",
+        &format!("Basic realm=\"{escaped}\""),
+    );
     resp
 }
 
@@ -2616,7 +2737,13 @@ async fn serve_static_flow(
         .await
         .unwrap_or(StaticHit::NotFound);
     match hit {
-        StaticHit::File { code, mime, body: source, meta, window } => {
+        StaticHit::File {
+            code,
+            mime,
+            body: source,
+            meta,
+            window,
+        } => {
             // window 命中时同一份文件要改写成 206
             let status = match (code, window) {
                 (200, Some(_)) => StatusCode::PARTIAL_CONTENT,
@@ -2651,21 +2778,15 @@ async fn serve_static_flow(
                         );
                         FileSource::Disk { path, start, len }
                     }
-                    Some(_) => {
-                        match read_file_window(&path, start, len).await {
-                            Ok(win) => FileSource::Memory(Bytes::from(
-                                crate::engine::apply_sub_filter(
-                                    filter,
-                                    Some(mime.as_str()),
-                                    win,
-                                ),
-                            )),
-                            Err(e) => {
-                                log_warn!("静态文件读取失败 {}: {e}", path.display());
-                                return error_response(ctx, server, Some(loc), 404).await;
-                            }
+                    Some(_) => match read_file_window(&path, start, len).await {
+                        Ok(win) => FileSource::Memory(Bytes::from(
+                            crate::engine::apply_sub_filter(filter, Some(mime.as_str()), win),
+                        )),
+                        Err(e) => {
+                            log_warn!("静态文件读取失败 {}: {e}", path.display());
+                            return error_response(ctx, server, Some(loc), 404).await;
                         }
-                    }
+                    },
                     None => FileSource::Disk { path, start, len },
                 },
             };
@@ -2727,7 +2848,14 @@ async fn serve_static_flow(
                     let hdrs = std::mem::take(&mut ctx.resp_headers);
                     let body = Bytes::from(ctx.body.take().unwrap_or_default());
                     return build_buffered_response(
-                        resp_status, &hdrs, body, loc, server, "", false, ctx,
+                        resp_status,
+                        &hdrs,
+                        body,
+                        loc,
+                        server,
+                        "",
+                        false,
+                        ctx,
                     );
                 }
             }
@@ -2756,13 +2884,15 @@ async fn serve_static_flow(
             } else {
                 match source {
                     FileSource::Memory(content) => full_body(content),
-                    FileSource::Disk { path, start, len } => match DiskBody::open(&path, start, len).await {
-                        Some(b) => b,
-                        None => {
-                            log_warn!("静态文件打开失败 {}", path.display());
-                            return error_response(ctx, server, Some(loc), 404).await;
+                    FileSource::Disk { path, start, len } => {
+                        match DiskBody::open(&path, start, len).await {
+                            Some(b) => b,
+                            None => {
+                                log_warn!("静态文件打开失败 {}", path.display());
+                                return error_response(ctx, server, Some(loc), 404).await;
+                            }
                         }
-                    },
+                    }
                 }
             };
             let mut resp = builder
@@ -2838,7 +2968,11 @@ enum StaticHit {
 enum FileSource {
     /// `Bytes` 让缓存命中与 Range 切片都只做引用计数，不再整份复制
     Memory(Bytes),
-    Disk { path: PathBuf, start: u64, len: u64 },
+    Disk {
+        path: PathBuf,
+        start: u64,
+        len: u64,
+    },
 }
 
 const DISK_CHUNK: usize = 64 * 1024;
@@ -3080,9 +3214,8 @@ fn resolve_one(snap: &StaticSnap, path: &str) -> StaticHit {
 
 /// URI 路径里是否有点开头的段。`.well-known`（ACME/LDAP/security.txt 约定目录）放行。
 fn hidden_hit(path: &str) -> bool {
-    path.split('/').any(|seg| {
-        seg.starts_with('.') && seg != ".well-known" && seg != "." && seg != ".."
-    })
+    path.split('/')
+        .any(|seg| seg.starts_with('.') && seg != ".well-known" && seg != "." && seg != "..")
 }
 
 /// 静态文件内存缓存：小文件整体驻留内存，命中后零磁盘读；以 (mtime, size) 做失效校验
@@ -3238,7 +3371,9 @@ fn parse_range(hdr: &str, size: u64) -> RangeReq {
 
 /// If-Range：带校验位时必须与我们发出的一致，带日期时必须与 Last-Modified 同秒，否则回整份 200
 fn if_range_matches(hdr: Option<&str>, fm: &FileMeta) -> bool {
-    let Some(v) = hdr.map(str::trim) else { return true };
+    let Some(v) = hdr.map(str::trim) else {
+        return true;
+    };
     if v.is_empty() {
         return false;
     }
@@ -3273,7 +3408,9 @@ fn etag_list_matches(header: &str, ours: &str) -> bool {
 }
 
 fn strip_weak(tag: &str) -> &str {
-    tag.strip_prefix("W/").or_else(|| tag.strip_prefix("w/")).unwrap_or(tag)
+    tag.strip_prefix("W/")
+        .or_else(|| tag.strip_prefix("w/"))
+        .unwrap_or(tag)
 }
 
 /// nginx 的 ETag 形式：`"<mtime 十六进制>-<size 十六进制>"`（强校验位）
@@ -3284,9 +3421,7 @@ fn etag_of(mtime: u64, size: u64) -> String {
 /// IMF-fixdate：`Mon, 13 Oct 2026 08:09:10 GMT`
 fn http_date(secs: u64) -> String {
     chrono::DateTime::from_timestamp(secs as i64, 0)
-        .map(|dt: chrono::DateTime<chrono::Utc>| {
-            dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
-        })
+        .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
         .unwrap_or_else(|| "Thu, 01 Jan 1970 00:00:00 GMT".to_string())
 }
 
@@ -3297,7 +3432,11 @@ fn parse_http_date(s: &str) -> Option<u64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
         return Some(dt.timestamp().max(0) as u64);
     }
-    for fmt in ["%a, %d-%b-%y %H:%M:%S %Z", "%a %b %d %H:%M:%S %Y", "%Y-%m-%dT%H:%M:%S%:z"] {
+    for fmt in [
+        "%a, %d-%b-%y %H:%M:%S %Z",
+        "%a %b %d %H:%M:%S %Y",
+        "%Y-%m-%dT%H:%M:%S%:z",
+    ] {
         if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
             return Some(Utc.from_utc_datetime(&dt).timestamp().max(0) as u64);
         }
@@ -3371,7 +3510,10 @@ fn apply_proxied_header_rewrites(hm: &mut hyper::HeaderMap, loc: &Location) {
     if !loc.proxy_redirect.off && !loc.proxy_redirect.rules.is_empty() {
         for name in ["location", "refresh"] {
             let hn = HeaderName::from_static(name);
-            let cur = hm.get(&hn).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            let cur = hm
+                .get(&hn)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             if let Some(cur) = cur {
                 if let Some(new) = rw::apply_redirect(&loc.proxy_redirect.rules, &cur) {
                     if let Ok(val) = HeaderValue::from_str(&new) {
@@ -3446,15 +3588,20 @@ fn convert_upstream_response(
             }
         }
         push_add_headers(hm, Some(loc), server, ctx);
+        push_expires(hm, Some(loc), server, parts.status.as_u16());
         apply_proxied_header_rewrites(hm, loc);
     }
-    builder.body(body.boxed()).unwrap_or_else(|_| error_page(StatusCode::INTERNAL_SERVER_ERROR))
+    builder
+        .body(body.boxed())
+        .unwrap_or_else(|_| error_page(StatusCode::INTERNAL_SERVER_ERROR))
 }
 
 /// 缓存键：`$proxy_host` 由 proxy_pass 的 authority 供值，其余交给变量插值。
 /// 默认模板 `$scheme$proxy_host$request_uri` 对齐 nginx。
 fn build_cache_key(template: &str, ctx: &RequestCtx, target: &str) -> String {
-    let rest = target.trim_start_matches("http://").trim_start_matches("https://");
+    let rest = target
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
     let proxy_host = match rest.split_once('/') {
         Some((h, _)) => h,
         None => rest,
@@ -3539,7 +3686,10 @@ fn store_still_online(
         // 存原始请求行：后台重取要照它重新走一遍路由（rewrite 步骤也得重跑）
         uri: ctx.uri.clone(),
     };
-    if state.still_online.store(zone, key, snap, loc.still_online_max_body) {
+    if state
+        .still_online
+        .store(zone, key, snap, loc.still_online_max_body)
+    {
         // 存进去的就是新鲜内容：后台那条待重取标记可以撤了
         state.still_online.clear_dirty(zone, key);
     }
@@ -3584,16 +3734,7 @@ fn serve_still_online(
     } else {
         (snap.resp.status, (*snap.resp.body).clone(), headers)
     };
-    let mut resp = build_buffered_response(
-        status,
-        &headers,
-        body,
-        loc,
-        server,
-        "",
-        false,
-        ctx,
-    );
+    let mut resp = build_buffered_response(status, &headers, body, loc, server, "", false, ctx);
     {
         let hm = resp.headers_mut();
         if let Ok(v) = HeaderValue::from_str("stale") {
@@ -3629,11 +3770,7 @@ pub async fn still_online_refresh_loop(state: Arc<AppState>, mut stop: watch::Re
         }
         for job in state.still_online.due_jobs(Instant::now()) {
             if refresh_copy(&state, &job).await {
-                log_info!(
-                    "Still ONLine：副本 {} {} 已换成新鲜内容",
-                    job.zone,
-                    job.key
-                );
+                log_info!("Still ONLine：副本 {} {} 已换成新鲜内容", job.zone, job.key);
                 state.still_online.note_refreshed(&job.zone, &job.key);
             } else {
                 state.still_online.requeue(job);
@@ -3650,9 +3787,16 @@ async fn refresh_copy(state: &Arc<AppState>, job: &crate::still_online::RefreshJ
         return false;
     };
     let router = state.routing();
-    let Some(server) = router.match_server(listener, job.host.as_deref()).map(Arc::clone) else {
+    let Some(server) = router
+        .match_server(listener, job.host.as_deref())
+        .map(Arc::clone)
+    else {
         // 热重载后这个监听/虚拟主机已经不在了：副本继续服务到 max_age，但无法重建请求
-        log_debug!("Still ONLine：重取无法定位虚拟主机（{} {:?}）", listener, job.host);
+        log_debug!(
+            "Still ONLine：重取无法定位虚拟主机（{} {:?}）",
+            listener,
+            job.host
+        );
         return false;
     };
     let Ok(uri) = job.uri.parse::<hyper::Uri>() else {
@@ -3727,7 +3871,14 @@ async fn refresh_copy(state: &Arc<AppState>, job: &crate::still_online::RefreshJ
         streamed: false,
         allow_stream: false,
     };
-    let resp = process(state, &mut ctx, &server, ProxyBody::Buffered(None), &mut scope).await;
+    let resp = process(
+        state,
+        &mut ctx,
+        &server,
+        ProxyBody::Buffered(None),
+        &mut scope,
+    )
+    .await;
     let replayed = resp.headers().contains_key("x-still-online");
     let ok = resp.status().is_success();
     drop(resp);
@@ -3743,7 +3894,8 @@ fn serve_from_cache(
     status_tag: &str,
     ctx: &mut RequestCtx,
 ) -> BoxResponse {
-    let (mut status, mut headers, mut body) = (resp.status, resp.headers.clone(), (*resp.body).clone());
+    let (mut status, mut headers, mut body) =
+        (resp.status, resp.headers.clone(), (*resp.body).clone());
     if has_wasm_filter(loc) {
         ctx.status = status;
         ctx.resp_headers = headers;
@@ -3773,9 +3925,8 @@ async fn serve_revalidated(
     fresh: &hyper::HeaderMap,
 ) -> BoxResponse {
     let (zone, key) = zone_key;
-    let counts = |name: &str| {
-        crate::proxy_cache::header_counts_for_cache(name, &loc.proxy_ignore_headers)
-    };
+    let counts =
+        |name: &str| crate::proxy_cache::header_counts_for_cache(name, &loc.proxy_ignore_headers);
     let mut fresh_h: Vec<(String, String)> = Vec::new();
     for (k, v) in fresh.iter() {
         let name = k.as_str();
@@ -3791,7 +3942,8 @@ async fn serve_revalidated(
         .unwrap_or(0);
     // 有效期的口径与普通写入一致：先看上游这次说了什么（Cache-Control/Expires），
     // 上游什么都没说才回落到 `proxy_cache_valid` 里 200 的那条（304 描述的是同一个对象）。
-    let decided: Vec<(String, String)> = merged.iter().filter(|(k, _)| counts(k)).cloned().collect();
+    let decided: Vec<(String, String)> =
+        merged.iter().filter(|(k, _)| counts(k)).cloned().collect();
     let ttl = crate::proxy_cache::effective_ttl(&loc.proxy_cache_valid, 200, &decided, now_unix);
     if let Some(ttl) = ttl {
         state.proxy_cache.store_as(
@@ -3826,9 +3978,8 @@ fn build_buffered_response(
     with_status_tag: bool,
     ctx: &RequestCtx,
 ) -> BoxResponse {
-    let mut builder = Response::builder().status(
-        StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
-    );
+    let mut builder =
+        Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
     {
         let hm = builder.headers_mut().unwrap();
         if let Ok(v) = HeaderValue::from_str(SERVER_HEADER) {
@@ -3851,6 +4002,7 @@ fn build_buffered_response(
             }
         }
         push_add_headers(hm, Some(loc), server, ctx);
+        push_expires(hm, Some(loc), server, status);
         if with_status_tag {
             crate::metrics::get().record_cache_status(status_tag);
             if let Ok(val) = HeaderValue::from_str(status_tag) {
@@ -3867,9 +4019,9 @@ fn build_buffered_response(
                     .find(|(k, _)| k.eq_ignore_ascii_case("cache-status"))
                     .map(|(_, v)| v.as_str());
                 let ours = crate::front_proxy::cache_status_field(status_tag);
-                if let Ok(val) = HeaderValue::from_str(&crate::front_proxy::append_cache_status(
-                    prev, &ours,
-                )) {
+                if let Ok(val) =
+                    HeaderValue::from_str(&crate::front_proxy::append_cache_status(prev, &ours))
+                {
                     hm.insert(HeaderName::from_static("cache-status"), val);
                 }
             }
@@ -3901,8 +4053,14 @@ fn build_buffered_response(
 pub fn is_hop_by_hop(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "connection" | "keep-alive" | "proxy-authenticate" | "proxy-authorization"
-            | "te" | "trailer" | "transfer-encoding" | "upgrade"
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
     )
 }
 
@@ -3938,6 +4096,7 @@ fn finish_response(ctx: &RequestCtx, server: &Server, loc: Option<&Location>) ->
             }
         }
         push_add_headers(hm, loc, server, ctx);
+        push_expires(hm, loc, server, ctx.status);
         if !hm.contains_key(hyper::header::CONTENT_TYPE) && !body.is_empty() {
             hm.insert(
                 hyper::header::CONTENT_TYPE,
@@ -3986,7 +4145,10 @@ async fn error_response(
     if let Some(file) = file {
         let read = tokio::task::spawn_blocking(move || {
             if file.is_file() {
-                Some((mime_of(&file).to_string(), std::fs::read(&file).unwrap_or_default()))
+                Some((
+                    mime_of(&file).to_string(),
+                    std::fs::read(&file).unwrap_or_default(),
+                ))
             } else {
                 None
             }
@@ -4013,10 +4175,8 @@ fn status_page(code: u16) -> BoxResponse {
 
 /// 显式要求关闭连接：用于请求体没读完就必须回错的场景（413/408）
 fn close_now(mut resp: BoxResponse) -> BoxResponse {
-    resp.headers_mut().insert(
-        hyper::header::CONNECTION,
-        HeaderValue::from_static("close"),
-    );
+    resp.headers_mut()
+        .insert(hyper::header::CONNECTION, HeaderValue::from_static("close"));
     resp
 }
 
@@ -4028,8 +4188,32 @@ fn set_header(resp: &mut BoxResponse, name: &str, value: &str) {
 
 /// add_header 对静态响应同样生效（这里覆盖的都是 2xx/3xx：nginx 的 add_header 默认不加到 4xx/5xx）
 fn apply_add_headers(resp: &mut BoxResponse, loc: &Location, server: &Server, ctx: &RequestCtx) {
+    let status = resp.status().as_u16();
     let hm = resp.headers_mut();
     push_add_headers(hm, Some(loc), server, ctx);
+    push_expires(hm, Some(loc), server, status);
+}
+
+/// `expires` 在这一响上该落的头。与 add_header 共用同一批漏斗点，覆盖范围因此一致：
+/// 静态、代理回源、缓存命中、buffered/Lua 流式都走得到；`off`/本级没写 = 空表 = 一字不动。
+fn expires_pairs(loc: Option<&Location>, server: &Server, status: u16) -> Vec<(String, String)> {
+    let Some(exp) = router::effective_expires(loc, server) else {
+        return Vec::new();
+    };
+    exp.headers_for(status, unix_now() as i64)
+}
+
+/// 把 `expires` 的头写进 HeaderMap（后写覆盖：与 nginx 的 header filter 一样，
+/// 网关的过期策略说了算，源站那份同名字段被替换掉）。
+fn push_expires(hm: &mut hyper::HeaderMap, loc: Option<&Location>, server: &Server, status: u16) {
+    for (k, v) in expires_pairs(loc, server, status) {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::try_from(k.as_str()),
+            HeaderValue::try_from(v.as_str()),
+        ) {
+            hm.insert(name, val);
+        }
+    }
 }
 
 /// nginx 的 add_header：`Parameter value can contain variables.`
@@ -4127,7 +4311,8 @@ async fn handle_upgrade(
     apply_realip(&server, &mut ctx, meta.peer);
     apply_front_proxy(&server, &mut ctx, meta.peer);
     rec.set_remote(ctx.remote_addr.clone());
-    let conn_guards = match acquire_conn_guards(&state, &server, &ctx.remote_addr) {
+    let loc0 = Router::match_location(&server, ctx.effective_path());
+    let conn_guards = match acquire_conn_guards(&state, &server, loc0, &ctx) {
         Ok(g) => g,
         Err(resp) => return resp,
     };
@@ -4182,7 +4367,8 @@ async fn handle_upgrade(
                 ctx.upstream_status,
                 ctx.upstream_header_time,
             );
-            return error_page(StatusCode::BAD_GATEWAY);
+            let code = crate::proxy::upstream_error_status(&e);
+            return error_page(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY));
         }
     };
     rec.set_upstream(
@@ -4443,7 +4629,9 @@ fn decode_and_normalize(raw: &str) -> Option<String> {
 
 /// 供 main 使用的连接额度表
 pub fn permits_for(settings: &Settings) -> Arc<tokio::sync::Semaphore> {
-    Arc::new(tokio::sync::Semaphore::new(settings.worker_connections.max(1)))
+    Arc::new(tokio::sync::Semaphore::new(
+        settings.worker_connections.max(1),
+    ))
 }
 
 // ==================== HTTP/3（QUIC/UDP）服务 ====================
@@ -4607,7 +4795,10 @@ async fn handle_h3_request(
     let body: crate::proxy::ProxyReqBody =
         BoxBody::new(http_body_util::StreamBody::new(body_stream));
 
-    let remote = meta.peer.map(|p| p.ip().to_string()).unwrap_or_else(|| "-".into());
+    let remote = meta
+        .peer
+        .map(|p| p.ip().to_string())
+        .unwrap_or_else(|| "-".into());
     let header_str = |name: &str| -> String {
         parts
             .headers
@@ -4643,7 +4834,10 @@ async fn handle_h3_request(
     let resp = match handled {
         Ok(r) => r,
         Err(p) => {
-            log_error!("HTTP/3 请求处理 panic（已隔离，返回 500）: {}", panic_text(&p));
+            log_error!(
+                "HTTP/3 请求处理 panic（已隔离，返回 500）: {}",
+                panic_text(&p)
+            );
             error_page(StatusCode::INTERNAL_SERVER_ERROR)
         }
     };
@@ -4719,7 +4913,12 @@ mod tests {
         std::fs::write(dir.join("a.txt"), b"hello world").unwrap();
         let snap = snap_for(dir.clone(), "/a.txt");
         let hit = resolve_snap(&snap);
-        let StaticHit::File { meta: Some(m), body: FileSource::Memory(body), .. } = hit else {
+        let StaticHit::File {
+            meta: Some(m),
+            body: FileSource::Memory(body),
+            ..
+        } = hit
+        else {
             panic!("应为文件命中，实际 {hit:?}");
         };
         assert_eq!(m.size, 11);
@@ -4797,7 +4996,12 @@ mod tests {
             let mut snap = snap_for(dir.clone(), "/a.txt");
             snap.range = Some(hdr.to_string());
             let hit = resolve_snap(&snap);
-            let StaticHit::File { body: FileSource::Memory(body), window: got, .. } = hit else {
+            let StaticHit::File {
+                body: FileSource::Memory(body),
+                window: got,
+                ..
+            } = hit
+            else {
                 panic!("{hdr} 应命中文件");
             };
             assert_eq!(got, window, "{hdr} 的区间");
@@ -4806,7 +5010,10 @@ mod tests {
         // 起点越界 → 416
         let mut snap = snap_for(dir.clone(), "/a.txt");
         snap.range = Some("bytes=100-120".to_string());
-        assert!(matches!(resolve_snap(&snap), StaticHit::RangeUnsatisfiable(_)));
+        assert!(matches!(
+            resolve_snap(&snap),
+            StaticHit::RangeUnsatisfiable(_)
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4821,14 +5028,24 @@ mod tests {
         };
         // 客户端缓存的校验位已过期：不能给 206，给整份 200
         snap.if_range = Some("\"deadbeef-99\"".to_string());
-        let StaticHit::File { body: FileSource::Memory(body), window, .. } = resolve_snap(&snap) else {
+        let StaticHit::File {
+            body: FileSource::Memory(body),
+            window,
+            ..
+        } = resolve_snap(&snap)
+        else {
             panic!("应命中文件");
         };
         assert_eq!(window, None);
         assert_eq!(&body[..], b"0123456789");
         // 校验位一致时 Range 生效
         snap.if_range = Some(m.etag.clone());
-        let StaticHit::File { window, body: FileSource::Memory(body), .. } = resolve_snap(&snap) else {
+        let StaticHit::File {
+            window,
+            body: FileSource::Memory(body),
+            ..
+        } = resolve_snap(&snap)
+        else {
             panic!("应命中文件");
         };
         assert_eq!(window, Some((0, 3)));
@@ -4848,7 +5065,12 @@ mod tests {
         snap.negotiable = false;
         snap.if_none_match = Some(m.etag.clone());
         snap.range = Some("bytes=0-2".to_string());
-        let StaticHit::File { body: FileSource::Memory(body), window, .. } = resolve_snap(&snap) else {
+        let StaticHit::File {
+            body: FileSource::Memory(body),
+            window,
+            ..
+        } = resolve_snap(&snap)
+        else {
             panic!("应命中文件");
         };
         assert_eq!(window, None);
@@ -4870,13 +5092,20 @@ mod tests {
         std::fs::write(dir.join(".git/config"), b"[core]-secret").unwrap();
         std::fs::write(dir.join(".env"), b"SECRET=1").unwrap();
         std::fs::write(dir.join("visible.txt"), b"ok").unwrap();
-        assert!(matches!(resolve_snap(&snap_for(dir.clone(), "/.env")), StaticHit::NotFound));
+        assert!(matches!(
+            resolve_snap(&snap_for(dir.clone(), "/.env")),
+            StaticHit::NotFound
+        ));
         assert!(matches!(
             resolve_snap(&snap_for(dir.clone(), "/.git/config")),
             StaticHit::NotFound
         ));
         // 同一目录下的普通文件不受影响
-        let StaticHit::File { body: FileSource::Memory(body), .. } = resolve_snap(&snap_for(dir.clone(), "/visible.txt")) else {
+        let StaticHit::File {
+            body: FileSource::Memory(body),
+            ..
+        } = resolve_snap(&snap_for(dir.clone(), "/visible.txt"))
+        else {
             panic!("普通文件应照常服务");
         };
         assert_eq!(&body[..], b"ok");
@@ -4885,13 +5114,25 @@ mod tests {
 
     #[test]
     fn range_parsing_edges() {
-        assert!(matches!(parse_range("bytes=0-0", 10), RangeReq::Window(0, 0)));
-        assert!(matches!(parse_range("bytes=-0", 10), RangeReq::Unsatisfiable));
-        assert!(matches!(parse_range("bytes=0-", 0), RangeReq::Unsatisfiable));
+        assert!(matches!(
+            parse_range("bytes=0-0", 10),
+            RangeReq::Window(0, 0)
+        ));
+        assert!(matches!(
+            parse_range("bytes=-0", 10),
+            RangeReq::Unsatisfiable
+        ));
+        assert!(matches!(
+            parse_range("bytes=0-", 0),
+            RangeReq::Unsatisfiable
+        ));
         assert!(matches!(parse_range("bytes=-5", 3), RangeReq::Window(0, 2)));
         assert!(matches!(parse_range("bytes=4-2", 10), RangeReq::Ignored));
         assert!(matches!(parse_range("bytes = 0-1", 10), RangeReq::Ignored));
-        assert!(matches!(parse_range("bytes=0-1,2-3", 10), RangeReq::Ignored));
+        assert!(matches!(
+            parse_range("bytes=0-1,2-3", 10),
+            RangeReq::Ignored
+        ));
     }
 
     #[test]
@@ -4915,7 +5156,11 @@ mod tests {
 
         // 超过缓存阈值 → 不整份入内存，只登记磁盘区间
         let hit = resolve_snap(&snap_for(dir.clone(), "/big.bin"));
-        let StaticHit::File { body: FileSource::Disk { start, len, .. }, window: None, .. } = hit
+        let StaticHit::File {
+            body: FileSource::Disk { start, len, .. },
+            window: None,
+            ..
+        } = hit
         else {
             panic!("大文件应走磁盘流式：{hit:?}");
         };
@@ -4926,7 +5171,12 @@ mod tests {
         let lo = FILE_CACHE_MAX_FILE + 17;
         snap.range = Some(format!("bytes={lo}-{}", lo + 99));
         let hit = resolve_snap(&snap);
-        let StaticHit::File { body: FileSource::Disk { start, len, .. }, window, .. } = hit else {
+        let StaticHit::File {
+            body: FileSource::Disk { start, len, .. },
+            window,
+            ..
+        } = hit
+        else {
             panic!("大文件 Range 应走磁盘流式：{hit:?}");
         };
         assert_eq!(window, Some((lo, lo + 99)));
@@ -4941,7 +5191,9 @@ mod tests {
         assert_eq!(got, &data[lo as usize..(lo + 100) as usize]);
 
         // 文件被截断/删除后打开失败 → 调用方回 404，而不是挂起或发出空体
-        assert!(DiskBody::open(&dir.join("missing.bin"), 0, 10).await.is_none());
+        assert!(DiskBody::open(&dir.join("missing.bin"), 0, 10)
+            .await
+            .is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4951,11 +5203,17 @@ mod tests {
         c.query = "a=1&b=0&c=&d=x".into();
         // 多值：任一表达式成立即成立
         assert!(cache_expr_truthy(&["$arg_b".into(), "$arg_a".into()], &c));
-        assert!(cache_expr_truthy(&["$arg_a".into(), "$arg_nope".into()], &c));
+        assert!(cache_expr_truthy(
+            &["$arg_a".into(), "$arg_nope".into()],
+            &c
+        ));
         // 空值、"0"、缺失变量都不成立（"0" 在 nginx 里明确是假）
         assert!(!cache_expr_truthy(&["$arg_c".into()], &c));
         assert!(!cache_expr_truthy(&["$arg_b".into()], &c));
-        assert!(!cache_expr_truthy(&["$arg_nope".into(), "$http_x_nope".into()], &c));
+        assert!(!cache_expr_truthy(
+            &["$arg_nope".into(), "$http_x_nope".into()],
+            &c
+        ));
         // 字面量与模板
         assert!(cache_expr_truthy(&["always".into()], &c));
         assert!(cache_expr_truthy(&["prefix-$arg_d".into()], &c));

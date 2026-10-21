@@ -18,13 +18,13 @@
 //!
 //! 用法：`onrouter [-t] [-V] [path/to/onrouter.conf]`
 
-mod access_log;
 mod access;
+mod access_log;
 mod affinity;
 mod certs;
 mod compress;
-mod dns;
 mod disk_cache;
+mod dns;
 mod engine;
 mod front_proxy;
 mod governor;
@@ -44,8 +44,8 @@ mod schedule;
 mod server;
 mod settings;
 mod shared_dict;
-mod still_online;
 mod sockpool;
+mod still_online;
 mod stream;
 mod tls;
 mod upstream;
@@ -347,7 +347,15 @@ fn main() {
 
     if args.test {
         std::process::exit(
-            match check(&router, &settings, &limits, &learning, &schedule, &config, &startup_warnings) {
+            match check(
+                &router,
+                &settings,
+                &limits,
+                &learning,
+                &schedule,
+                &config,
+                &startup_warnings,
+            ) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("[onrouter] {e}");
@@ -418,6 +426,14 @@ fn check(
     }
     for line in router.describe_listeners() {
         println!("  监听 {line}");
+    }
+    for st in &router.stream {
+        if st.udp {
+            println!(
+                "  监听 udp://{}（proxy_responses={}，空闲回收 {:?}）",
+                st.listen, st.proxy_responses, st.proxy_timeout
+            );
+        }
     }
     println!(
         "  worker_connections={} keepalive_requests={} shutdown_grace={:?}",
@@ -573,7 +589,10 @@ async fn run(
     let lua = Arc::new(lua);
     let proxy = match dns::DnsResolver::from_config(&config) {
         Some(r) => {
-            println!("[onrouter] 异步 DNS 解析器就绪：nameserver {:?}", r.nameservers());
+            println!(
+                "[onrouter] 异步 DNS 解析器就绪：nameserver {:?}",
+                r.nameservers()
+            );
             Arc::new(ProxyEngine::new(Arc::clone(&pool)).with_resolver(r))
         }
         None => Arc::new(ProxyEngine::new(Arc::clone(&pool))),
@@ -592,8 +611,7 @@ async fn run(
         );
     }
     proxy_cache.attach_disks(proxy_disks);
-    let still_online =
-        still_online::StillOnline::with_budgets(router.still_zones.clone());
+    let still_online = still_online::StillOnline::with_budgets(router.still_zones.clone());
     let access_log = access_log::AccessLog::new(&config, &base_dir);
 
     let listener_specs = router.listeners.clone();
@@ -656,7 +674,17 @@ async fn run(
     }
     // 四层 stream 监听：合成一个纯 TCP Listener（无 TLS/h2/quic），同样先绑定再服务。
     let mut bound_stream: Vec<(Arc<router::StreamServer>, tokio::net::TcpListener)> = Vec::new();
+    let mut bound_udp: Vec<(Arc<router::StreamServer>, Arc<tokio::net::UdpSocket>)> = Vec::new();
     for s in &stream_specs {
+        // UDP 入口走另一条通路：绑一个数据报 socket，不建 TCP 监听器
+        if s.udp {
+            let sock = tokio::net::UdpSocket::bind(s.listen)
+                .await
+                .map_err(|e| AppError::Other(format!("stream udp 监听 {} 绑定失败: {e}", s.listen)))
+                .map(Arc::new)?;
+            bound_udp.push((Arc::clone(s), sock));
+            continue;
+        }
         let l = router::Listener {
             addr: s.listen,
             tls: None,
@@ -737,7 +765,15 @@ async fn run(
         let listeners = listener_specs.clone();
         let notify = Arc::clone(&reload_notify);
         let poll = settings.reload;
-        spawn_reload_task(state, conf_path, base_dir, listeners, poll, notify, rx.clone())
+        spawn_reload_task(
+            state,
+            conf_path,
+            base_dir,
+            listeners,
+            poll,
+            notify,
+            rx.clone(),
+        )
     };
 
     let signals = spawn_signal_handlers(tx.clone(), reload_notify.clone());
@@ -750,11 +786,24 @@ async fn run(
         let state = Arc::clone(&state);
         // QUIC/HTTP/3：同一 addr 再挂一个 UDP 端点（h3），TCP 侧照常提供 h1/h2（供 Alt-Svc 回退）
         if l.quic {
-            tokio::spawn(server::serve_quic(Arc::clone(&state), l.clone(), rx.clone()));
+            tokio::spawn(server::serve_quic(
+                Arc::clone(&state),
+                l.clone(),
+                rx.clone(),
+            ));
         }
         tasks.spawn(server::serve(state, l, tcp, rx.clone()));
     }
     // 四层 stream 隧道：与 HTTP 共用停机信号与 worker_connections 额度。
+    for (s, udp_sock) in bound_udp {
+        tasks.spawn(stream::serve_udp(
+            Arc::clone(&state),
+            Arc::clone(&pool),
+            s,
+            udp_sock,
+            rx.clone(),
+        ));
+    }
     for (s, tcp) in bound_stream {
         tasks.spawn(stream::serve_stream(
             Arc::clone(&state),
@@ -838,8 +887,7 @@ async fn run(
         log_info!(
             "DICT 磁盘冷层：{} 个区已启用（{}），落盘/冷命中见 /metrics 的 onrouter_dict_disk_*",
             cold.len(),
-            cold
-                .iter()
+            cold.iter()
                 .map(|(n, s)| format!("{n}: {:?}", s.config().root))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -883,7 +931,10 @@ async fn run(
     log_info!("已退出");
     drop(state);
     // 冷层：把排队的落盘/删除写完再退，否则重启后扫目录会少一批数据
-    if tokio::task::spawn_blocking(disk_cache::flush_all_pending).await.is_err() {
+    if tokio::task::spawn_blocking(disk_cache::flush_all_pending)
+        .await
+        .is_err()
+    {
         log_warn!("磁盘冷层排空任务异常结束（尽力而为，冷层丢数据只影响命中率）");
     }
     // 冲刷并回收两个日志线程：优雅退出不该丢访问日志/诊断日志
@@ -971,10 +1022,7 @@ fn spawn_signal_handlers(
 /// resident task at all — and lazily on an `off -> observe/auto` hot reload.
 /// Turning it off via reload keeps the task alive but idle: `advance` answers
 /// `None` in off mode, so nothing is measured, decided or acted on.
-fn spawn_governor_task(
-    g: Arc<governor::Governor>,
-    pc: Arc<proxy_cache::ProxyCache>,
-) {
+fn spawn_governor_task(g: Arc<governor::Governor>, pc: Arc<proxy_cache::ProxyCache>) {
     if !g.mark_task_started() {
         return;
     }
@@ -983,9 +1031,7 @@ fn spawn_governor_task(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let Some((from, to, cause, action)) =
-                g.advance(schedule::now_ms() as u64)
-            else {
+            let Some((from, to, cause, action)) = g.advance(schedule::now_ms() as u64) else {
                 continue;
             };
             let cause_txt = match cause {
@@ -1016,9 +1062,7 @@ fn spawn_governor_task(
                             }
                             let (en, eb) = pc.governor_evict_pass(64);
                             g.counters.demoted.fetch_add(en as u64, Ordering::Relaxed);
-                            g.counters
-                                .demoted_bytes
-                                .fetch_add(eb, Ordering::Relaxed);
+                            g.counters.demoted_bytes.fetch_add(eb, Ordering::Relaxed);
                             if dict_n == 0 && en == 0 {
                                 break;
                             }
@@ -1149,7 +1193,10 @@ fn spawn_reload_task(
 /// 定期自检 Lua 脚本文件：mtime 变了的重读进缓存，下一个请求即编译新版本。
 fn check_lua_files() {
     for p in lua_engine::recheck_cached_files() {
-        log_info!("定期自检：Lua 脚本有变更，缓存已更新（重读或失效） {}", p.display());
+        log_info!(
+            "定期自检：Lua 脚本有变更，缓存已更新（重读或失效） {}",
+            p.display()
+        );
     }
 }
 
@@ -1188,13 +1235,14 @@ fn do_reload(
                 // proxy_cache 冷层先打开、后换路由：打不开就整次重载作废并保留旧配置，
                 // 否则会出现"路由是新的、磁盘层还是旧的（或没有）"这种对不上账的状态。
                 // 新配置里没写 disk=on 时这里传入空表 = 摘掉全部冷层并排空旧队列。
-                let proxy_disks = match proxy_cache::ProxyCache::open_disk_zones(&new_router.cache_disk) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log_error!("热重载失败：{e}，保持旧配置继续服务");
-                        return;
-                    }
-                };
+                let proxy_disks =
+                    match proxy_cache::ProxyCache::open_disk_zones(&new_router.cache_disk) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            log_error!("热重载失败：{e}，保持旧配置继续服务");
+                            return;
+                        }
+                    };
                 disk_cache::register_proxy_zones(
                     proxy_disks
                         .iter()

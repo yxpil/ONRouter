@@ -316,7 +316,9 @@ impl ReqZone {
             rate_per_sec,
             burst,
             key_var: key_var.to_string(),
-            shards: (0..SHARDS).map(|_| Mutex::new(ReqShard::default())).collect(),
+            shards: (0..SHARDS)
+                .map(|_| Mutex::new(ReqShard::default()))
+                .collect(),
             policy: Mutex::new(None),
             table: Mutex::new(None),
             q: QueueCounters::default(),
@@ -372,12 +374,7 @@ impl ReqZone {
     /// 仍然按同一速率发放令牌，所以给可信客户放宽队列不会多放出一个请求。
     /// 等待预算只认运维给的 `max_delay`：排队时已经预留了令牌，
     /// 排上队就一定等得到，不需要再按"深度 × 周期"猜一遍位置。
-    fn effective(
-        &self,
-        p: QueuePolicy,
-        key: &str,
-        vip: Option<&Arc<crate::vip::Vip>>,
-    ) -> QueueEff {
+    fn effective(&self, p: QueuePolicy, key: &str, vip: Option<&Arc<crate::vip::Vip>>) -> QueueEff {
         let static_eff = || QueueEff {
             depth: p.depth_max,
             delay_ms: p.max_delay_ms,
@@ -414,7 +411,9 @@ impl ReqZone {
         let capacity = burst + 1.0;
         let refill_per_ms = self.rate_per_sec / 1000.0;
         let now = now_ms();
-        let mut shard = self.shards[shard_of(key)].lock().unwrap_or_else(|e| e.into_inner());
+        let mut shard = self.shards[shard_of(key)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let (deficit_ms, queued) = match shard.map.get_mut(key) {
             Some(st) => {
@@ -547,7 +546,9 @@ impl ReqZone {
     }
 
     fn dec_queued(&self, key: &str) {
-        let mut shard = self.shards[shard_of(key)].lock().unwrap_or_else(|e| e.into_inner());
+        let mut shard = self.shards[shard_of(key)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(st) = shard.map.get_mut(key) {
             st.queued = st.queued.saturating_sub(1);
         }
@@ -587,14 +588,18 @@ impl ReqZone {
                     .sum::<u64>()
             })
             .sum();
-        let (table_bytes, slots, slots_total, learned_max) =
-            match self.table.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(t) => {
-                    let (used, total, held) = t.snapshot();
-                    (t.bytes(), used, total, held)
-                }
-                None => (0, 0, 0, 0),
-            };
+        let (table_bytes, slots, slots_total, learned_max) = match self
+            .table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            Some(t) => {
+                let (used, total, held) = t.snapshot();
+                (t.bytes(), used, total, held)
+            }
+            None => (0, 0, 0, 0),
+        };
         QueueSnapshot {
             policy: self.policy(),
             occupied,
@@ -785,9 +790,7 @@ fn parse_queue_policies(config: &Config, notes: &mut Vec<String>) -> HashMap<Str
         if p.depth_min > p.depth_max {
             notes.push(format!(
                 "limit_req_queue {zone}（第 {} 行）depth_min={} 大于 depth={}，下界已按上界处理",
-                d.line,
-                p.depth_min,
-                p.depth_max
+                d.line, p.depth_min, p.depth_max
             ));
             p.depth_min = p.depth_max;
         }
@@ -818,20 +821,29 @@ impl ConnZone {
         Arc::new(ConnZone {
             name: name.to_string(),
             key_var: key_var.to_string(),
-            shards: (0..SHARDS).map(|_| Mutex::new(ConnShard::default())).collect(),
+            shards: (0..SHARDS)
+                .map(|_| Mutex::new(ConnShard::default()))
+                .collect(),
         })
     }
 
     /// 占用一个并发额度；超限返回 None。成功返回 RAII，drop 时释放。
     pub fn try_acquire(self: &Arc<Self>, key: &str, number: u32) -> Option<ConnGuard> {
-        let mut shard = self.shards[shard_of(key)].lock().unwrap_or_else(|e| e.into_inner());
+        let mut shard = self.shards[shard_of(key)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let n = shard.map.get(key).copied().unwrap_or(0);
         if n >= number {
             return None;
         }
         if !shard.map.contains_key(key) && shard.map.len() >= PER_SHARD_CAPACITY {
             // 状态表满：优先淘汰已归零的 key；无可淘汰项时按 nginx 的 shm 耗尽语义拒绝新连接
-            match shard.map.iter().find(|(_, v)| **v == 0).map(|(k, _)| k.clone()) {
+            match shard
+                .map
+                .iter()
+                .find(|(_, v)| **v == 0)
+                .map(|(k, _)| k.clone())
+            {
                 Some(old) => {
                     shard.map.remove(&old);
                 }
@@ -846,7 +858,9 @@ impl ConnZone {
     }
 
     fn release(&self, key: &str) {
-        let mut shard = self.shards[shard_of(key)].lock().unwrap_or_else(|e| e.into_inner());
+        let mut shard = self.shards[shard_of(key)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match shard.map.get_mut(key) {
             Some(n) if *n > 1 => *n -= 1,
             Some(_) => {
@@ -906,13 +920,144 @@ pub struct Limits {
     vip: Mutex<Option<Arc<crate::vip::Vip>>>,
 }
 
-/// 目前限流只支持按客户端地址计数（其余变量需要 nginx 的 shared 变量体系）
+/// key 完全由客户端地址构成：请求路径上不必插值（见 server::limit_key）
 pub fn addr_var(v: &str) -> bool {
     matches!(v, "$remote_addr" | "$binary_remote_addr")
 }
 
-/// 从一条 `limit_*_zone` 指令里取出 key 变量（与 `parse_req_zone` 同一口径）。
-/// `-t` 用它把"写了个运行期根本不展开的变量"直接否决掉（见 router 的 `check_zone_keys`）。
+/// 限流判定时刻（preaccess/ACCESS，读请求头之后、回源之前）就有值的固定变量。
+/// 这是 nginx 变量全集里"能给请求归组"的那一部分：地址、连接与监听、请求行、Host/SNI。
+const REQUEST_PHASE_VARS: &[&str] = &[
+    "remote_addr",
+    "binary_remote_addr",
+    "realip_remote_addr",
+    "remote_port",
+    "server_addr",
+    "server_port",
+    "scheme",
+    "https",
+    "request_method",
+    "method",
+    "request_uri",
+    "uri",
+    "args",
+    "query_string",
+    "is_args",
+    "host",
+    "ssl_server_name",
+    "content_type",
+    "content_length",
+    "request_length",
+    "hostname",
+    "proxy_add_x_forwarded_for",
+    "front_proxy",
+    "front_proxy_country",
+    "front_proxy_host",
+    "front_proxy_verified",
+];
+
+/// 这些前缀派生的变量在判定时刻必然取不到值：它们描述的是**响应**或**后端**。
+/// 写进 key 的话每个请求都展开成空串，整区流量并成一个桶——比"按 IP 限"更安静的失效。
+const RESPONSE_PHASE_PREFIXES: &[&str] = &[
+    "sent_http_",
+    "upstream_http_",
+    "upstream_cookie_",
+    "upstream_",
+];
+
+/// 逐段检查一条 zone key 模板，第一处取不到值的变量给出点名与原因。
+/// nginx 的 key 是 complex value，所以 `$cookie_sid$remote_addr` 这种复合写法要逐段判；
+/// 段名取 `$` 之后的 `[A-Za-z0-9_]` 前缀，与变量插值的词法一致（`$1` 是捕获组字面量，跳过）。
+///
+/// 支持的维度：客户端地址、请求头（`$http_*`）、Cookie（`$cookie_*`）、URL 参数（`$arg_*`）、
+/// 以及 `REQUEST_PHASE_VARS` 里的请求期变量。
+/// 明确否决的：响应期/后端变量、`$request_body`（判定时刻体还没读完，恒为空）、
+/// 本实现没有的变量（`$server_name`、`$geoip_*`…），以及 `set` 出来的请求级变量——
+/// nginx 允许它当 key，但我们的限流跑在 REWRITE 之前，那时 set 还没执行；
+/// 与其让它静默变成"所有请求共用一个空桶"，不如在 `-t` 就拒绝。
+pub fn check_key_var(var: &str) -> Result<(), String> {
+    let segs = key_segs(var);
+    for name in &segs {
+        let dollar = format!("${name}");
+        if name == "request_body" {
+            return Err(format!(
+                "'{dollar}' 在限流判定时刻请求体还没读完，当 key 会把整区流量并成一个空桶"
+            ));
+        }
+        if REQUEST_PHASE_VARS.contains(&name.as_str()) {
+            continue;
+        }
+        if RESPONSE_PHASE_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            return Err(format!(
+                "'{dollar}' 是响应期/后端变量，限流判定（ACCESS 之前）取不到值，当 key 会把整区流量并成一个空桶"
+            ));
+        }
+        if name.starts_with("http_") || name.starts_with("cookie_") || name.starts_with("arg_") {
+            continue;
+        }
+        return Err(format!(
+            "'{dollar}' 在限流判定时刻展开不出值。支持的 key：$remote_addr / $binary_remote_addr、\
+             $http_<头>、$cookie_<名>、$arg_<参数>、$uri/$request_uri/$host/$scheme/$request_method \
+             等请求期变量（可拼接，如 $cookie_sid$remote_addr）；set 出来的变量不能作为 key，\
+             请直接用它右边的来源变量"
+        ));
+    }
+    // 一个变量都没有的模板（`$1abc` 这类捕获组字面量、纯文本）会原样保留，于是每个请求
+    // 都落进同一个"常量键"桶：整区变成一条全局限流。这同样是静默失效，一起否决。
+    if segs.is_empty() {
+        return Err(format!(
+            "'{var}' 里没有任何展开得出值的变量（`$1` 这类正则捕获组不算）：这样写会让所有请求共用同一个键"
+        ));
+    }
+    Ok(())
+}
+
+/// 取出模板里所有 `$name` / `${name}` 形式的变量名（跳过 `$1` 这类数字捕获组）
+fn key_segs(var: &str) -> Vec<String> {
+    let bytes = var.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        if bytes.get(j) == Some(&b'{') {
+            j += 1;
+        }
+        let start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            j += 1;
+        }
+        if start != j && !bytes[start].is_ascii_digit() {
+            out.push(var[start..j].to_string());
+        }
+        i = j.max(i + 1);
+    }
+    out
+}
+
+/// 本请求在这个 key 模板下的计数 key。
+///
+/// 返回 `None` = 这一维上这个请求没有值（没带那个头/Cookie/参数）。nginx 的语义是
+/// **key 为空的请求不受本区限流**，调用方要跳过判定；绝不能把它们并到一个空 key 的桶里，
+/// 那等于给整个区加了一道隐藏的总闸，还会把"匿名流量"和真流量混在一起算突发。
+///
+/// 地址写法走快路径：不插值、每请求零分配，这也是绝大多数配置的形态。
+pub fn zone_key(var: &str, ctx: &crate::engine::RequestCtx) -> Option<String> {
+    if addr_var(var) {
+        return Some(ctx.remote_addr.clone());
+    }
+    let key = crate::proxy::interpolate_vars(var, ctx);
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+/// 从一条 `limit_*_zone` 指令里取出 key 变量（与 `parse_req_zone` 同一口径）。/// `-t` 用它把"写了个运行期根本不展开的变量"直接否决掉（见 router 的 `check_zone_keys`）。
 pub fn zone_key_var(d: &Directive) -> Option<String> {
     var_of(&d.args)
 }
@@ -933,18 +1078,20 @@ impl Limits {
                         l.req_zones
                             .insert(name.clone(), ReqZone::new(&name, rate, burst, &var));
                     }
-                    None => l
-                        .warnings
-                        .push(format!("limit_req_zone（第 {} 行）缺少变量、zone= 或 rate=", d.line)),
+                    None => l.warnings.push(format!(
+                        "limit_req_zone（第 {} 行）缺少变量、zone= 或 rate=",
+                        d.line
+                    )),
                 },
                 "limit_conn_zone" => match parse_conn_zone(d) {
                     Some((var, name)) => {
                         l.conn_zones
                             .insert(name.clone(), ConnZone::new(&name, &var));
                     }
-                    None => l
-                        .warnings
-                        .push(format!("limit_conn_zone（第 {} 行）缺少变量或 zone=", d.line)),
+                    None => l.warnings.push(format!(
+                        "limit_conn_zone（第 {} 行）缺少变量或 zone=",
+                        d.line
+                    )),
                 },
                 "limit_req_status" => {
                     if let Some(v) = d.arg(0).and_then(|s| s.parse::<u16>().ok()) {
@@ -1030,7 +1177,8 @@ impl Limits {
         let want = learning.vip_cfg();
         let mut g = self.vip.lock().unwrap_or_else(|e| e.into_inner());
         // 配置没变就别重建：重建会把在世信誉清零，等于每次重载都把所有客户重新当陌生人
-        if matches!((g.as_ref(), want), (Some(v), Some(w)) if v.cfg() == w) || (g.is_none() && want.is_none())
+        if matches!((g.as_ref(), want), (Some(v), Some(w)) if v.cfg() == w)
+            || (g.is_none() && want.is_none())
         {
             return notes;
         }
@@ -1047,8 +1195,7 @@ impl Limits {
         if self.req_zones.is_empty() {
             // 没申领过就不归还：信誉的观察源是限流判定，一个区都没有时这条配置永远不会生效
             notes.push(
-                "vip_learning：没有任何 limit_req_zone，判定结果无从观测，信誉学不起来"
-                    .to_string(),
+                "vip_learning：没有任何 limit_req_zone，判定结果无从观测，信誉学不起来".to_string(),
             );
             return notes;
         }
@@ -1087,7 +1234,8 @@ impl Limits {
     }
 
     /// 逐区队列概况（`/metrics` 渲染；按区名排序，保证每次抓取可比对）
-    pub fn queue_rows(&self) -> Vec<(String, QueueSnapshot)> {        let mut rows: Vec<(String, QueueSnapshot)> = self
+    pub fn queue_rows(&self) -> Vec<(String, QueueSnapshot)> {
+        let mut rows: Vec<(String, QueueSnapshot)> = self
             .req_zones
             .iter()
             .map(|(n, z)| (n.clone(), z.queue_snapshot()))
@@ -1111,7 +1259,6 @@ impl Limits {
             })
             .collect()
     }
-
 
     /// 启动时打印的区域概况（运维只看日志就要知道限流到底生效了什么）
     pub fn describe(&self) -> Vec<String> {
@@ -1144,9 +1291,11 @@ impl Limits {
             .collect();
         let mut conns: Vec<&Arc<ConnZone>> = self.conn_zones.values().collect();
         conns.sort_by(|a, b| a.name.cmp(&b.name));
-        out.extend(conns.iter().map(|z| {
-            format!("limit_conn zone={} key={}", z.name, z.key_var)
-        }));
+        out.extend(
+            conns
+                .iter()
+                .map(|z| format!("limit_conn zone={} key={}", z.name, z.key_var)),
+        );
         out
     }
 
@@ -1245,7 +1394,10 @@ mod tests {
         // 规则级 burst 覆盖
         let z2 = ReqZone::new("t2", 1.0, 0.0, "$remote_addr");
         assert!(z2.check("k", Some(5.0)).is_none());
-        assert!(z2.check("k", Some(0.0)).is_none(), "覆盖为 0 时首个请求仍可放行");
+        assert!(
+            z2.check("k", Some(0.0)).is_none(),
+            "覆盖为 0 时首个请求仍可放行"
+        );
     }
 
     #[test]
@@ -1296,11 +1448,15 @@ mod tests {
         let desc = l.describe();
         assert_eq!(desc.len(), 2, "一个 limit_req 区 + 一个 limit_conn 区");
         assert!(
-            desc.iter().any(|s| s.contains("zone=allr") && s.contains("rate=10.0r/s")
-                && s.contains("burst=20") && s.contains("key=$remote_addr")),
+            desc.iter().any(|s| s.contains("zone=allr")
+                && s.contains("rate=10.0r/s")
+                && s.contains("burst=20")
+                && s.contains("key=$remote_addr")),
             "describe: {desc:?}"
         );
-        assert!(desc.iter().any(|s| s.contains("zone=allc") && s.contains("key=$binary_remote_addr")));
+        assert!(desc
+            .iter()
+            .any(|s| s.contains("zone=allc") && s.contains("key=$binary_remote_addr")));
         let z = l.req_zone("allr").unwrap();
         assert!((z.rate_per_sec - 10.0).abs() < 1e-9);
         assert_eq!(z.burst, 20.0);
@@ -1318,18 +1474,95 @@ mod tests {
         assert!(z.purge_idle(1_000_000) == 0);
     }
 
-    /// key 变量的"是不是地址"只有一处判定：`-t` 拿它硬否决非地址配置，
+    /// "是不是地址"只有一处判定：地址走快路径，其余按 key 模板插值。
+    /// `-t` 用 check_key_var 逐段否决"判定时刻取不到值"的写法，
     /// 运行期不再有"记着别的变量、实际按 IP 限"这种两说。
     #[test]
-    fn only_address_keys_are_supported() {
+    fn key_templates_are_checked_per_segment() {
         assert!(addr_var("$remote_addr"));
         assert!(addr_var("$binary_remote_addr"));
-        for bad in ["$uri", "$http_x_api_key", "$server_name"] {
-            let cfg = Config::parse(&format!("limit_req_zone {bad} zone=u:1m rate=1r/s;")).unwrap();
-            let var = zone_key_var(&cfg.root.block[0]).unwrap();
-            assert_eq!(var, bad, "{bad} 要能被取出来交给 -t 判定");
-            assert!(!addr_var(&var), "{bad} 不是客户端地址");
+        for good in [
+            "$remote_addr",
+            "$binary_remote_addr",
+            "$http_x_api_key",
+            "$cookie_sid",
+            "$arg_token",
+            "$cookie_sid$remote_addr",
+            "${http_x_stu}-${uri}",
+            "$uri",
+            "$host",
+            "$server_port",
+            "$request_method",
+        ] {
+            assert!(
+                check_key_var(good).is_ok(),
+                "{good} 是请求期就有值的变量，不该被否决：{:?}",
+                check_key_var(good)
+            );
         }
+        for bad in [
+            "$status",
+            "$upstream_addr",
+            "$sent_http_x_cache",
+            "$upstream_http_age",
+            "$request_body",
+            "$server_name",
+            "$geoip_country_code",
+            "$not_a_var",
+        ] {
+            assert!(
+                check_key_var(bad).is_err(),
+                "{bad} 在判定时刻取不到值，该被否决"
+            );
+        }
+        // 复合模板逐段判：坏一段就整体否决，并且要点名那一段
+        let e = check_key_var("$cookie_sid$status").unwrap_err();
+        assert!(e.contains("$status"), "{e}");
+        // 一个变量都没有的模板（`$1abc` 这类捕获组字面量）会原样保留，
+        // 于是每个请求共用同一个常量键桶 = 整区变成一条全局限流，同样要否决
+        let e = check_key_var("$1abc").unwrap_err();
+        assert!(e.contains("没有任何展开得出值的变量"), "{e}");
+        assert!(check_key_var("static").is_err(), "纯文本键同样并成一个桶");
+    }
+
+    /// key 在这一维上没有值 = 这个请求不参与本区计数（nginx 同义）。
+    /// 把它们并到一个空 key 的桶里等于给全区加一道看不见的总闸，
+    /// 还会把匿名流量学成"同一个大客户"。
+    #[test]
+    fn zone_key_scopes_counting_to_the_declared_dimension() {
+        let mut ctx = crate::engine::RequestCtx::default();
+        ctx.remote_addr = "10.1.2.3".into();
+        ctx.req_headers = vec![
+            ("x-student".into(), "20210001".into()),
+            ("cookie".into(), "sid=abc; theme=dark".into()),
+        ];
+        ctx.query = "token=t9".into();
+        assert_eq!(zone_key("$remote_addr", &ctx).as_deref(), Some("10.1.2.3"));
+        assert_eq!(
+            zone_key("$binary_remote_addr", &ctx).as_deref(),
+            Some("10.1.2.3")
+        );
+        assert_eq!(
+            zone_key("$http_x_student", &ctx).as_deref(),
+            Some("20210001")
+        );
+        assert_eq!(zone_key("$cookie_sid", &ctx).as_deref(), Some("abc"));
+        assert_eq!(zone_key("$arg_token", &ctx).as_deref(), Some("t9"));
+        assert_eq!(
+            zone_key("$cookie_sid$remote_addr", &ctx).as_deref(),
+            Some("abc10.1.2.3"),
+            "拼接写法按整模板插值"
+        );
+        assert_eq!(
+            zone_key("$http_x_missing", &ctx),
+            None,
+            "没带头的请求不该被计数"
+        );
+        assert_eq!(zone_key("$cookie_nope", &ctx), None);
+        // 地址永远有值：非地址维度才可能返回 None
+        let empty_ctx = crate::engine::RequestCtx::default();
+        assert!(zone_key("$remote_addr", &empty_ctx).is_some());
+        assert_eq!(zone_key("$http_x_student", &empty_ctx), None);
     }
 
     #[test]
@@ -1369,7 +1602,11 @@ mod tests {
             assert!(!adjusted);
         }
         // 停了 300ms（> gap_cap）再来一个：上一股结束，长度 10 成为下次的上界
-        assert_eq!(t.observe("k", 1_750, 64), (10, true), "学到的量要能计入调整次数");
+        assert_eq!(
+            t.observe("k", 1_750, 64),
+            (10, true),
+            "学到的量要能计入调整次数"
+        );
         // 第二股进行中：仍沿用上一股的结论，不会中途改写
         assert_eq!(t.observe("k", 1_800, 64), (10, false));
         assert_eq!(t.observe("k", 1_850, 64), (10, false));
@@ -1390,7 +1627,11 @@ mod tests {
         let mut t = BurstTable::new(16 * 1024, 1_000);
         // 先记下一股正常长度的突发（5 个，仍在洪水线 8 之内）
         for i in 0..5 {
-            assert_eq!(t.observe("bursty", i as i64 * 10, 8).0, 0, "突发没结束前不给深度");
+            assert_eq!(
+                t.observe("bursty", i as i64 * 10, 8).0,
+                0,
+                "突发没结束前不给深度"
+            );
         }
         assert_eq!(t.observe("bursty", 5_000, 8), (5, true), "结束后学到 5");
         // 另一路持续洪水：越过洪水线（8）之后，深度立刻回到无记忆状态
@@ -1410,9 +1651,17 @@ mod tests {
         }
         // 洪水收手后隔很久再来一个：也不该把这么长一股记成"正常突发"，
         // 否则"攻满一分钟再停手"就能换来下一股的深队列
-        assert_eq!(t.observe("flood", 30_000, 8), (0, false), "洪水结束时同样清零");
+        assert_eq!(
+            t.observe("flood", 30_000, 8),
+            (0, false),
+            "洪水结束时同样清零"
+        );
         // 两路互不干扰：突发那路记住的仍是它自己的形状
-        assert_eq!(t.observe("bursty", 20_000, 8), (1, true), "距上次已远超 gap_cap，这股只有 1 个");
+        assert_eq!(
+            t.observe("bursty", 20_000, 8),
+            (1, true),
+            "距上次已远超 gap_cap，这股只有 1 个"
+        );
         assert_eq!(t.snapshot().2, 1, "表里只留突发那路的结论");
     }
 
@@ -1422,7 +1671,10 @@ mod tests {
     fn admit_without_a_queue_policy_matches_check() {
         let z = ReqZone::new("t", 1.0, 2.0, "$remote_addr");
         for _ in 0..3 {
-            assert!(matches!(z.admit("k", None, None), Admit::Pass), "burst+1 内应放行");
+            assert!(
+                matches!(z.admit("k", None, None), Admit::Pass),
+                "burst+1 内应放行"
+            );
         }
         let a = z.admit("k", None, None);
         let Admit::Reject { retry_after_secs } = a else {
@@ -1432,7 +1684,10 @@ mod tests {
         // 队列计数只在"真的可能排队"的区累加：没开队列的区一律为 0，
         // 超限拒绝仍按老路径计入访问日志与通用限流指标。
         let s = z.queue_snapshot();
-        assert_eq!((s.queued, s.rejected_full, s.rejected_slow, s.occupied), (0, 0, 0, 0));
+        assert_eq!(
+            (s.queued, s.rejected_full, s.rejected_slow, s.occupied),
+            (0, 0, 0, 0)
+        );
     }
 
     /// 队列是有界的：排到 depth 就拒，名额随请求结束归还。
@@ -1458,7 +1713,10 @@ mod tests {
         );
         assert_eq!(z.queue_snapshot().occupied, 2);
         drop(held.pop().unwrap());
-        assert!(matches!(z.admit("k", None, None), Admit::Queued { .. }), "归还名额后应可再排");
+        assert!(
+            matches!(z.admit("k", None, None), Admit::Queued { .. }),
+            "归还名额后应可再排"
+        );
         drop(held);
         assert_eq!(z.queue_snapshot().occupied, 0);
         // 别的 key 不受影响：令牌与队列都按 key 独立
@@ -1533,11 +1791,17 @@ mod tests {
         let learn = crate::learning::Learning::parse_all(&cfg);
         assert!(l.apply_queue(&cfg, &learn).is_empty());
         let notes = l.apply_vip(&learn);
-        assert!(notes.iter().any(|n| n.contains("信誉学习：已建")), "{notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("信誉学习：已建")),
+            "{notes:?}"
+        );
         let v = l.vip().expect("apply_vip 应建好信誉表");
         let z = l.req_zone("q").unwrap();
         // 两次 reload 之间配置没变就不该重建表：重建等于把所有在世信誉清零
-        assert!(l.apply_vip(&learn).is_empty(), "配置未变时热重载要复用同一张表");
+        assert!(
+            l.apply_vip(&learn).is_empty(),
+            "配置未变时热重载要复用同一张表"
+        );
         assert!(Arc::ptr_eq(&l.vip().unwrap(), &v));
 
         // 陌生 key：只有 depth_min 一个名额
@@ -1586,11 +1850,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(150));
             }
         }
-        assert_eq!(
-            z.queue_snapshot().learned_max,
-            1,
-            "稀疏流量只该学到长度 1"
-        );
+        assert_eq!(z.queue_snapshot().learned_max, 1, "稀疏流量只该学到长度 1");
         assert_eq!(v.score(plain_key), 2, "两次放行不到 min");
         for _ in 0..2 {
             v.note(trusted_key, crate::vip::Outcome::Passed, now_ms());
@@ -1630,7 +1890,10 @@ mod tests {
         let z = l.req_zone("q").unwrap();
         assert!(l.apply_queue(&cfg, &learn).is_empty());
         let bytes = z.queue_snapshot().table_bytes;
-        assert!(bytes > 0 && bytes <= 8 * 1024, "表按申领量建，实占 {bytes} B");
+        assert!(
+            bytes > 0 && bytes <= 8 * 1024,
+            "表按申领量建，实占 {bytes} B"
+        );
         assert_eq!(learn.used(), bytes, "账本要如实记着这张表");
 
         // 重载后本区不再学习（这里用"账本沿用、区换成别的名字"模拟）：表要还得干干净净
@@ -1668,7 +1931,10 @@ mod tests {
         assert_eq!(z.queue_snapshot().table_bytes, 0, "领不到就不该占内存");
         assert_eq!(learn.used(), 0);
         assert!(matches!(z.admit("k", None, None), Admit::Pass));
-        assert!(matches!(z.admit("k", None, None), Admit::Queued { .. }), "队列本身仍可用");
+        assert!(
+            matches!(z.admit("k", None, None), Admit::Queued { .. }),
+            "队列本身仍可用"
+        );
     }
 
     #[test]
@@ -1709,7 +1975,9 @@ mod tests {
         let l = Limits::parse_all(&cfg);
         let notes = l.apply_queue(&cfg, &crate::learning::Learning::default());
         assert!(
-            notes.iter().any(|n| n.contains("ghost") && n.contains("重启")),
+            notes
+                .iter()
+                .any(|n| n.contains("ghost") && n.contains("重启")),
             "{notes:?}"
         );
         // 只声明了队列、没声明学习：不占任何预算
@@ -1723,8 +1991,13 @@ mod tests {
         assert_eq!(l2.req_zone("q").unwrap().queue_snapshot().table_bytes, 0);
         assert_eq!(learn.used(), 0);
         // -t 摘要只列开了队列的区，没写 limit_req_queue 时一行都不产生
-        assert!(l2.queue_summary().is_empty() || l2.queue_summary().iter().all(|s| s.contains("zone=q")));
-        let empty = Limits::parse_all(&Config::parse("limit_req_zone $remote_addr zone=a:1m rate=1r/s;").unwrap());
+        assert!(
+            l2.queue_summary().is_empty()
+                || l2.queue_summary().iter().all(|s| s.contains("zone=q"))
+        );
+        let empty = Limits::parse_all(
+            &Config::parse("limit_req_zone $remote_addr zone=a:1m rate=1r/s;").unwrap(),
+        );
         assert!(empty.queue_summary().is_empty(), "没开队列不该出现在摘要里");
     }
 }

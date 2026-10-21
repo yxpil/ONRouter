@@ -281,11 +281,14 @@ def scenario_percent():
 
     sticky_bad = []
     for uid in users[:60]:
-        first = request("/release", cookie=f"uid={uid}")[1].get("who")
+        st0, kv0, raw0, _ = request("/release", cookie=f"uid={uid}")
+        first = kv0.get("who")
         for _ in range(2):
-            again = request("/release", cookie=f"uid={uid}")[1].get("who")
+            st, kv, raw, _ = request("/release", cookie=f"uid={uid}")
+            again = kv.get("who")
             if again != first:
-                sticky_bad.append((uid, first, again))
+                # 带上状态码与体：分不清"换了档"和"这次根本没拿到灰度响应"的失败无法追
+                sticky_bad.append((uid, first, f"{st}/{again}", raw[:80]))
     check("同一个用户连续访问永远同一档（粘性键是 cookie_uid+地址）",
           not sticky_bad, str(sticky_bad[:4]))
 

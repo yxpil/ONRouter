@@ -10,7 +10,7 @@
 #      远大于 1s 读超时，但每个间隔都小于 1s → 响应完整成功（不会被总时长误杀）。
 #   4) upstream guard 持有到响应体结束：max_conns=1 的节点在慢体期间仍被占用，
 #      并发第二个请求得到 502 no live upstreams；体读完后立即恢复。
-#   5) 缓存路径（collect 整个体）同样受读超时约束 → 1s 后 502，不悬挂。
+#   5) 缓存路径（collect 整个体）同样受读超时约束 → 1s 后 504（超时是 504，口径同 nginx），不悬挂。
 #
 #   cargo build --release -p onrouter-server --bin onrouter && python tools/proxy_body_timeout_e2e.py
 import os
@@ -269,8 +269,8 @@ def main():
 
         # ---- 6) 缓存路径 collect 同样受读超时约束 ----
         r_cached = raw_get("/cached/stall/1", timeout=8)
-        check("缓存路径遇到停顿上游 → 约 1s 后 502（不悬挂）",
-              r_cached["status"] == 502 and r_cached["elapsed"] < 2.6,
+        check("缓存路径遇到停顿上游 → 约 1s 后 504（不悬挂）",
+              r_cached["status"] == 504 and r_cached["elapsed"] < 2.6,
               f"status={r_cached['status']} elapsed={r_cached['elapsed']:.2f}s")
         check("进程全程存活", proc.poll() is None, f"returncode={proc.poll()}")
     finally:

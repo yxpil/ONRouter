@@ -8,7 +8,9 @@ is covered by a probe that fails on the pre-fix binary and passes on the post-fi
 Harness: `tools/security_matrix_e2e.py` (S1-S7 + S9-S12) and `tools/rce_matrix_e2e.py`
 (remote-execution surface) — one gateway process per probe (no cross-contamination),
 backends that report what they actually received.
-Current result: **36/36** and **32/32 PASS** (R3 grew from 6 to 11 checks when S13 was closed).
+Current result: **49/49** (`tools/security_matrix_e2e.py`, S1-S7 + S9-S13, re-run on the 1.0.2
+binary in `logs/regression/reg_102.txt`) and **32/32 PASS** (R3 grew from 6 to 11 checks when S13
+was closed).
 Post-fix regression (2026-10-20, after S9-S12): `cargo test --workspace` **360/360** and
 the full suite — `python run_regression.py secFixRound.txt` → `TOTAL 72 scripts,
 nonzero=0` (`logs/regression/secFixRound.txt`). Round 1 recorded 281 unit tests and a

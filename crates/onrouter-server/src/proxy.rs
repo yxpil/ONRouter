@@ -23,14 +23,14 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use http::Uri;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
-use hyper::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, HOST, CONNECTION, UPGRADE};
+use hyper::header::{HeaderMap, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, UPGRADE};
 use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
-use http::Uri;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_service::Service as _;
 
@@ -39,7 +39,7 @@ use crate::engine::SplitRole;
 use crate::proxy_tls::{ProxyConnector, ProxyStream, TlsPolicy};
 use crate::router::SplitFailover;
 use crate::upstream::{KeepaliveOpts, UpstreamGuard, UpstreamPool};
-use crate::{log_warn, log_info};
+use crate::{log_info, log_warn};
 
 /// 转发请求体统一擦除成 BoxBody：缓冲路径塞 `Full<Bytes>`，流式路径塞客户端的 `Incoming`，
 /// 二者共用同一套连接池客户端（`Client` 的请求体类型是编译期固定的）。
@@ -48,9 +48,7 @@ pub type ProxyReqBody = BoxBody<Bytes, BoxError>;
 type HyperClient = Client<ProxyConnector, ProxyReqBody>;
 
 fn full_boxed(b: Bytes) -> ProxyReqBody {
-    Full::new(b)
-        .map_err(|e| match e {})
-        .boxed()
+    Full::new(b).map_err(|e| match e {}).boxed()
 }
 
 /// 转发给后端的请求体来源。
@@ -254,7 +252,6 @@ impl Body for UpstreamBody {
     }
 }
 
-
 /// 每个代理 location 的超时（连接级 + 写空闲级 + 读响应头级）
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyTimeouts {
@@ -369,12 +366,7 @@ impl ProxyEngine {
     ///
     /// `strict` = 这个候选来自分流。严格模式下裸名字查不到池就是错误（`no split branch`），
     /// 不交给 DNS 猜；目标写死的老路径 strict=false，行为与今天完全一致。
-    fn pick_backend(
-        &self,
-        cand: &str,
-        remote: &str,
-        strict: bool,
-    ) -> Result<BackendPick, String> {
+    fn pick_backend(&self, cand: &str, remote: &str, strict: bool) -> Result<BackendPick, String> {
         if cand.is_empty() {
             return Err("empty split branch（分桶选中的目标是空串）".to_string());
         }
@@ -458,14 +450,20 @@ impl ProxyEngine {
             connect.as_millis() as u64,
             send.as_millis() as u64,
             ka.max_idle.unwrap_or(usize::MAX) as u64,
-            ka.idle_timeout.map(|d| d.as_millis() as u64).unwrap_or(u64::MAX),
+            ka.idle_timeout
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(u64::MAX),
             if is_https { tls.fingerprint() } else { 0 },
         );
         let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = map.get(&key) {
             return Ok(c.clone());
         }
-        let tls_cfg = if is_https { Some(tls.build_client_config()?) } else { None };
+        let tls_cfg = if is_https {
+            Some(tls.build_client_config()?)
+        } else {
+            None
+        };
         let connector = ProxyConnector::new(connect, send, tls_cfg, tls);
         let mut builder = Client::builder(TokioExecutor::new());
         builder.timer(TokioTimer::new());
@@ -604,19 +602,7 @@ impl ProxyEngine {
         }
 
         let out_path = match uri_part {
-            Some(repl) => {
-                let rel = match ctx.effective_path().strip_prefix(loc_prefix) {
-                    Some(r) => r,
-                    None => ctx.effective_path(),
-                };
-                let rel = if rel.is_empty() { "/" } else { rel };
-                let base = repl.trim_end_matches('/');
-                if rel.starts_with('/') {
-                    format!("{base}{rel}")
-                } else {
-                    format!("{base}/{rel}")
-                }
-            }
+            Some(repl) => rewrite_proxy_path(ctx.effective_path(), loc_prefix, &repl),
             None => ctx.effective_path().to_string(),
         };
         let query = if ctx.query.is_empty() {
@@ -628,7 +614,9 @@ impl ProxyEngine {
         // 转发请求头：复制后按 proxy_set_header 覆盖（构建一次，重试时 clone）
         let mut headers = HeaderMap::new();
         for (k, v) in &ctx.req_headers {
-            if is_hop_by_hop(k) || k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("expect")
+            if is_hop_by_hop(k)
+                || k.eq_ignore_ascii_case("content-length")
+                || k.eq_ignore_ascii_case("expect")
             {
                 continue;
             }
@@ -741,16 +729,11 @@ impl ProxyEngine {
                 self.connect_target(&backend).await?
             };
             let scheme = if is_https { "https" } else { "http" };
-            let uri = format!(
-                "{scheme}://{connect_host}{}{query}",
-                encode_path(&out_path),
-            );
+            let uri = format!("{scheme}://{connect_host}{}{query}", encode_path(&out_path),);
             // 每次尝试重建请求体：缓冲体可回放（clone Bytes），流式体只能取用一次
             let req_body: ProxyReqBody = match &mut body {
                 ProxyBody::Buffered(b) => full_boxed(b.as_ref().cloned().unwrap_or_default()),
-                ProxyBody::Streaming(inc) => {
-                    inc.take().expect("streaming body 仅用于单次尝试")
-                }
+                ProxyBody::Streaming(inc) => inc.take().expect("streaming body 仅用于单次尝试"),
             };
             let (sent_tx, mut sent_rx) = tokio::sync::watch::channel(false);
             let mut req_body = BodySent {
@@ -786,17 +769,23 @@ impl ProxyEngine {
                     // 预算耗尽/次数用尽时把最后一个上游响应原样返回（nginx 不会改写成 502）。
                     let within_budget =
                         retry_deadline.map_or(true, |d| std::time::Instant::now() < d);
-                    if !retry_statuses.is_empty()
+                    let matched_fail_status =
+                        !retry_statuses.is_empty() && retry_statuses.contains(&status);
+                    if matched_fail_status
                         && method_retryable
-                        && retry_statuses.contains(&status)
                         && attempt + 1 < max_attempts
                         && within_budget
                     {
+                        // 真的换节点了，这一次尝试才算"失败尝试"：nginx 只在 upstream_next 里
+                        // 打 NGX_PEER_FAILED，而 403/404 走的是 NGX_PEER_NEXT，不计。
+                        // 缺了这一步，"只会回 503 的后端"永远摘不掉：max_fails 数不到它。
+                        if !matches!(status, 403 | 404) {
+                            note(&guard_holder, false);
+                        }
                         guard_holder = None;
                         ctx.upstream_status = status;
-                        last_err = format!(
-                            "后端返回 {status}，按 proxy_next_upstream 换节点: {backend}"
-                        );
+                        last_err =
+                            format!("后端返回 {status}，按 proxy_next_upstream 换节点: {backend}");
                         log_warn!("{last_err}");
                         drop(r);
                         continue;
@@ -810,6 +799,9 @@ impl ProxyEngine {
                     if let Some(g) = &guard_holder {
                         g.note_latency(header_dt);
                     }
+                    // 到这里就是"命中了 http_XXX 但这次不换节点"（最后一台/预算用尽/非幂等）。
+                    // nginx 此时把上游响应原样回给客户端，并且**不**记失败尝试——失败只随真正的
+                    // upstream_next 发生。这里保持一致，不去"顺手摘掉"最后一台。
                     return Ok(Response::from_parts(
                         parts,
                         UpstreamBody::new(incoming, eff_read, guard_holder.take(), backend.clone()),
@@ -848,6 +840,17 @@ impl ProxyEngine {
     }
 }
 
+/// `proxy_pass` 带 URI 部分时的转发路径：把匹配到的 location 前缀整段换成 URI 部分，
+/// 余下的原样接上。nginx 这里是**纯字符串替换**——既不补斜杠也不删斜杠，余下部分可以为空。
+/// 单独成函数是因为"请求路径正好等于前缀"这一条曾经被补成 `/api/hot/`：后端把同一个资源
+/// 看成两条路由（框架的精确路由表就是这样），缓存键也跟着分叉。
+fn rewrite_proxy_path(effective: &str, loc_prefix: &str, repl: &str) -> String {
+    match effective.strip_prefix(loc_prefix) {
+        Some(rel) => format!("{repl}{rel}"),
+        None => effective.to_string(),
+    }
+}
+
 /// 路径按段重新做百分号编码后转发：
 /// location 匹配用的是解码后的路径，而 URI 语法不允许空格/控制字符/裸 UTF-8 字节，
 /// 直接把解码结果拼进转发 URI 会让后端收到非法请求行（含中文文件名、带空格的路径必现）。
@@ -879,8 +882,17 @@ fn raw_upgrade_target(ctx: &RequestCtx) -> Option<String> {
 fn is_idempotent(method: &str) -> bool {
     matches!(
         method,
-        "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PROPFIND" | "COPY" | "MOVE" | "MKCOL" | "LOCK"
-            | "UNLOCK" | "SEARCH"
+        "GET"
+            | "HEAD"
+            | "OPTIONS"
+            | "TRACE"
+            | "PROPFIND"
+            | "COPY"
+            | "MOVE"
+            | "MKCOL"
+            | "LOCK"
+            | "UNLOCK"
+            | "SEARCH"
     )
 }
 
@@ -913,8 +925,14 @@ fn split_host_port(s: &str) -> (&str, u16) {
 pub fn is_hop_by_hop(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "connection" | "keep-alive" | "proxy-authenticate" | "proxy-authorization"
-            | "te" | "trailer" | "transfer-encoding" | "upgrade"
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
     )
 }
 
@@ -933,6 +951,26 @@ fn error_root(e: &(dyn std::error::Error + 'static)) -> String {
 fn looks_like_connect_error(root: &str) -> bool {
     let s = root.to_ascii_lowercase();
     s.contains("connect") || s.contains("dns") || s.contains("refused")
+}
+
+/// 上游超时（连不上之外的"等了太久"）。
+fn looks_like_upstream_timeout(err: &str) -> bool {
+    let s = err.to_ascii_lowercase();
+    s.contains("超时") || s.contains("timed out") || s.contains("timeout")
+}
+
+/// 回源失败该给客户端哪个状态码。
+///
+/// nginx 把"后端慢"和"后端坏"分成两个码：等满 `proxy_*_timeout` 是 504，连不上/响应非法
+/// 才是 502。这个区分不是好看：告警规则、`error_page 504`、以及"该扩容还是该查进程"的
+/// 判断都建立在它上面；并进 502 会让一台只是慢的后端看起来像一台挂掉的后端。
+/// hyper 把错误折叠成字符串，所以按本文件在回源路径上写出的根因文本判定。
+pub fn upstream_error_status(err: &str) -> u16 {
+    if looks_like_upstream_timeout(err) {
+        504
+    } else {
+        502
+    }
 }
 
 /// hyper 把所有协议错误折叠成字符串，只能按根因文本近似识别"响应头非法"
@@ -1027,14 +1065,16 @@ pub(crate) fn interpolate_vars_with(
 /// 检测是否为 WebSocket/Upgrade 请求（对标 nginx 的 map $http_upgrade $connection_upgrade）
 pub fn is_upgrade_request(headers: &HeaderMap) -> bool {
     // Connection 头必须包含 "upgrade"
-    let has_upgrade_conn = headers
-        .get_all(CONNECTION)
-        .iter()
-        .any(|v| v.to_str().ok().map(|s| s.to_ascii_lowercase().contains("upgrade")).unwrap_or(false));
-    
+    let has_upgrade_conn = headers.get_all(CONNECTION).iter().any(|v| {
+        v.to_str()
+            .ok()
+            .map(|s| s.to_ascii_lowercase().contains("upgrade"))
+            .unwrap_or(false)
+    });
+
     // Upgrade 头存在（通常是 "websocket"，但也可以是其他协议）
     let has_upgrade_header = headers.contains_key(UPGRADE);
-    
+
     has_upgrade_conn && has_upgrade_header
 }
 
@@ -1091,9 +1131,7 @@ impl ProxyEngine {
             .filter(|_| ctx.balancer_peer.is_none())
             .map(|sp| (sp, host_part.clone()));
         let chosen: Option<&str> = routing.as_ref().map(|(_, c)| c.as_str());
-        let stats = routing
-            .as_ref()
-            .and_then(|(sp, _)| sp.stats.clone());
+        let stats = routing.as_ref().and_then(|(sp, _)| sp.stats.clone());
         if let Some(c) = chosen {
             ctx.proxy_split = c.to_string();
             if c.is_empty() {
@@ -1109,9 +1147,7 @@ impl ProxyEngine {
                 let mut hit: Option<BackendPick> = None;
                 let mut err = String::new();
                 for cand in candidates.iter() {
-                    let p = match self
-                        .pick_backend(cand, &ctx.remote_addr, chosen.is_some())
-                    {
+                    let p = match self.pick_backend(cand, &ctx.remote_addr, chosen.is_some()) {
                         Ok(p) => p,
                         Err(e) => {
                             if let Some(st) = &stats {
@@ -1164,7 +1200,10 @@ impl ProxyEngine {
         // 访问日志的 $upstream_addr：即使在后续建连/握手阶段失败也要留下尝试目标
         ctx.upstream_addr = backend_addr.clone();
         let (host, port) = match backend_addr.split_once(':') {
-            Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| format!("非法端口: {p}"))?),
+            Some((h, p)) => (
+                h.to_string(),
+                p.parse::<u16>().map_err(|_| format!("非法端口: {p}"))?,
+            ),
             None => (backend_addr.clone(), if is_tls { 443 } else { 80 }),
         };
         // 明文：有 resolver 且是域名时先异步解析成 IP 再连（HOST 头仍用原始名）；
@@ -1200,7 +1239,11 @@ impl ProxyEngine {
             .balancer_timeouts
             .map(|t| std::time::Duration::from_millis(t.2))
             .unwrap_or(opts.timeouts.read);
-        let tls_cfg = if is_tls { Some(opts.tls.build_client_config()?) } else { None };
+        let tls_cfg = if is_tls {
+            Some(opts.tls.build_client_config()?)
+        } else {
+            None
+        };
         let mut connector = ProxyConnector::new(eff_connect, eff_send, tls_cfg, opts.tls);
         let scheme = if is_tls { "https" } else { "http" };
         let dst: Uri = format!("{scheme}://{connect_host}:{port}")
@@ -1221,7 +1264,10 @@ impl ProxyEngine {
         // 构建升级请求头
         let mut req_headers = HeaderMap::new();
         for (k, v) in &ctx.req_headers {
-            if is_hop_by_hop(k) || k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("expect") {
+            if is_hop_by_hop(k)
+                || k.eq_ignore_ascii_case("content-length")
+                || k.eq_ignore_ascii_case("expect")
+            {
                 continue;
             }
             if let (Ok(name), Ok(val)) = (
@@ -1233,11 +1279,15 @@ impl ProxyEngine {
         }
         req_headers.insert(
             HOST,
-            HeaderValue::try_from(ctx.host.as_deref().unwrap_or(&host)).map_err(|e| e.to_string())?,
+            HeaderValue::try_from(ctx.host.as_deref().unwrap_or(&host))
+                .map_err(|e| e.to_string())?,
         );
         req_headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
         if let Some(upgrade) = ctx.header("upgrade") {
-            req_headers.insert(UPGRADE, HeaderValue::try_from(upgrade).map_err(|e| e.to_string())?);
+            req_headers.insert(
+                UPGRADE,
+                HeaderValue::try_from(upgrade).map_err(|e| e.to_string())?,
+            );
         }
         for (k, v) in opts.set_headers {
             let name = hyper::header::HeaderName::try_from(*k)
@@ -1259,7 +1309,9 @@ impl ProxyEngine {
         };
         let mut request_buf = request_line.into_bytes();
         for (name, value) in &req_headers {
-            request_buf.extend_from_slice(format!("{}: {}\r\n", name, value.to_str().unwrap_or("")).as_bytes());
+            request_buf.extend_from_slice(
+                format!("{}: {}\r\n", name, value.to_str().unwrap_or("")).as_bytes(),
+            );
         }
         request_buf.extend_from_slice(b"\r\n");
 
@@ -1310,7 +1362,9 @@ impl ProxyEngine {
         let head_str = String::from_utf8_lossy(&resp_buf[..head_end]).to_string();
         let mut lines = head_str.split("\r\n");
         let first_line = lines.next().unwrap_or("");
-        let status_code = if first_line.len() >= 12 && (first_line.starts_with("HTTP/1.1 ") || first_line.starts_with("HTTP/1.0 ")) {
+        let status_code = if first_line.len() >= 12
+            && (first_line.starts_with("HTTP/1.1 ") || first_line.starts_with("HTTP/1.0 "))
+        {
             first_line[9..12].parse::<u16>().unwrap_or(0)
         } else {
             0
@@ -1338,7 +1392,11 @@ impl ProxyEngine {
         if let Some(g) = &guard_holder {
             g.note_success();
         }
-        log_info!("WebSocket/Upgrade 隧道已建联: {} -> {}", ctx.remote_addr, backend_addr);
+        log_info!(
+            "WebSocket/Upgrade 隧道已建联: {} -> {}",
+            ctx.remote_addr,
+            backend_addr
+        );
         Ok(UpgradeTunnel {
             stream: backend_stream,
             headers,
@@ -1352,6 +1410,68 @@ impl ProxyEngine {
 mod tests {
     use super::*;
     use crate::engine::RequestCtx;
+
+    /// nginx 的 proxy_pass URI 语义是纯字符串替换。逐条钉住，特别是"请求正好等于前缀"
+    /// 与"前缀不带斜杠而剩余带斜杠"这两种最容易悄悄改变后端所见路径的写法。
+    #[test]
+    fn proxy_pass_uri_replacement_is_pure_string_replacement() {
+        assert_eq!(
+            rewrite_proxy_path("/api/hot", "/api/hot", "/api/hot"),
+            "/api/hot"
+        );
+        assert_eq!(
+            rewrite_proxy_path("/api/hot", "/api/hot", "/v1/hot"),
+            "/v1/hot"
+        );
+        assert_eq!(
+            rewrite_proxy_path("/api/hot/detail", "/api/hot", "/v1/hot"),
+            "/v1/hot/detail"
+        );
+        // 经典写法：location /api/ + proxy_pass http://app/
+        assert_eq!(rewrite_proxy_path("/api/hello", "/api/", "/"), "/hello");
+        assert_eq!(rewrite_proxy_path("/api/", "/api/", "/"), "/");
+        // 前缀不带尾斜杠、proxy_pass 的 URI 带尾斜杠、剩余部分又带斜杠：nginx 就是
+        // "directive 的 URI + 去掉 location 前缀后的剩余"（ngx_http_proxy_module.c 里
+        // loc_len = ngx_min(plcf->location.len, r->uri.len)），**不去重斜杠**，
+        // 所以这条会得到 `/v1//x` —— 这是 nginx 的真实输出，也是文档劝人以斜杠结尾的原因。
+        assert_eq!(rewrite_proxy_path("/api/x", "/api", "/v1/"), "/v1//x");
+        assert_eq!(rewrite_proxy_path("/api/x", "/api/", "/v1/"), "/v1/x");
+        // 前缀匹配到 /apix 这种"半个词"的剩余部分：nginx 直接拼，不补斜杠（这是它的既有
+        // 语义，也是"proxy_pass 的 location 请以斜杠结尾"那条告诫的来源）
+        assert_eq!(rewrite_proxy_path("/apix", "/api", "/v1"), "/v1x");
+        // 精确匹配的 location
+        assert_eq!(rewrite_proxy_path("/x", "/x", "/y"), "/y");
+        // rewrite 改写过路径、与前缀对不上时：原样转发，不猜
+        assert_eq!(rewrite_proxy_path("/other", "/api", "/v1"), "/other");
+    }
+
+    /// nginx 把"后端慢"和"后端坏"分成 504 与 502。告警规则、`error_page 504` 与
+    /// "该扩容还是该查进程"都建立在这个区分上，所以两类根因都要钉住。
+    #[test]
+    fn upstream_timeout_maps_to_504_and_broken_upstream_to_502() {
+        for e in [
+            "proxy_read_timeout (1s) 超时: 127.0.0.1:18631",
+            "等待后端 101 超时: 127.0.0.1:18631",
+            "代理请求失败 127.0.0.1:1 | 根因: operation timed out",
+        ] {
+            assert_eq!(upstream_error_status(e), 504, "超时应当是 504：{e}");
+        }
+        for e in [
+            "连接后端失败 127.0.0.1:1: 由于目标计算机积极拒绝，无法连接。",
+            "no live upstreams: app（全部节点在摘除期内）",
+            "unresolvable 'svc.invalid': dns",
+            "后端未返回 101，而是 400",
+        ] {
+            assert_eq!(upstream_error_status(e), 502, "连不上/坏响应仍是 502：{e}");
+        }
+        // 拒绝连接里出现的 "Connection refused" 不该被误判成超时
+        assert_eq!(
+            upstream_error_status(
+                "代理请求失败 127.0.0.1:1 | 根因: Connection refused (os error 10061)"
+            ),
+            502
+        );
+    }
 
     fn ctx() -> RequestCtx {
         RequestCtx {
@@ -1416,7 +1536,10 @@ mod tests {
             interpolate_vars("$scheme://$host:$server_port$uri?$args", &c),
             "https://www.example.com:8080/api/x?a=1"
         );
-        assert_eq!(interpolate_vars("$remote_addr:$remote_port", &c), "10.0.0.9:54321");
+        assert_eq!(
+            interpolate_vars("$remote_addr:$remote_port", &c),
+            "10.0.0.9:54321"
+        );
         assert_eq!(
             interpolate_vars("$proxy_add_x_forwarded_for", &c),
             "1.1.1.1, 10.0.0.9"
@@ -1426,7 +1549,10 @@ mod tests {
     #[test]
     fn expands_http_header_vars() {
         let c = ctx();
-        assert_eq!(interpolate_vars("[$http_user_agent|$http_missing]", &c), "[curl/8|]");
+        assert_eq!(
+            interpolate_vars("[$http_user_agent|$http_missing]", &c),
+            "[curl/8|]"
+        );
         // 变量名里下划线代表连字符
         assert_eq!(interpolate_vars("$http_x_forwarded_for", &c), "1.1.1.1");
     }
@@ -1452,16 +1578,26 @@ mod tests {
     fn known_but_valueless_var_expands_empty_unknown_stays_literal() {
         let c = ctx();
         // nginx 认识的名字但这次没值 → 空串（$upstream_cache_status 在非缓存请求上就是空）
-        assert_eq!(interpolate_vars("[$upstream_cache_status|$arg_no]", &c), "[|]");
+        assert_eq!(
+            interpolate_vars("[$upstream_cache_status|$arg_no]", &c),
+            "[|]"
+        );
         // 根本不像 nginx 变量的名字（拼错、或 set 之外的自定义名）保留字面量，
         // 让配置错误在响应头里看得见，而不是静默变成空值
         assert_eq!(interpolate_vars("$hstop", &c), "$hstop");
-        assert_eq!(interpolate_vars("$upstream_cache_statusx", &c), "$upstream_cache_statusx");
+        assert_eq!(
+            interpolate_vars("$upstream_cache_statusx", &c),
+            "$upstream_cache_statusx"
+        );
         // $host 去端口、$http_host 原样：两条路径共用 builtin_var 这一个事实源
         let mut c2 = ctx();
         c2.host = Some("example.test:8080".into());
-        c2.req_headers.push(("host".into(), "example.test:8080".into()));
-        assert_eq!(interpolate_vars("$host|$http_host", &c2), "example.test|example.test:8080");
+        c2.req_headers
+            .push(("host".into(), "example.test:8080".into()));
+        assert_eq!(
+            interpolate_vars("$host|$http_host", &c2),
+            "example.test|example.test:8080"
+        );
     }
 
     #[test]
@@ -1489,7 +1625,10 @@ mod tests {
     #[test]
     fn forwarded_path_is_reencoded_per_segment() {
         // 解码后的中文/空格必须重新编码，否则后端拿到非法请求行
-        assert_eq!(encode_path("/a b/中文.html"), "/a%20b/%E4%B8%AD%E6%96%87.html");
+        assert_eq!(
+            encode_path("/a b/中文.html"),
+            "/a%20b/%E4%B8%AD%E6%96%87.html"
+        );
         // 原本就是转义形式的 '%' 不能二次误解
         assert_eq!(encode_path("/100%25/"), "/100%2525/");
         assert_eq!(encode_path("/"), "/");
@@ -1503,7 +1642,10 @@ mod tests {
         c.uri = "/ws%23frag?x=1%3fy=2".to_string();
         c.path = "/ws#frag".to_string();
         c.query = "x=1%3fy=2".to_string();
-        assert_eq!(raw_upgrade_target(&c).as_deref(), Some("/ws%23frag?x=1%3fy=2"));
+        assert_eq!(
+            raw_upgrade_target(&c).as_deref(),
+            Some("/ws%23frag?x=1%3fy=2")
+        );
         // rewrite 改写出来的是解码态路径，只能重新编码；绝对形式/`*` 同理
         c.rewritten_path = Some("/rewritten".to_string());
         assert_eq!(raw_upgrade_target(&c), None);
@@ -1536,9 +1678,27 @@ mod tests {
         let e = ProxyEngine::new(pool);
         let k = KeepaliveOpts::default();
         let tls = TlsPolicy::default();
-        let a = e.client(Duration::from_secs(3), Duration::from_secs(60), k, &tls, false);
-        let b = e.client(Duration::from_secs(3), Duration::from_secs(60), k, &tls, false);
-        let c = e.client(Duration::from_secs(7), Duration::from_secs(60), k, &tls, false);
+        let a = e.client(
+            Duration::from_secs(3),
+            Duration::from_secs(60),
+            k,
+            &tls,
+            false,
+        );
+        let b = e.client(
+            Duration::from_secs(3),
+            Duration::from_secs(60),
+            k,
+            &tls,
+            false,
+        );
+        let c = e.client(
+            Duration::from_secs(7),
+            Duration::from_secs(60),
+            k,
+            &tls,
+            false,
+        );
         let _ = (&a, &b, &c);
         let n = e.clients.lock().unwrap().len();
         assert_eq!(n, 2, "两个不同的 connect 超时应有两个客户端池");
@@ -1551,12 +1711,42 @@ mod tests {
         let e = ProxyEngine::new(pool);
         let tls = TlsPolicy::default();
         let base = KeepaliveOpts::default();
-        let capped = KeepaliveOpts { max_idle: Some(8), idle_timeout: None };
-        let timed = KeepaliveOpts { max_idle: None, idle_timeout: Some(Duration::from_secs(5)) };
-        let _ = e.client(Duration::from_secs(3), Duration::from_secs(60), base, &tls, false);
-        let _ = e.client(Duration::from_secs(3), Duration::from_secs(60), base, &tls, false); // 同键 → 命中缓存，不新增
-        let _ = e.client(Duration::from_secs(3), Duration::from_secs(60), capped, &tls, false);
-        let _ = e.client(Duration::from_secs(3), Duration::from_secs(60), timed, &tls, false);
+        let capped = KeepaliveOpts {
+            max_idle: Some(8),
+            idle_timeout: None,
+        };
+        let timed = KeepaliveOpts {
+            max_idle: None,
+            idle_timeout: Some(Duration::from_secs(5)),
+        };
+        let _ = e.client(
+            Duration::from_secs(3),
+            Duration::from_secs(60),
+            base,
+            &tls,
+            false,
+        );
+        let _ = e.client(
+            Duration::from_secs(3),
+            Duration::from_secs(60),
+            base,
+            &tls,
+            false,
+        ); // 同键 → 命中缓存，不新增
+        let _ = e.client(
+            Duration::from_secs(3),
+            Duration::from_secs(60),
+            capped,
+            &tls,
+            false,
+        );
+        let _ = e.client(
+            Duration::from_secs(3),
+            Duration::from_secs(60),
+            timed,
+            &tls,
+            false,
+        );
         assert_eq!(
             e.clients.lock().unwrap().len(),
             3,
@@ -1587,7 +1777,13 @@ mod tests {
         // 同策略再来一次 → 命中缓存，不新增
         let _ = e.client(Duration::from_secs(3), Duration::from_secs(60), k, &a, true);
         // http 目标忽略 TLS 指纹（第四键恒 0），与上面两个 https 池都不同键
-        let _ = e.client(Duration::from_secs(3), Duration::from_secs(60), k, &a, false);
+        let _ = e.client(
+            Duration::from_secs(3),
+            Duration::from_secs(60),
+            k,
+            &a,
+            false,
+        );
         assert_eq!(e.clients.lock().unwrap().len(), 3);
     }
 
@@ -1618,7 +1814,13 @@ mod tests {
             tls: &tls,
         };
         let err = e
-            .forward(&mut c, "https://example.com", "/api", &opts, ProxyBody::Buffered(None))
+            .forward(
+                &mut c,
+                "https://example.com",
+                "/api",
+                &opts,
+                ProxyBody::Buffered(None),
+            )
             .await
             .unwrap_err();
         assert!(err.contains("proxy_ssl_trusted_certificate"), "{err}");
@@ -1651,7 +1853,13 @@ mod tests {
             tls: &tls,
         };
         let r = e
-            .forward(&mut c, "http://127.0.0.1:1", "/api", &opts, ProxyBody::Buffered(None))
+            .forward(
+                &mut c,
+                "http://127.0.0.1:1",
+                "/api",
+                &opts,
+                ProxyBody::Buffered(None),
+            )
             .await;
         assert!(r.is_err(), "无监听端口应转发失败");
         assert_eq!(c.upstream_addr, "127.0.0.1:1");
@@ -1670,23 +1878,39 @@ mod tests {
         let e = ProxyEngine::new(Arc::new(UpstreamPool::default()));
         let tls = TlsPolicy::default();
         let allow = Arc::new(
-            [declared.clone()].
-                into_iter()
+            [declared.clone()]
+                .into_iter()
                 .collect::<std::collections::HashSet<String>>(),
         );
         let mut opts = test_opts(&tls, None, SplitFailover::On);
         opts.var_targets = Some(&allow);
 
         let err = e
-            .forward(&mut ctx(), &format!("http://{canary}"), "/x", &opts, ProxyBody::Buffered(None))
+            .forward(
+                &mut ctx(),
+                &format!("http://{canary}"),
+                "/x",
+                &opts,
+                ProxyBody::Buffered(None),
+            )
             .await
             .unwrap_err();
         assert!(err.contains("undeclared proxy_pass target"), "{err}");
-        assert_eq!(canary_hits.load(Relaxed), 0, "白名单外的落点一次连接都不该发起");
+        assert_eq!(
+            canary_hits.load(Relaxed),
+            0,
+            "白名单外的落点一次连接都不该发起"
+        );
 
         let mut c2 = ctx();
         let ok = e
-            .forward(&mut c2, &format!("http://{declared}"), "/x", &opts, ProxyBody::Buffered(None))
+            .forward(
+                &mut c2,
+                &format!("http://{declared}"),
+                "/x",
+                &opts,
+                ProxyBody::Buffered(None),
+            )
             .await;
         assert!(ok.is_ok(), "挂进集合的落点不该被拦：{:?}", ok.err());
         assert_eq!(declared_hits.load(Relaxed), 1);
@@ -1702,7 +1926,10 @@ mod tests {
         assert!(off.build_client_config().is_ok());
         // verify on 且无 trusted cert：明确报错（离线未链接系统根库）
         let on = TlsPolicy::default();
-        assert!(on.build_client_config().unwrap_err().contains("proxy_ssl_trusted_certificate"));
+        assert!(on
+            .build_client_config()
+            .unwrap_err()
+            .contains("proxy_ssl_trusted_certificate"));
         // 不同策略的指纹必须不同，避免连接池串味
         assert_ne!(off.fingerprint(), on.fingerprint());
     }
@@ -1776,7 +2003,10 @@ mod tests {
             vec!["v2", "v3"]
         );
         // 没有分流（目标写死）：一个候选，与今天的行为逐字一致
-        assert_eq!(split_candidates("backend", None, &SplitFailover::On), vec!["backend"]);
+        assert_eq!(
+            split_candidates("backend", None, &SplitFailover::On),
+            vec!["backend"]
+        );
     }
 
     #[test]
@@ -1788,10 +2018,16 @@ mod tests {
             Ok(_) => panic!("裸名字的分支不该被交给 DNS 猜"),
         };
         assert!(err.contains("no split branch"), "实际: {err}");
-        assert!(e.pick_backend("v9", "10.0.0.9", false).is_ok(), "目标写死时保持今天的直连语义");
+        assert!(
+            e.pick_backend("v9", "10.0.0.9", false).is_ok(),
+            "目标写死时保持今天的直连语义"
+        );
         // 自带落点的写法在严格模式下照样允许
         assert!(e.pick_backend("127.0.0.1:8080", "10.0.0.9", true).is_ok());
-        assert!(e.pick_backend("10.0.0.5", "10.0.0.9", true).is_ok(), "IP 字面量不经 DNS");
+        assert!(
+            e.pick_backend("10.0.0.5", "10.0.0.9", true).is_ok(),
+            "IP 字面量不经 DNS"
+        );
         let empty = match e.pick_backend("", "10.0.0.9", true) {
             Err(e) => e,
             Ok(_) => panic!("空分支不可能有落点"),
@@ -1806,12 +2042,17 @@ mod tests {
         };
         assert!(["127.0.0.1:8081", "127.0.0.1:8082"].contains(&p.backend.as_str()));
         assert_eq!(p.pool.as_deref(), Some("gray"));
-        assert_eq!(p.tried.len(), 1, "首个节点要计入 tried，否则换节点会重复选同一台");
+        assert_eq!(
+            p.tried.len(),
+            1,
+            "首个节点要计入 tried，否则换节点会重复选同一台"
+        );
     }
 
     #[tokio::test]
     async fn bleeding_only_happens_when_the_chosen_branch_has_no_backend() {
-        let (b_addr, b_hits) = counted_backend("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let (b_addr, b_hits) =
+            counted_backend("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
         let dead = dead_port().await;
         let pool = pool_of(&format!(
             "upstream a {{ server {dead}; }} upstream b {{ server {b_addr}; }}"
@@ -1824,7 +2065,13 @@ mod tests {
         // 第一次：a 池里还有"可选节点"，请求发出去后被拒 —— 这不是改投时刻，原样失败
         let mut c1 = ctx();
         let r1 = e
-            .forward(&mut c1, "http://a", "/api", &opts, ProxyBody::Buffered(None))
+            .forward(
+                &mut c1,
+                "http://a",
+                "/api",
+                &opts,
+                ProxyBody::Buffered(None),
+            )
             .await;
         assert!(r1.is_err(), "本意那路拒接时应原样失败");
         assert_eq!(c1.proxy_split, "a");
@@ -1834,25 +2081,43 @@ mod tests {
         assert_eq!(stats.served("a"), 1);
         assert_eq!(stats.role(SplitRole::Routed), 1);
         assert_eq!(stats.role(SplitRole::Bled), 0);
-        assert_eq!(stats.role(SplitRole::Down), 0, "a 当时还有可选节点，不是'没人可服务'");
+        assert_eq!(
+            stats.role(SplitRole::Down),
+            0,
+            "a 当时还有可选节点，不是'没人可服务'"
+        );
         // 第二次：被动健康检查已把 a 摘除 —— 这才是"这一路没人可服务"，允许改投
         let mut c2 = ctx();
         let r2 = e
-            .forward(&mut c2, "http://a", "/api", &opts, ProxyBody::Buffered(None))
+            .forward(
+                &mut c2,
+                "http://a",
+                "/api",
+                &opts,
+                ProxyBody::Buffered(None),
+            )
             .await;
         assert!(r2.is_ok(), "a 全摘后应按 proxy_split_failover 改投到 b");
         assert_eq!(c2.proxy_split, "a", "$proxy_split 记的是按比例选中的那一路");
-        assert_eq!(c2.proxy_split_served, "b", "实际服务的是改投后的那一路，两者不同才说明串过台");
+        assert_eq!(
+            c2.proxy_split_served, "b",
+            "实际服务的是改投后的那一路，两者不同才说明串过台"
+        );
         assert_eq!(b_hits.load(Relaxed), 1);
         assert_eq!(stats.served("b"), 1);
         assert_eq!(stats.role(SplitRole::Down), 1);
         assert_eq!(stats.role(SplitRole::Bled), 1);
-        assert_eq!(stats.role(SplitRole::Routed), 1, "改投那次记 bled，不重复记 routed");
+        assert_eq!(
+            stats.role(SplitRole::Routed),
+            1,
+            "改投那次记 bled，不重复记 routed"
+        );
     }
 
     #[tokio::test]
     async fn failover_off_keeps_the_failure_in_its_own_branch() {
-        let (b_addr, b_hits) = counted_backend("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let (b_addr, b_hits) =
+            counted_backend("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
         let dead = dead_port().await;
         let pool = pool_of(&format!(
             "upstream a {{ server {dead}; }} upstream b {{ server {b_addr}; }}"
@@ -1865,10 +2130,19 @@ mod tests {
         // 先让 a 的节点拒接一次，把它摘除
         let mut c0 = ctx();
         assert!(e
-            .forward(&mut c0, "http://a", "/api", &opts, ProxyBody::Buffered(None))
+            .forward(
+                &mut c0,
+                "http://a",
+                "/api",
+                &opts,
+                ProxyBody::Buffered(None)
+            )
             .await
             .is_err());
-        assert_eq!(c0.proxy_split_served, "a", "请求确实交给了 a 的节点，只是那台拒接");
+        assert_eq!(
+            c0.proxy_split_served, "a",
+            "请求确实交给了 a 的节点，只是那台拒接"
+        );
         // 摘除之后再请求：off 模式下"这一路没人可服务"也不改投，原样失败
         for _ in 0..2 {
             let mut c = ctx();
@@ -1877,7 +2151,10 @@ mod tests {
                 .await;
             assert!(r.is_err(), "不串台：这一路的失败原样回给客户端");
             assert_eq!(c.proxy_split, "a");
-            assert_eq!(c.proxy_split_served, "", "一个节点都没交给，就不该有'实际服务的那一路'");
+            assert_eq!(
+                c.proxy_split_served, "",
+                "一个节点都没交给，就不该有'实际服务的那一路'"
+            );
         }
         assert_eq!(b_hits.load(Relaxed), 0, "off 模式下 b 一次都不该被碰到");
         assert_eq!(stats.role(SplitRole::Bled), 0);
@@ -1893,8 +2170,10 @@ mod tests {
         // 这条是整套语义的安全边界：后端已经收到过请求，成败归 proxy_next_upstream / error_page，
         // 绝不能跨路重投 —— 否则一个 POST 会被写进两个业务版本。
         let (a_addr, a_hits) =
-            counted_backend("HTTP/1.0 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n").await;
-        let (b_addr, b_hits) = counted_backend("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+            counted_backend("HTTP/1.0 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        let (b_addr, b_hits) =
+            counted_backend("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
         let pool = pool_of(&format!(
             "upstream a {{ server {a_addr}; }} upstream b {{ server {b_addr}; }}"
         ));

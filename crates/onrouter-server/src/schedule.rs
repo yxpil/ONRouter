@@ -45,11 +45,19 @@ impl Zone {
         }
         let (sign, rest) = match s.as_bytes().first() {
             Some(b'+') | Some(b'-') => (s.as_bytes()[0] as char, &s[1..]),
-            _ => return Err(format!("invalid timezone {spec}: only UTC or a fixed +HH:MM / -HH:MM offset is accepted")),
+            _ => {
+                return Err(format!(
+                "invalid timezone {spec}: only UTC or a fixed +HH:MM / -HH:MM offset is accepted"
+            ))
+            }
         };
         let (hh, mm) = match rest.split_once(':') {
             Some((h, m)) => (h, m),
-            None => return Err(format!("invalid timezone {spec}: write it as +HH:MM (for example +08:00)")),
+            None => {
+                return Err(format!(
+                    "invalid timezone {spec}: write it as +HH:MM (for example +08:00)"
+                ))
+            }
         };
         let h: i32 = hh
             .parse()
@@ -83,9 +91,21 @@ struct Spec {
     names: &'static [(&'static str, u32)],
 }
 
-const MINUTE: Spec = Spec { lo: 0, hi: 59, names: &[] };
-const HOUR: Spec = Spec { lo: 0, hi: 23, names: &[] };
-const DOM: Spec = Spec { lo: 1, hi: 31, names: &[] };
+const MINUTE: Spec = Spec {
+    lo: 0,
+    hi: 59,
+    names: &[],
+};
+const HOUR: Spec = Spec {
+    lo: 0,
+    hi: 23,
+    names: &[],
+};
+const DOM: Spec = Spec {
+    lo: 1,
+    hi: 31,
+    names: &[],
+};
 const MONTH: Spec = Spec {
     lo: 1,
     hi: 12,
@@ -157,9 +177,9 @@ fn atom(spec: Spec, token: &str) -> Result<u32, String> {
     if let Some(v) = name_value(spec, token) {
         return Ok(v);
     }
-    let v: u32 = token
-        .parse()
-        .map_err(|_| format!("field value {token:?} is neither a number nor a usable mnemonic name"))?;
+    let v: u32 = token.parse().map_err(|_| {
+        format!("field value {token:?} is neither a number nor a usable mnemonic name")
+    })?;
     if (spec.lo..=spec.hi).contains(&v) {
         Ok(v)
     } else {
@@ -669,10 +689,12 @@ impl Scheduler {
                 d.line
             ))?;
             let zone = Zone::parse(&tz_spec)?;
-            let open_expr = open_expr.ok_or_else(|| format!(
-                "line {}: schedule_window '{name}' has no open (open \"0 9 * * 1-5\";)",
-                d.line
-            ))?;
+            let open_expr = open_expr.ok_or_else(|| {
+                format!(
+                    "line {}: schedule_window '{name}' has no open (open \"0 9 * * 1-5\";)",
+                    d.line
+                )
+            })?;
             let close_expr = close_expr.ok_or_else(|| format!(
                 "line {}: schedule_window '{name}' has no close: with only open there is no decidable answer to \
                  \"is it open right now\" (if a route should stay open, do not gate it with a window)",
@@ -685,7 +707,8 @@ impl Scheduler {
             // Both expressions must really become true within the search cap, or the window never moves -- that is
             // a configuration error, not an operational fact.
             let probe = now_ms();
-            if next_after(&open, zone, probe).is_none() || next_after(&close, zone, probe).is_none() {
+            if next_after(&open, zone, probe).is_none() || next_after(&close, zone, probe).is_none()
+            {
                 return Err(format!(
                     "line {}: schedule_window '{name}' has an open/close expression that never becomes true within \
                      {} years (such as 0 0 31 2 *): such a window looks configured but will never change state",
@@ -793,13 +816,15 @@ impl Scheduler {
             if want != s.open.load(Ordering::Relaxed) {
                 s.open.store(want, Ordering::Relaxed);
                 s.changes.fetch_add(1, Ordering::Relaxed);
-                out.push(Change { name: s.name.clone(), open: want, at_ms: now });
+                out.push(Change {
+                    name: s.name.clone(),
+                    open: want,
+                    at_ms: now,
+                });
             }
         }
         out
     }
-
-
 
     /// Render an absolute instant as a wall-clock string in **the zone this window itself is configured with**
     /// (for the logs). If the operator wrote `tz +08:00` but the log prints UTC, "the schedule has not come due"
@@ -838,7 +863,11 @@ impl Scheduler {
         let mut out = Vec::with_capacity(self.slots.len());
         for s in &self.slots {
             let next = s.next.load(Ordering::Relaxed);
-            let open_txt = if s.open.load(Ordering::Relaxed) { "open" } else { "closed" };
+            let open_txt = if s.open.load(Ordering::Relaxed) {
+                "open"
+            } else {
+                "closed"
+            };
             let Some((open_expr, close_expr, tz, zone)) = s.view() else {
                 out.push(format!(
                     "schedule window '{}' removed from the configuration, state frozen at {open_txt}",
@@ -886,7 +915,10 @@ impl Scheduler {
                         let mut g = s.def.lock().unwrap_or_else(|e| e.into_inner());
                         *g = Some(d.clone());
                     }
-                    s.next.store(d.win.next_trigger_at(now).unwrap_or(NO_NEXT), Ordering::Relaxed);
+                    s.next.store(
+                        d.win.next_trigger_at(now).unwrap_or(NO_NEXT),
+                        Ordering::Relaxed,
+                    );
                     if want != before {
                         s.open.store(want, Ordering::Relaxed);
                         s.changes.fetch_add(1, Ordering::Relaxed);
@@ -930,7 +962,8 @@ impl Scheduler {
 fn is_valid_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= MAX_NAME_LEN
-        && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// The absolute clock (Unix milliseconds). Window state is a pure function of the calendar, so no process origin
@@ -1014,69 +1047,129 @@ mod tests {
 
     #[test]
     fn aliases_expand() {
-        assert_eq!(parse_cron("@daily").unwrap(), parse_cron("0 0 * * *").unwrap());
+        assert_eq!(
+            parse_cron("@daily").unwrap(),
+            parse_cron("0 0 * * *").unwrap()
+        );
         assert_eq!(
             parse_cron("@yearly").unwrap(),
             parse_cron("@annually").unwrap()
         );
-        assert_eq!(parse_cron("@hourly").unwrap(), parse_cron("0 * * * *").unwrap());
+        assert_eq!(
+            parse_cron("@hourly").unwrap(),
+            parse_cron("0 * * * *").unwrap()
+        );
     }
 
     #[test]
     fn rejects_shapes_a_human_would_want_typed_wrong() {
-        assert!(parse_cron("0 0 * *").is_err(), "four fields must be rejected");
-        assert!(parse_cron("0 0 * * * *").is_err(), "six fields must be rejected");
+        assert!(
+            parse_cron("0 0 * *").is_err(),
+            "four fields must be rejected"
+        );
+        assert!(
+            parse_cron("0 0 * * * *").is_err(),
+            "six fields must be rejected"
+        );
         assert!(parse_cron("60 * * * *").is_err(), "minute out of range");
         assert!(parse_cron("* * 32 * *").is_err(), "day out of range");
         assert!(parse_cron("* * * 13 *").is_err(), "month out of range");
         assert!(parse_cron("* * * * 8").is_err(), "weekday out of range");
         assert!(parse_cron("*/0 * * * *").is_err(), "zero step");
         assert!(parse_cron("5-1 * * * *").is_err(), "wrap-around range");
-        assert!(parse_cron("abc * * * *").is_err(), "neither a number nor a mnemonic name");
-        assert!(parse_cron("@reboot").is_err(), "@reboot is a startup semantic, not a calendar");
+        assert!(
+            parse_cron("abc * * * *").is_err(),
+            "neither a number nor a mnemonic name"
+        );
+        assert!(
+            parse_cron("@reboot").is_err(),
+            "@reboot is a startup semantic, not a calendar"
+        );
     }
 
     #[test]
     fn hourly_grid_and_strictly_after() {
         // Landing exactly on the top of the hour => the next slot, never re-firing the same minute.
-        assert_eq!(fired("*/15 * * * *", Zone::Utc, ms(2026, 10, 20, 4, 30)), "2026-10-20T04:45");
-        assert_eq!(fired("30 4 * * *", Zone::Utc, ms(2026, 10, 20, 4, 30)), "2026-10-21T04:30");
-        assert_eq!(fired("30 4 * * *", Zone::Utc, ms(2026, 10, 20, 4, 29)), "2026-10-20T04:30");
+        assert_eq!(
+            fired("*/15 * * * *", Zone::Utc, ms(2026, 10, 20, 4, 30)),
+            "2026-10-20T04:45"
+        );
+        assert_eq!(
+            fired("30 4 * * *", Zone::Utc, ms(2026, 10, 20, 4, 30)),
+            "2026-10-21T04:30"
+        );
+        assert_eq!(
+            fired("30 4 * * *", Zone::Utc, ms(2026, 10, 20, 4, 29)),
+            "2026-10-20T04:30"
+        );
     }
 
     #[test]
     fn weekend_skips_to_monday() {
         // 2026-10-24 is a Saturday.
-        assert_eq!(fired("0 9 * * 1-5", Zone::Utc, ms(2026, 10, 24, 12, 0)), "2026-10-26T09:00");
+        assert_eq!(
+            fired("0 9 * * 1-5", Zone::Utc, ms(2026, 10, 24, 12, 0)),
+            "2026-10-26T09:00"
+        );
         // The "Monday 9:00" seen from Sunday 10:00 belongs to the next week.
-        assert_eq!(fired("0 9 * * 1", Zone::Utc, ms(2026, 10, 25, 10, 0)), "2026-10-26T09:00");
+        assert_eq!(
+            fired("0 9 * * 1", Zone::Utc, ms(2026, 10, 25, 10, 0)),
+            "2026-10-26T09:00"
+        );
     }
 
     #[test]
     fn leap_day_only_resolves_on_leap_years() {
-        assert_eq!(fired("0 0 29 2 *", Zone::Utc, ms(2026, 6, 15, 0, 0)), "2028-02-29T00:00");
-        assert_eq!(fired("0 0 29 2 *", Zone::Utc, ms(2028, 3, 1, 0, 0)), "2032-02-29T00:00");
+        assert_eq!(
+            fired("0 0 29 2 *", Zone::Utc, ms(2026, 6, 15, 0, 0)),
+            "2028-02-29T00:00"
+        );
+        assert_eq!(
+            fired("0 0 29 2 *", Zone::Utc, ms(2028, 3, 1, 0, 0)),
+            "2032-02-29T00:00"
+        );
     }
 
     #[test]
     fn month_rollover_keeps_day_and_time_reset() {
         // June has only 30 days => June must be skipped as a whole block and land on July 31 00:00 (rather than crawling minute by minute after 6/30).
-        assert_eq!(fired("0 0 31 * *", Zone::Utc, ms(2026, 6, 15, 8, 0)), "2026-07-31T00:00");
+        assert_eq!(
+            fired("0 0 31 * *", Zone::Utc, ms(2026, 6, 15, 8, 0)),
+            "2026-07-31T00:00"
+        );
         // February has no 31st: after noon on January 31, the next 31st is March 31.
-        assert_eq!(fired("0 0 31 * *", Zone::Utc, ms(2026, 1, 31, 12, 0)), "2026-03-31T00:00");
+        assert_eq!(
+            fired("0 0 31 * *", Zone::Utc, ms(2026, 1, 31, 12, 0)),
+            "2026-03-31T00:00"
+        );
         // Year-end crossing into the next year.
-        assert_eq!(fired("0 0 1 1 *", Zone::Utc, ms(2026, 6, 15, 8, 0)), "2027-01-01T00:00");
+        assert_eq!(
+            fired("0 0 1 1 *", Zone::Utc, ms(2026, 6, 15, 8, 0)),
+            "2027-01-01T00:00"
+        );
         // Jumping from the start to the end of the same month, the day/hour/minute must all reset.
-        assert_eq!(fired("30 6 20 * *", Zone::Utc, ms(2026, 3, 1, 0, 0)), "2026-03-20T06:30");
+        assert_eq!(
+            fired("30 6 20 * *", Zone::Utc, ms(2026, 3, 1, 0, 0)),
+            "2026-03-20T06:30"
+        );
     }
 
     #[test]
     fn dom_and_dow_or_when_both_restricted() {
         // "day 1 OR Friday": 10/30 is a Friday, 11/1 is the start of a month -- both trigger.
-        assert_eq!(fired("0 12 1 * 5", Zone::Utc, ms(2026, 10, 29, 13, 0)), "2026-10-30T12:00");
-        assert_eq!(fired("0 12 1 * 5", Zone::Utc, ms(2026, 10, 30, 13, 0)), "2026-11-01T12:00");
+        assert_eq!(
+            fired("0 12 1 * 5", Zone::Utc, ms(2026, 10, 29, 13, 0)),
+            "2026-10-30T12:00"
+        );
+        assert_eq!(
+            fired("0 12 1 * 5", Zone::Utc, ms(2026, 10, 30, 13, 0)),
+            "2026-11-01T12:00"
+        );
         // With only dom restricted (dow is *) it stays an AND and does not let a day through just for its weekday.
-        assert_eq!(fired("0 12 15 * *", Zone::Utc, ms(2026, 10, 15, 13, 0)), "2026-11-15T12:00");
+        assert_eq!(
+            fired("0 12 15 * *", Zone::Utc, ms(2026, 10, 15, 13, 0)),
+            "2026-11-15T12:00"
+        );
     }
 
     #[test]
@@ -1125,15 +1218,33 @@ mod tests {
     #[test]
     fn prev_before_is_inclusive_and_walks_backwards() {
         // Inclusive of equality: at 09:00:30 today's 09:00 has already happened.
-        assert_eq!(prev_at("0 9 * * *", ms(2026, 10, 20, 9, 0) + 30_000), "2026-10-20T09:00");
-        assert_eq!(prev_at("0 9 * * *", ms(2026, 10, 20, 8, 59)), "2026-10-19T09:00");
-        assert_eq!(prev_at("*/15 * * * *", ms(2026, 10, 20, 10, 7)), "2026-10-20T10:00");
+        assert_eq!(
+            prev_at("0 9 * * *", ms(2026, 10, 20, 9, 0) + 30_000),
+            "2026-10-20T09:00"
+        );
+        assert_eq!(
+            prev_at("0 9 * * *", ms(2026, 10, 20, 8, 59)),
+            "2026-10-19T09:00"
+        );
+        assert_eq!(
+            prev_at("*/15 * * * *", ms(2026, 10, 20, 10, 7)),
+            "2026-10-20T10:00"
+        );
         // February has no 31st: searching back from March 1, the nearest is January 31.
-        assert_eq!(prev_at("0 0 31 * *", ms(2026, 3, 1, 0, 0)), "2026-01-31T00:00");
+        assert_eq!(
+            prev_at("0 0 31 * *", ms(2026, 3, 1, 0, 0)),
+            "2026-01-31T00:00"
+        );
         // Holds only in leap years.
-        assert_eq!(prev_at("0 0 29 2 *", ms(2026, 6, 15, 0, 0)), "2024-02-29T00:00");
+        assert_eq!(
+            prev_at("0 0 29 2 *", ms(2026, 6, 15, 0, 0)),
+            "2024-02-29T00:00"
+        );
         // Monday only: searching back from Monday 08:00 gives last Monday, not "today has not come yet so count yesterday".
-        assert_eq!(prev_at("0 9 * * 1", ms(2026, 10, 26, 8, 0)), "2026-10-19T09:00");
+        assert_eq!(
+            prev_at("0 9 * * 1", ms(2026, 10, 26, 8, 0)),
+            "2026-10-19T09:00"
+        );
         // Under a fixed offset it must also walk back on the same wall clock.
         let cn = Zone::parse("+08:00").unwrap();
         let c = parse_cron("0 9 * * *").unwrap();
@@ -1158,8 +1269,14 @@ mod tests {
             let c = parse_cron(expr).unwrap();
             let mut t = ms(2026, 3, 9, 0, 0);
             for _ in 0..30 {
-                let n = next_after(&c, Zone::Utc, t).unwrap_or_else(|| panic!("{expr} found no next fire"));
-                assert_eq!(prev_before(&c, Zone::Utc, n), Some(n), "{expr} at {}", show(n, Zone::Utc));
+                let n = next_after(&c, Zone::Utc, t)
+                    .unwrap_or_else(|| panic!("{expr} found no next fire"));
+                assert_eq!(
+                    prev_before(&c, Zone::Utc, n),
+                    Some(n),
+                    "{expr} at {}",
+                    show(n, Zone::Utc)
+                );
                 assert_eq!(
                     next_after(&c, Zone::Utc, n - 1),
                     Some(n),
@@ -1175,11 +1292,20 @@ mod tests {
     fn window_state_is_derived_not_assumed() {
         // 2026-10-21 is a Wednesday, 10-24 a Saturday.
         let w = window("0 9 * * 1-5", "0 18 * * 1-5", Zone::Utc);
-        assert!(w.is_open_at(ms(2026, 10, 21, 9, 0)), "counted as open from the very moment it opens");
+        assert!(
+            w.is_open_at(ms(2026, 10, 21, 9, 0)),
+            "counted as open from the very moment it opens"
+        );
         assert!(w.is_open_at(ms(2026, 10, 21, 17, 59)));
-        assert!(!w.is_open_at(ms(2026, 10, 21, 18, 0)), "the boundary belongs to the closing side");
+        assert!(
+            !w.is_open_at(ms(2026, 10, 21, 18, 0)),
+            "the boundary belongs to the closing side"
+        );
         assert!(!w.is_open_at(ms(2026, 10, 21, 8, 59)));
-        assert!(!w.is_open_at(ms(2026, 10, 24, 12, 0)), "the weekend is closed all day");
+        assert!(
+            !w.is_open_at(ms(2026, 10, 24, 12, 0)),
+            "the weekend is closed all day"
+        );
         // The gateway can start mid-window: whether it is open or closed at this moment must be computable on the spot.
         assert!(w.is_open_at(ms(2026, 10, 21, 14, 20)));
     }
@@ -1188,16 +1314,25 @@ mod tests {
     fn window_next_trigger_picks_the_sooner_one() {
         let w = window("0 9 * * 1-5", "0 18 * * 1-5", Zone::Utc);
         assert_eq!(
-            show(w.next_trigger_at(ms(2026, 10, 21, 10, 0)).unwrap(), Zone::Utc),
+            show(
+                w.next_trigger_at(ms(2026, 10, 21, 10, 0)).unwrap(),
+                Zone::Utc
+            ),
             "2026-10-21T18:00"
         );
         assert_eq!(
-            show(w.next_trigger_at(ms(2026, 10, 21, 19, 0)).unwrap(), Zone::Utc),
+            show(
+                w.next_trigger_at(ms(2026, 10, 21, 19, 0)).unwrap(),
+                Zone::Utc
+            ),
             "2026-10-22T09:00"
         );
         // Saturday morning: the next change waits until Monday 9:00 (crossing the whole weekend).
         assert_eq!(
-            show(w.next_trigger_at(ms(2026, 10, 24, 10, 0)).unwrap(), Zone::Utc),
+            show(
+                w.next_trigger_at(ms(2026, 10, 24, 10, 0)).unwrap(),
+                Zone::Utc
+            ),
             "2026-10-26T09:00"
         );
     }
@@ -1262,7 +1397,12 @@ mod tests {
         for i in 0..80 {
             let n = w.next_trigger_at(t).unwrap();
             let derived = w.is_open_at(n);
-            assert_ne!(derived, got, "trigger #{i} at {} did not change state", show(n, Zone::Utc));
+            assert_ne!(
+                derived,
+                got,
+                "trigger #{i} at {} did not change state",
+                show(n, Zone::Utc)
+            );
             got = derived;
             t = n;
         }
@@ -1271,22 +1411,47 @@ mod tests {
     #[test]
     fn collision_check_is_decidable_not_sampled() {
         let daily9 = parse_cron("0 9 * * *").unwrap();
-        assert!(collides(&daily9, &daily9), "the same line obviously collides");
-        assert!(collides(&daily9, &parse_cron("0 9 15 * *").unwrap()), "9:00 on the 15th every month must collide with 9:00 daily");
-        assert!(!collides(&daily9, &parse_cron("30 18 * * *").unwrap()), "hours apart means no collision, days overlapping every day does not count");
-        assert!(!collides(&parse_cron("0 12 * * 1").unwrap(), &parse_cron("0 12 * * 5").unwrap()), "Monday and Friday are never the same day");
-        assert!(!collides(&parse_cron("0 0 29 2 *").unwrap(), &parse_cron("0 0 1 8 *").unwrap()), "leap-year 2/29 only versus 8/1 only");
+        assert!(
+            collides(&daily9, &daily9),
+            "the same line obviously collides"
+        );
+        assert!(
+            collides(&daily9, &parse_cron("0 9 15 * *").unwrap()),
+            "9:00 on the 15th every month must collide with 9:00 daily"
+        );
+        assert!(
+            !collides(&daily9, &parse_cron("30 18 * * *").unwrap()),
+            "hours apart means no collision, days overlapping every day does not count"
+        );
+        assert!(
+            !collides(
+                &parse_cron("0 12 * * 1").unwrap(),
+                &parse_cron("0 12 * * 5").unwrap()
+            ),
+            "Monday and Friday are never the same day"
+        );
+        assert!(
+            !collides(
+                &parse_cron("0 0 29 2 *").unwrap(),
+                &parse_cron("0 0 1 8 *").unwrap()
+            ),
+            "leap-year 2/29 only versus 8/1 only"
+        );
         // The tricky one: dom and dow each never intersect, yet when "the 1st of a month falls on a Friday" both
         // hold at once. A pure bitmap intersection would judge this as no collision -- that is why it must be
         // derived day by day over the full 400-year cycle.
-        assert!(collides(&parse_cron("0 12 1 * 1").unwrap(), &parse_cron("0 12 15 * 5").unwrap()));
+        assert!(collides(
+            &parse_cron("0 12 1 * 1").unwrap(),
+            &parse_cron("0 12 15 * 5").unwrap()
+        ));
     }
 
     // ==================== window table ====================
 
     fn table(text: &str, now: i64) -> Scheduler {
         let cfg = Config::parse(text).unwrap();
-        Scheduler::parse_all_at(&cfg, now).unwrap_or_else(|e| panic!("a legal configuration was rejected: {e}"))
+        Scheduler::parse_all_at(&cfg, now)
+            .unwrap_or_else(|e| panic!("a legal configuration was rejected: {e}"))
     }
 
     /// Reads a window's next trigger time (`None` = removed or the name does not exist).
@@ -1308,7 +1473,8 @@ mod tests {
     }
 
     /// Weekday 9:00-18:00 (+08:00). 2026-10-21 is a Wednesday.
-    const OFFICE: &str = "schedule_window office { tz +08:00; open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; }";
+    const OFFICE: &str =
+        "schedule_window office { tz +08:00; open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; }";
 
     #[test]
     fn table_rejects_every_declared_but_inert_shape() {
@@ -1332,11 +1498,14 @@ mod tests {
         assert!(!is_valid_name("office hours") && !is_valid_name("office/x") && !is_valid_name(""));
         assert!(is_valid_name("office.hours-1_2"));
 
-        let e = reject("schedule_window office { tz UTC; open \"0 0 31 2 *\"; close \"0 18 * * 1-5\"; }");
+        let e = reject(
+            "schedule_window office { tz UTC; open \"0 0 31 2 *\"; close \"0 18 * * 1-5\"; }",
+        );
         assert!(e.contains("never becomes true"), "{e}");
 
         // open and close in the same minute: at that moment there is no criterion for "open or closed", it must be rejected rather than guessed by order.
-        let e = reject("schedule_window office { tz UTC; open \"0 9 * * *\"; close \"0 9 * * *\"; }");
+        let e =
+            reject("schedule_window office { tz UTC; open \"0 9 * * *\"; close \"0 9 * * *\"; }");
         assert!(e.contains("both demand a state change"), "{e}");
 
         let e = reject("schedule_window office { tz UTC; open \"0 9 * * 1-5\"; close \"0 18 * * 1-5\"; keep on; }");
@@ -1404,7 +1573,14 @@ mod tests {
         // Due: open->closed, and next pushed to the next day.
         let ch = t.advance(ms(2026, 10, 21, 10, 0));
         assert_eq!(ch.len(), 1);
-        assert_eq!(ch[0], Change { name: "office".into(), open: false, at_ms: ms(2026, 10, 21, 10, 0) });
+        assert_eq!(
+            ch[0],
+            Change {
+                name: "office".into(),
+                open: false,
+                at_ms: ms(2026, 10, 21, 10, 0)
+            }
+        );
         assert!(!t.is_open("office"));
         assert!(next_ms(&t, "office").unwrap() > before);
         // The count in the snapshot only tallies real flips.
@@ -1421,7 +1597,10 @@ mod tests {
         let t = table(cfg, ms(2026, 1, 1, 0, 0));
         assert!(!t.is_open("leap"));
         let mar1 = ms(2026, 3, 1, 0, 30);
-        assert!(t.advance(mar1).is_empty(), "3/1 2026 due must not change state");
+        assert!(
+            t.advance(mar1).is_empty(),
+            "3/1 2026 due must not change state"
+        );
         // close holds every year, so after waking next advances to **next year's 3/1**, not the leap day --
         // if this computed 2028-02-29, next only looked at the open side.
         assert_eq!(next_ms(&t, "leap"), Some(ms(2027, 3, 1, 0, 30)));
@@ -1457,24 +1636,49 @@ mod tests {
         assert_eq!(names, ["night", "office"]);
 
         // New configuration: office switched to open all day (recomputed as open right now), night removed, plus a never-instantiated new.
-        let next_cfg = "schedule_window office { tz UTC; open \"0 0 * * *\"; close \"59 23 * * *\"; }\n\
+        let next_cfg =
+            "schedule_window office { tz UTC; open \"0 0 * * *\"; close \"59 23 * * *\"; }\n\
                         schedule_window new { tz UTC; open \"0 0 1 1 *\"; close \"0 0 2 1 *\"; }";
         let notes = t.apply(&Config::parse(next_cfg).unwrap(), ms(2026, 10, 24, 12, 0));
-        assert!(t.is_open("office"), "recompute under the new definition must take effect immediately");
         assert!(
-            notes.iter().any(|n| n.contains("office") && n.contains("closed->open")),
+            t.is_open("office"),
+            "recompute under the new definition must take effect immediately"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("office") && n.contains("closed->open")),
             "{notes:?}"
         );
-        assert!(notes.iter().any(|n| n.contains("night") && n.contains("removed from the new configuration")), "{notes:?}");
-        assert!(notes.iter().any(|n| n.contains("'new'") && n.contains("all pass")), "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("night") && n.contains("removed from the new configuration")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("'new'") && n.contains("all pass")),
+            "{notes:?}"
+        );
         // A removed window: state frozen, no longer scheduled, but the name stays in the table (metrics must make clear it once existed).
         assert_eq!(next_ms(&t, "night"), None);
         let snap = t.snapshot();
         let frozen = snap.iter().find(|s| s.name == "night").unwrap();
         assert!(!frozen.enabled && !frozen.open);
         // 22:00 UTC is the moment night would originally have opened: after freezing it must not flip even once.
-        assert!(t.advance(ms(2026, 10, 25, 22, 0)).is_empty(), "a frozen window is still flipping");
-        assert!(!t.snapshot().into_iter().find(|s| s.name == "night").unwrap().open);
+        assert!(
+            t.advance(ms(2026, 10, 25, 22, 0)).is_empty(),
+            "a frozen window is still flipping"
+        );
+        assert!(
+            !t.snapshot()
+                .into_iter()
+                .find(|s| s.name == "night")
+                .unwrap()
+                .open
+        );
         // A new name has no instance => pass + counted in misses.
         assert!(t.is_open("new"));
         assert_eq!(t.misses(), 1);
@@ -1489,7 +1693,8 @@ mod tests {
         let mut names = Scheduler::declared_names(&cfg);
         names.sort();
         assert_eq!(names, ["night", "office"]);
-        assert!(Scheduler::declared_names(&Config::parse("worker_processes 2;").unwrap()).is_empty());
+        assert!(
+            Scheduler::declared_names(&Config::parse("worker_processes 2;").unwrap()).is_empty()
+        );
     }
-
 }
