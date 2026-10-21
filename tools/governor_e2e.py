@@ -302,7 +302,13 @@ def main():
         files = wait_for(lambda: cold_file_count() or None, 10, every=0.25)
         check("the cold root actually holds the forced spills (spill_after=1000 rules out eviction)",
               bool(files), f"files={cold_file_count()}")
-        after_sleep = stats()
+        # 冷层索引要等写线程真正落盘才出现（spill() 只是排队），所以这里必须等账目落定：
+        # 一次性的快照读到的是"已经落了几个"，满载机器上会读到 num=15 size=7680 这种半路值，
+        # 报出来的样子像"降级把 49 条数据弄丢了"。等待的是最终状态，断言本身没有放松。
+        after_sleep = wait_for(
+            lambda: (lambda s: s if s.get("num") == KEYS
+                                 and s.get("size") == KEYS * VALUE_LEN else None)(stats()),
+            24, every=0.3) or stats()
         check("memory was reclaimed: free_space jumped back",
               after_sleep.get("free", 0) - after_seed.get("free", 0) > 20_000,
               f"before={after_seed.get('free')} after={after_sleep.get('free')}")

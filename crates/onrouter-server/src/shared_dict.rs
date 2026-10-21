@@ -317,14 +317,28 @@ impl ZoneInner {
             }
             let Some((key, _, _)) = best else { continue };
             if let Some(entry) = map.remove(&key) {
-                self.release(entry.cost);
-                if let Some(store) = &self.disk {
-                    let freq = entry.decayed_freq(now);
-                    // Forced: the governor's sleep contract is "value stays readable
-                    // through the cold path", so no admit() frequency gate here.
-                    store.spill(&key, &entry.value, entry.expires_at, freq);
+                let expired = entry.expires_at.is_some_and(|t| now >= t);
+                let handed_off = match &self.disk {
+                    Some(store) => {
+                        store.spill(&key, &entry.value, entry.expires_at, entry.decayed_freq(now))
+                    }
+                    None => false,
+                };
+                if handed_off || expired {
+                    self.release(entry.cost);
+                    return Some((key, entry.cost as u64));
                 }
-                return Some((key, entry.cost as u64));
+                // 冷层没收下（盘满、pending 字节/任务上限、写通道已关）：原样放回内存并
+                // 结束本轮——调用方拿到 None 就停止降级，下一轮再试。
+                // 早先的写法把 spill() 的返回值丢掉了：内存里的值已经摘掉，冷层却没落副本，
+                // 于是"休眠降级"在冷层饱和时静默变成"删除"，而返回的记录照旧计数，
+                // 运维读到的账是"64 条都搬下去了"。容量淘汰可以丢（缓存语义），
+                // 这里搬的是 Lua 应用状态，不能丢。
+                if let Some(store) = &self.disk {
+                    store.note_spill_skipped();
+                }
+                map.insert(key, entry);
+                return None;
             }
         }
         None
@@ -1623,6 +1637,29 @@ mod tests {
             "absent keys answer false"
         );
         s.flush_pending();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governor_demote_pass_keeps_values_the_cold_tier_refuses() {
+        let dir = tmpdir("gov-demote-refused");
+        // 冷层撑不下（max_bytes 连一条记录都放不下）时 spill() 返回 false。
+        // 这时降级必须把值留在内存里并结束本轮：早先的写法摘掉内存值却照样返回一条记录，
+        // 于是"休眠降级"在冷层满载时静默变成"删除"，而账上记的是"搬下去了"。
+        let cfg = DiskConfig {
+            root: dir.clone(),
+            max_bytes: 8,
+            ..Default::default()
+        };
+        let s = DiskStore::open(cfg, None).unwrap();
+        let z = SharedZone::new(4096, Some(s));
+        z.set("a", V_A.to_vec(), None).unwrap();
+        z.set("b", V_B.to_vec(), None).unwrap();
+        let recs = z.governor_demote_pass(64);
+        assert!(recs.is_empty(), "冷层拒收时一条都不该算降级：{recs:?}");
+        assert_eq!(z.num(), 2, "值必须还留在内存里");
+        assert_eq!(z.get("a"), Some(V_A.to_vec()));
+        assert_eq!(z.get("b"), Some(V_B.to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
