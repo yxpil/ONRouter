@@ -827,6 +827,21 @@ impl Drop for LoggedBody {
 /// 因此 HTTP/1.1、HTTP/2（hyper `Incoming`）与 HTTP/3（h3 请求流）都能喂进同一套阶段管线
 /// （vhost/location/rewrite/access/try_files/content/proxy/lua）。返回的 `BoxResponse` 由各自
 /// 传输层负责把 `RespBody` 落成线上字节。
+/// vhost 匹配要用的主机名。HTTP/1.x 在 `Host` 头里；HTTP/2 **没有 Host 头**，主机在
+/// `:authority` 伪头上，hyper 把它放进 URI 的 authority。只读 `Host` 的后果不是报错而是
+/// 静默串站：h2 上每个请求的 host 都是 None，于是永远落到 default_server（没配 default 时
+/// 全体落到 vhost 列表第一个）。绝对形式请求行（`GET http://host/ HTTP/1.1`）走同一条兜底。
+fn request_host(headers: &hyper::HeaderMap, uri: &hyper::Uri) -> Option<String> {
+    if let Some(h) = headers
+        .get(HOST_NAME)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(h.to_string());
+    }
+    uri.authority().map(|a| a.as_str().to_string())
+}
+
 async fn handle_request(
     state: Arc<AppState>,
     meta: Arc<ConnMeta>,
@@ -890,10 +905,7 @@ async fn handle_request(
         Some(p) => p,
         None => return error_page(StatusCode::BAD_REQUEST),
     };
-    let host = headers
-        .get(HOST_NAME)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    let host = request_host(&headers, &uri);
     let router = state.routing();
     let server = match router.match_server(meta.listener, host.as_deref()) {
         Some(s) => Arc::clone(s),
@@ -4050,11 +4062,7 @@ async fn handle_upgrade(
     rec: Arc<LogRecord>,
     req: &mut Request<Incoming>,
 ) -> BoxResponse {
-    let host = req
-        .headers()
-        .get(HOST_NAME)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    let host = request_host(req.headers(), req.uri());
     let router = state.routing();
     let server = match router.match_server(meta.listener, host.as_deref()) {
         Some(s) => Arc::clone(s),
