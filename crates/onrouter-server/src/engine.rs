@@ -1711,16 +1711,23 @@ fn apply_steps(ctx: &mut RequestCtx, steps: &[RewriteStep], depth: u8) -> StepFl
 
 pub fn apply_return(ctx: &mut RequestCtx, ret: &ReturnAction) {
     ctx.status = ret.code;
+    // nginx 从 1.4.0 起在 `return` 的文本与 URL 里展开变量。ONRouter 过去把模板原样发出去，
+    // 于是 `return 301 https://$host$request_uri;`（整站跳转最常见的那一行）会把字面量
+    // "$host" 塞进 Location。展开用 rewrite/proxy 同一把插值器，未知变量名保持原样。
+    let text = ret
+        .text
+        .as_ref()
+        .map(|t| crate::proxy::interpolate_vars(t, ctx));
     // return 301/302 <url>：URL 放入 Location（对标 nginx）
     if matches!(ret.code, 301 | 302 | 303 | 307 | 308) {
-        if let Some(url) = &ret.text {
+        if let Some(url) = &text {
             ctx.set_resp_header("location", url);
             ctx.body = None;
             ctx.done = true;
             return;
         }
     }
-    ctx.body = ret.text.clone().map(|t| t.into_bytes());
+    ctx.body = text.map(|t| t.into_bytes());
     ctx.done = true;
 }
 
@@ -2148,6 +2155,52 @@ mod tests {
     }
 
     // ---- canary：灰度条件与求值 ----
+
+    #[test]
+    fn return_expands_variables_in_body_and_redirect_url() {
+        let mut ctx = RequestCtx::default();
+        ctx.host = Some("www.example.com".to_string());
+        ctx.set_vars.push(("reason".to_string(), "maintenance".to_string()));
+        // 200 + 文本：变量必须展开（nginx 1.4.0 起的行为）；认不出的名字保持字面量
+        apply_return(
+            &mut ctx,
+            &ReturnAction {
+                code: 200,
+                text: Some("server-blocked:$reason,$nosuchvar".to_string()),
+            },
+        );
+        assert_eq!(ctx.status, 200);
+        assert_eq!(
+            String::from_utf8(ctx.body.clone().unwrap()).unwrap(),
+            "server-blocked:maintenance,$nosuchvar"
+        );
+        assert!(ctx.done);
+        // 301 + URL：Location 拿到展开后的地址，body 必须为空（重定向无 body）
+        let mut ctx2 = RequestCtx::default();
+        ctx2.host = Some("www.example.com".to_string());
+        apply_return(
+            &mut ctx2,
+            &ReturnAction {
+                code: 301,
+                text: Some("https://$host/redirect".to_string()),
+            },
+        );
+        let loc = ctx2
+            .resp_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .map(|(_, v)| v.clone())
+            .expect("301 必须带 Location");
+        assert_eq!(loc, "https://www.example.com/redirect", "URL 里的变量要展开");
+        assert!(ctx2.body.is_none(), "重定向响应不该带 body");
+        // 301 不带文本时不该凭空造一个 Location
+        let mut ctx3 = RequestCtx::default();
+        apply_return(&mut ctx3, &ReturnAction { code: 301, text: None });
+        assert!(!ctx3
+            .resp_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("location")));
+    }
 
     fn canary_ctx() -> RequestCtx {
         let mut ctx = RequestCtx::default();

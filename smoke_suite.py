@@ -135,7 +135,8 @@ def main():
 
         # 6 add_header
         st, h, b = req("GET", "/hello")
-        check("add_header", h.get("x-powered-by") == "ONRouter/0.2", f"{st} {h.get('x-powered-by')}")
+        # 断言的是 add_header 生效，不是版本号本身：写死 "ONRouter/x.y" 会让每次发版都误报
+        check("add_header", (h.get("x-powered-by") or "").startswith("ONRouter/"), f"{st} {h.get('x-powered-by')}")
 
         # 7 HTTPS/TLS（8443 端口，自签名证书）
         st, h, b = req("GET", "/hello", https=True)

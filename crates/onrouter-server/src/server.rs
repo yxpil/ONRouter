@@ -1508,6 +1508,33 @@ async fn run_ingress<'a>(
     server: &'a Arc<Server>,
 ) -> Result<&'a Location, BoxResponse> {
     let mut last_loc: Option<&'a Location> = None;
+    // 0) server 级 REWRITE（nginx 的 SERVER-rewrite 相位：在 location 匹配之前）。
+    //    这一步的 `set`/`rewrite` 会改变后面的路径与变量，所以必须在匹配之前跑；
+    //    `return` 也在这一层就出结果——`server { return 301 https://$host$request_uri; }`
+    //    这种"只做跳转的 vhost"本来就没有可匹配的 location。
+    //    与 location 级的刻意差异见 engine.rs：location 级 `return` 仍排在访问控制之后。
+    if !server.rewrite_steps.is_empty() || server.ret.is_some() {
+        // 条件里的 return 也算"这一步有东西要做"，所以上面的判据不能只看裸 return
+        ctx.rewrite_return = None;
+        engine::apply_rewrite_steps(ctx, &server.rewrite_steps);
+        if let Some((code, target)) = ctx.redirect.take() {
+            return Err(redirect_response(code, &target));
+        }
+        // server 级 rewrite 的 last/break 结果只是"路径变了"，直接带进 location 查找；
+        // 不占用环检测的额度，否则一条 server 级 rewrite 就吃掉一跳
+        ctx.internal_redirect = false;
+        // `if (...) { return ...; }` 记在 ctx.rewrite_return 上，裸 `return` 记在 server.ret 上。
+        // 两者都算"本相位终止"，条件里的那个优先：它只有在条件成立时才存在，而同时写了
+        // 裸 return 的配置本来就是退化的（nginx 里裸 return 之后的指令永远到不了）。
+        let ret = ctx.rewrite_return.take().or_else(|| server.ret.clone());
+        if let Some(ret) = &ret {
+            engine::apply_return(ctx, ret);
+            if let Some((code, target)) = ctx.redirect.take() {
+                return Err(redirect_response(code, &target));
+            }
+            return Err(finish_response(ctx, server, last_loc));
+        }
+    }
     // 停在"还在跳转"状态跑满 10 跳 = 配置成环（nginx: rewrite or internal redirection cycle → 500）
     let mut cycle = false;
     for _ in 0..MAX_URI_CHANGES {
@@ -1826,6 +1853,29 @@ async fn process(
             state.still_online.note_credential_reject();
         }
 
+        // ---- proxy_cache_revalidate：过期条目先问一次"还是这份吗" ----
+        // 带出去的是**缓存里那份**的校验器，并且先把客户端自带的 If-* 摘掉：客户端的
+        // If-* 说的是它自己的副本，混在一次条件请求里会把"我们的副本没变"误当成
+        // "你的副本没变"而错发 304。没有 ETag/Last-Modified 就没什么可问的，走普通回源。
+        let mut revalidate_from: Option<Arc<crate::proxy_cache::CachedResponse>> = None;
+        if cache_target.is_some() && loc.proxy_cache_revalidate {
+            if let Some(stale) = &stale_response {
+                let validators = crate::proxy_cache::revalidation_validators(&stale.headers);
+                if !validators.is_empty() {
+                    ctx.req_headers.retain(|(k, _)| {
+                        !k.eq_ignore_ascii_case("if-none-match")
+                            && !k.eq_ignore_ascii_case("if-modified-since")
+                            && !k.eq_ignore_ascii_case("if-unmodified-since")
+                            && !k.eq_ignore_ascii_case("if-range")
+                    });
+                    for (k, v) in validators {
+                        ctx.req_headers.push((k, v));
+                    }
+                    revalidate_from = Some(Arc::clone(stale));
+                }
+            }
+        }
+
         return match state
             .proxy
             .forward(ctx, &target, &loc.pattern, &opts, body)
@@ -1834,6 +1884,18 @@ async fn process(
             Ok(upstream_resp) => {
                 // use_stale http_xxx：上游返回这些状态码时回放过期内容（不覆盖缓存）
                 let upstream_status = upstream_resp.status().as_u16();
+                // 我们的条件请求拿到 304：对象没变，发存下来的那份，有效期按 304 的头重算。
+                // 这一步必须在 use_stale/http_xxx 之前——304 不是失败，是一次成功的确认。
+                if let Some(stored) = &revalidate_from {
+                    if upstream_status == 304 {
+                        // cache_target 一定是 Some：revalidate_from 只在那条路径上才会被赋值
+                        let (zone, key) = cache_target.clone().unwrap();
+                        return serve_revalidated(
+                            state, loc, server, ctx, stored, (&zone, &key), upstream_resp.headers(),
+                        )
+                        .await;
+                    }
+                }
                 if let Some(stale) = &stale_response {
                     let token = format!("http_{upstream_status}");
                     if use_stale_allows(&loc.proxy_cache_use_stale, &token) {
@@ -3682,6 +3744,63 @@ fn serve_from_cache(
         body = Bytes::from(ctx.body.take().unwrap_or_default());
     }
     build_buffered_response(status, &headers, body, loc, server, status_tag, true, ctx)
+}
+
+/// `proxy_cache_revalidate` 拿到 304 后的收口：状态与 body 用缓存里那份，**头按 304 刷新**，
+/// 有效期重算后写回缓存，响应带 `X-Cache-Status: REVALIDATED`。
+///
+/// 上游答 304 时不附带 body，所以这里绝不能去"收集响应体"——那会得到一个空体并把
+/// 好端端的缓存条目覆盖成空响应（nginx 用同一套 if/else 规避，这里用独立的收口函数）。
+async fn serve_revalidated(
+    state: &Arc<AppState>,
+    loc: &Location,
+    server: &Server,
+    ctx: &mut RequestCtx,
+    stored: &Arc<crate::proxy_cache::CachedResponse>,
+    zone_key: (&str, &str),
+    fresh: &hyper::HeaderMap,
+) -> BoxResponse {
+    let (zone, key) = zone_key;
+    let counts = |name: &str| {
+        crate::proxy_cache::header_counts_for_cache(name, &loc.proxy_ignore_headers)
+    };
+    let mut fresh_h: Vec<(String, String)> = Vec::new();
+    for (k, v) in fresh.iter() {
+        let name = k.as_str();
+        if is_hop_by_hop(name) || name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        fresh_h.push((name.to_string(), v.to_str().unwrap_or("").to_string()));
+    }
+    let merged = crate::proxy_cache::merge_revalidated(&stored.headers, &fresh_h);
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // 有效期的口径与普通写入一致：先看上游这次说了什么（Cache-Control/Expires），
+    // 上游什么都没说才回落到 `proxy_cache_valid` 里 200 的那条（304 描述的是同一个对象）。
+    let decided: Vec<(String, String)> = merged.iter().filter(|(k, _)| counts(k)).cloned().collect();
+    let ttl = crate::proxy_cache::effective_ttl(&loc.proxy_cache_valid, 200, &decided, now_unix);
+    if let Some(ttl) = ttl {
+        state.proxy_cache.store_as(
+            &zone,
+            &key,
+            crate::proxy_cache::CachedResponse {
+                status: stored.status,
+                headers: merged.clone(),
+                body: Arc::clone(&stored.body),
+            },
+            ttl,
+            state.limits.is_vip(&ctx.remote_addr),
+        );
+    }
+    ctx.cache_status = "REVALIDATED".to_string();
+    let resp = Arc::new(crate::proxy_cache::CachedResponse {
+        status: stored.status,
+        headers: merged,
+        body: Arc::clone(&stored.body),
+    });
+    serve_from_cache(resp, loc, server, "REVALIDATED", ctx)
 }
 
 /// 由缓冲好的状态/头/字节构造最终响应；`with_status_tag` 为真时附带 `X-Cache-Status`。

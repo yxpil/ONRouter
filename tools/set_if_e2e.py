@@ -7,6 +7,13 @@
 #   S14    已知差异：if 块里的 return 不许绕过 allow/deny
 #   S15    启动日志里 set/if 不再是未知指令
 #
+#   S16..S19 server 级 set/if/rewrite（18371）：在 location 匹配之前生效，能改变
+#            最终落到哪个 location
+#   S20    server 级 if 里的 return 同样生效
+#   S21    纯跳转 vhost（18372）：server 级 return 301 真的给出 301（过去被忽略→404）
+#   S22    server 级 return 先于 location（18373）
+#   S23    -t 不再对这些指令报"已被忽略"
+#
 #   cargo build --release -p onrouter-server --bin onrouter && python tools/set_if_e2e.py
 import os
 import subprocess
@@ -52,6 +59,34 @@ def request(path, headers=None, method="GET", timeout=15):
         return resp.status, dict(resp.headers), resp.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read().decode(errors="replace")
+
+
+SRV_PORT, REDIRECT_PORT, MAINT_PORT = 18371, 18372, 18373
+
+
+def request_at(port, path, headers=None):
+    """跨 vhost 的请求：server 级指令要换监听口才验得出差异。"""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="GET")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        resp = _opener.open(req, timeout=15)
+        return resp.status, dict(resp.headers), resp.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read().decode(errors="replace")
+
+
+def request_no_follow(port, path):
+    """301 必须原样收到：默认 opener 会自己跟随并重呈 200，那就什么也验不出来。"""
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("GET", path)
+    r = conn.getresponse()
+    hs = dict(r.getheaders())
+    body = r.read().decode(errors="replace")
+    conn.close()
+    return r.status, hs, body
 
 
 def hdr(hs, name):
@@ -162,6 +197,37 @@ def main():
               "panicked" not in err and "traceback" not in err.lower(), err[-300:])
         check("set/if 不再被报成未知指令",
               "未知指令 'set'" not in err and "未知指令 'if'" not in err, err[-300:])
+        # ---- S16..S23 server 级 REWRITE 相位 ----
+        _, h, b = request_at(SRV_PORT, "/echo")
+        check("S16 server 级 set 的变量在 location 里可见", hdr(h, "X-Channel") == "grey",
+              f"X-Channel={hdr(h, 'X-Channel')!r} body={b!r}")
+        _, h, _ = request_at(SRV_PORT, "/echo?from=ctx")
+        check("S17 server 级 set 一样展开变量（$arg_from）", hdr(h, "X-From") == "ctx",
+              f"X-From={hdr(h, 'X-From')!r}")
+        _, h, _ = request_at(SRV_PORT, "/echo", headers={"X-Grey": "1"})
+        check("S18 server 级 if 覆盖 server 级 set", hdr(h, "X-Channel") == "blue",
+              f"X-Channel={hdr(h, 'X-Channel')!r}")
+        st, h, b = request_at(SRV_PORT, "/old/hop")
+        check("S19 server 级 rewrite ... last 改变了选中的 location",
+              st == 200 and b.strip() == "landed-hop" and hdr(h, "X-Rewrote") == "1",
+              f"st={st} body={b!r} X-Rewrote={hdr(h, 'X-Rewrote')!r}")
+        st, _, b = request_at(SRV_PORT, "/echo?kill=1")
+        check("S20 server 级 if 里的 return 也生效（过去它和裸 return 一起被忽略）",
+              st == 404 and b.strip() == "killed-at-server", f"st={st} body={b!r}")
+        st, h, b = request_no_follow(REDIRECT_PORT, "/any/thing?x=1")
+        check("S21 纯跳转 vhost 给出 301（过去这条被静默忽略 → 404）",
+              st == 301 and hdr(h, "Location") == "https://example.com/any/thing?x=1",
+              f"st={st} Location={hdr(h, 'Location')!r}")
+        st, h, b = request_at(MAINT_PORT, "/")
+        check("S22 server 级 return 先于 location 结束请求",
+              st == 403 and b == "server-blocked:maintenance",
+              f"st={st} body={b!r}")
+        t_run = subprocess.run([exe, "-t", CONF], cwd=ROOT, capture_output=True,
+                               text=True, encoding="utf-8", errors="replace")
+        tout = (t_run.stdout or "") + (t_run.stderr or "")
+        check("S23 -t 不再把 server 级指令报成\"已被忽略\"",
+              t_run.returncode == 0 and "已被忽略" not in tout, tout[-400:])
+
     finally:
         proc.terminate()
         try:

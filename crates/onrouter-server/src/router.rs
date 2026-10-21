@@ -253,6 +253,9 @@ pub struct Location {
     pub proxy_cache_valid: Vec<(Vec<String>, std::time::Duration)>,
     /// `proxy_cache_min_uses N`（默认 1）：同一 key 第 N 次起才写入
     pub proxy_cache_min_uses: u32,
+    /// `proxy_cache_revalidate on|off`：过期条目先带上自己的 ETag/Last-Modified 回源问一次，
+    /// 上游答 304 就刷新有效期、把存下来的 body 原样发回（`X-Cache-Status: REVALIDATED`）
+    pub proxy_cache_revalidate: bool,
     /// `proxy_cache_lock on|off`：同一 key 并发未命中时只放一个请求回源
     pub proxy_cache_lock: bool,
     /// `proxy_cache_lock_timeout`（默认 5s）：等锁超时后自己回源
@@ -296,6 +299,14 @@ pub struct Location {
 
 #[derive(Debug, Clone)]
 pub struct Server {
+    /// server 级 REWRITE 步骤：`rewrite`/`set`/`if` 按书写顺序混排，在 **location 匹配之前**执行
+    /// （nginx 的 SERVER-rewrite 相位就在那里，所以 server 级的 `set`/`rewrite` 能改变本次请求
+    /// 最终落到哪个 location）。
+    pub rewrite_steps: Vec<RewriteStep>,
+    /// server 级裸 `return`：在本块 rewrite 步骤之后执行。它先于访问控制（nginx 同款语义），
+    /// 这正是 `server { return 301 https://$host$request_uri; }` 这种"只做跳转的 vhost"能工作的
+    /// 原因。location 级 `return` 仍在访问控制之后（那是 ONRouter 刻意的差异，见 engine.rs）。
+    pub ret: Option<ReturnAction>,
     /// `server_name` 的首个值，用于日志与告警
     pub server_name: String,
     pub server_names: Vec<String>,
@@ -494,6 +505,7 @@ struct ServerTemplate {
     proxy_cache_methods: Vec<String>,
     proxy_cache_valid: Vec<(Vec<String>, std::time::Duration)>,
     proxy_cache_min_uses: u32,
+    proxy_cache_revalidate: bool,
     proxy_cache_lock: bool,
     proxy_cache_lock_timeout: std::time::Duration,
     proxy_cache_use_stale: Vec<String>,
@@ -684,7 +696,7 @@ fn parse_on_off(v: &str) -> Option<bool> {
 }
 
 /// REWRITE 阶段有序步骤：`rewrite`/`set`/`if` 按配置书写顺序混排（nginx 的 rewrite 模块
-/// 就是这个语义，三种指令互相影响顺序）。location 级专用；server 级暂不参与匹配前阶段。
+/// 就是这个语义，三种指令互相影响顺序）。location 级与 server 级共用；server 级的这一步跑在 location 匹配之前。
 fn parse_rewrite_steps(
     d: &Directive,
     warnings: &mut Vec<String>,
@@ -1096,6 +1108,7 @@ struct CacheSettings {
     valid: Vec<(Vec<String>, std::time::Duration)>,
     has_valid: bool,
     min_uses: Option<u32>,
+    revalidate: Option<bool>,
     lock: Option<bool>,
     lock_timeout: Option<std::time::Duration>,
     use_stale: Option<Vec<String>>,
@@ -1127,6 +1140,7 @@ fn parse_cache_directives(d: &Directive, warnings: &mut Vec<String>) -> CacheSet
         valid: Vec::new(),
         has_valid: false,
         min_uses: None,
+        revalidate: None,
         lock: None,
         lock_timeout: None,
         use_stale: None,
@@ -1172,6 +1186,14 @@ fn parse_cache_directives(d: &Directive, warnings: &mut Vec<String>) -> CacheSet
         match v.parse::<u32>() {
             Ok(n) if n >= 1 => cs.min_uses = Some(n),
             _ => warnings.push(format!("proxy_cache_min_uses 需为 ≥1 整数，已忽略 '{v}'")),
+        }
+    }
+    if let Some(v) = d.find("proxy_cache_revalidate").and_then(|x| x.arg(0)) {
+        match parse_on_off(v) {
+            Some(b) => cs.revalidate = Some(b),
+            None => warnings.push(format!(
+                "proxy_cache_revalidate 只接受 on/off（收到 '{v}'），保持 off"
+            )),
         }
     }
     if let Some(v) = d.find("proxy_cache_lock").and_then(|x| x.arg(0)) {
@@ -2317,7 +2339,7 @@ impl Router {
                    "proxy_send_timeout", "proxy_next_upstream", "proxy_next_upstream_tries",
                    "proxy_next_upstream_timeout", "proxy_request_buffering", "limit_conn", "http2",
                    "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
-                   "proxy_cache_lock", "proxy_cache_lock_timeout", "proxy_cache_use_stale",
+                   "proxy_cache_revalidate", "proxy_cache_lock", "proxy_cache_lock_timeout", "proxy_cache_use_stale",
                    "proxy_cache_bypass", "proxy_no_cache", "proxy_ignore_headers",
                    "still_online", "still_online_max_age", "still_online_max_body",
                    "still_online_retry", "still_online_retry_max",
@@ -2340,19 +2362,14 @@ impl Router {
                 "server",
                 &mut warnings,
             );
-            // 这四条都属于 nginx 的 REWRITE 阶段，ONRouter 只在 location 里跑该阶段。
-            // 写在 server 级过去是"静默失效"（`server { return 403; }` 照样放行），
-            // 现在必须留痕。
-            for c in d
-                .block
-                .iter()
-                .filter(|c| matches!(c.name.as_str(), "return" | "rewrite" | "set" | "if"))
-            {
-                warnings.push(format!(
-                    "server 块第 {} 行：'{}' 暂不支持 server 级（REWRITE 阶段只在 location 内执行），该指令已被忽略",
-                    c.line, c.name
-                ));
-            }
+            // 这四条属于 nginx 的 REWRITE 阶段。过去 server 级只留一行告警然后忽略，于是
+            // `server { return 301 https://…; }` 这种"跳转专用 vhost"会静默变成 404 —— 现在真的
+            // 在 location 匹配之前执行（SERVER-rewrite 相位）。未知形态仍由 parse_* 硬失败。
+            let server_rewrite_steps = parse_rewrite_steps(d, &mut warnings)?;
+            let server_ret = match d.find("return") {
+                Some(rd) => Some(parse_return(rd)?),
+                None => None,
+            };
 
             let tmpl = Self::build_template(
                 d,
@@ -2441,6 +2458,8 @@ impl Router {
                 ep.protocols.union_with(&tmpl.protocols);
 
                 let server = Server {
+                    rewrite_steps: server_rewrite_steps.clone(),
+                    ret: server_ret.clone(),
                     server_name: tmpl.server_name.clone(),
                     server_names: tmpl.server_names.clone(),
                     is_default_server: flags.default_server,
@@ -3127,6 +3146,7 @@ impl Router {
             proxy_cache_methods: vec!["GET".to_string(), "HEAD".to_string()],
             proxy_cache_valid: Vec::new(),
             proxy_cache_min_uses: 1,
+            proxy_cache_revalidate: false,
             proxy_cache_lock: false,
             proxy_cache_lock_timeout: std::time::Duration::from_secs(5),
             proxy_cache_use_stale: Vec::new(),
@@ -3299,6 +3319,9 @@ impl Router {
         }
         if cs.min_uses.is_some() {
             tmpl.proxy_cache_min_uses = cs.min_uses.unwrap();
+        }
+        if let Some(b) = cs.revalidate {
+            tmpl.proxy_cache_revalidate = b;
         }
         if let Some(b) = cs.lock {
             tmpl.proxy_cache_lock = b;
@@ -3544,6 +3567,7 @@ impl Router {
             proxy_cache_methods: tmpl.proxy_cache_methods.clone(),
             proxy_cache_valid: tmpl.proxy_cache_valid.clone(),
             proxy_cache_min_uses: tmpl.proxy_cache_min_uses,
+            proxy_cache_revalidate: tmpl.proxy_cache_revalidate,
             proxy_cache_lock: tmpl.proxy_cache_lock,
             proxy_cache_lock_timeout: tmpl.proxy_cache_lock_timeout,
             proxy_cache_use_stale: tmpl.proxy_cache_use_stale.clone(),
@@ -3587,7 +3611,7 @@ impl Router {
                "proxy_next_upstream_tries", "proxy_next_upstream_timeout",
                "proxy_request_buffering",
                "proxy_cache", "proxy_cache_key", "proxy_cache_methods", "proxy_cache_valid", "proxy_cache_min_uses",
-               "proxy_cache_lock", "proxy_cache_lock_timeout", "proxy_cache_use_stale",
+               "proxy_cache_revalidate", "proxy_cache_lock", "proxy_cache_lock_timeout", "proxy_cache_use_stale",
                "proxy_cache_bypass", "proxy_no_cache", "proxy_ignore_headers",
                "still_online", "still_online_max_age", "still_online_max_body",
                "still_online_retry", "still_online_retry_max",
@@ -4047,6 +4071,9 @@ impl Router {
         }
         if lcs.min_uses.is_some() {
             loc.proxy_cache_min_uses = lcs.min_uses.unwrap();
+        }
+        if let Some(b) = lcs.revalidate {
+            loc.proxy_cache_revalidate = b;
         }
         if let Some(b) = lcs.lock {
             loc.proxy_cache_lock = b;
@@ -6015,17 +6042,68 @@ mod tests {
         }
     }
 
+    /// server 级 REWRITE 相位：过去只留一行"已被忽略"的告警，于是
+    /// `server { return 301 https://…; }` 这种跳转专用 vhost 静默变成 404。
+    /// 现在这四条真的进结构体（顺序与形态由 parse_* 把关）。
     #[test]
-    fn server_level_rewrite_directives_warn_instead_of_failing_open() {
+    fn server_level_rewrite_directives_are_parsed_not_dropped() {
         let r = build(
-            r#"server { listen 127.0.0.1:18074; return 403 "no";
-                 location / { return 200 ok; } }"#,
+            r#"server {
+                 listen 127.0.0.1:18074;
+                 set $channel grey;
+                 if ($http_x_grey) {
+                     set $channel blue;
+                 }
+                 rewrite ^/old/(.*)$ /new/$1 last;
+                 return 301 https://$host$request_uri;
+                 location / { return 200 ok; }
+             }"#,
         );
         assert!(
-            r.warnings.iter().any(|w| w.contains("'return'") && w.contains("已被忽略")),
-            "server 级 return 必须告警：{:?}",
+            !r.warnings.iter().any(|w| w.contains("已被忽略")),
+            "server 级四条不该再有忽略告警：{:?}",
             r.warnings
         );
+        let addr = "127.0.0.1:18074".parse().unwrap();
+        let srv = &r.groups[&addr].servers[0];
+        // set / if(set) / rewrite 三步按书写顺序进 rewrite_steps，裸 return 单列
+        assert_eq!(srv.rewrite_steps.len(), 3, "{:?}", srv.rewrite_steps);
+        assert!(matches!(srv.rewrite_steps[0], RewriteStep::Set { .. }));
+        assert!(matches!(srv.rewrite_steps[1], RewriteStep::If { .. }));
+        assert!(matches!(srv.rewrite_steps[2], RewriteStep::Rewrite(_)));
+        assert!(srv.ret.is_some(), "server 级 return 必须落在 ret 上");
+    }
+
+    #[test]
+    fn server_level_rewrite_without_return_leaves_ret_none() {
+        let r = build(
+            r#"server { listen 127.0.0.1:18075; set $a 1; location / { return 200 ok; } }"#,
+        );
+        let addr = "127.0.0.1:18075".parse().unwrap();
+        let srv = &r.groups[&addr].servers[0];
+        assert_eq!(srv.rewrite_steps.len(), 1);
+        assert!(srv.ret.is_none(), "没写裸 return 就不该凭空造一个");
+    }
+
+    #[test]
+    fn server_level_rewrite_bad_shapes_hard_fail_like_location() {
+        // server 级不是"宽松版"：与 location 级同一套 parse_*，写错就出局，不能靠告警蒙过去
+        for tail in [
+            "set plain 1;",
+            "set $1a 1;",
+            "if ($a =) { return 404; }",
+            "if ($a) { if ($b) { return 404; } }",
+        ] {
+            // 注意不列 `return` 的形态：`return abc;`（跳 URI）与 `return 403 "no" more;`
+            // （多段文本拼成一个 body）在 nginx 里都合法，不是坏写法
+            let conf = format!(
+                "server {{ listen 127.0.0.1:18076; {tail} location / {{ return 200 ok; }} }}"
+            );
+            assert!(
+                Router::build(&cfg(&conf), &PathBuf::from(".")).is_err(),
+                "应当拒绝：{tail}"
+            );
+        }
     }
 
     /// 取 127.0.0.1:<port> 上第一个 vhost 的第 n 个 location。

@@ -27,6 +27,11 @@ BASE = f"http://{GW_HOST}:{GW_PORT}"
 # 后端按路径维护"真实被服务次数"，用于判定网关是否命中缓存（命中则不再打后端）
 counter_lock = threading.Lock()
 hits = {}
+# 收到过几次真正的条件请求（If-None-Match 命中→304）：与 hits 分开记，
+# 因为"问了"和"重发了整份"是两件事，测试要能分开断言
+conditionals = {}
+# rv/rvn 两个区的"整份响应发出过几次"：304 不算，所以它与 hits 分开
+rv_served = {}
 
 results = []
 
@@ -85,6 +90,35 @@ class Backend(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Set-Cookie", "sid=xyz; Path=/")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path.startswith("/rv/") or path.startswith("/rvn/"):
+            # 短 max-age=2 + 固定 ETag：条目过期后能不能复用，取决于网关有没有带着条件头来问。
+            # rv 与 rvn 各用一个 ETag，两区的 304 不会互相认错对象。
+            name = "rv" if path.startswith("/rv/") else "rvn"
+            etag = f'"{name}-1"'
+            if self.headers.get("If-None-Match") == etag:
+                # 304 不带 body：整份响应没重发，但"问过上游"必须记账 —— conditionals 与 hits
+                # 分开，测试才能把"问了"与"重发了整份"断言成两件事
+                with counter_lock:
+                    conditionals[path] = conditionals.get(path, 0) + 1
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "max-age=2")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            # 只有真的发出整份时才让发出计数涨：304 不能推它，否则 R4 什么也说明不了
+            with counter_lock:
+                rv_served[name] = rv_served.get(name, 0) + 1
+                served = rv_served[name]
+            body = f"{name}={served} n={n}".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", "Wed, 21 Oct 2026 08:00:00 GMT")
+            self.send_header("Cache-Control", "max-age=2")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -168,6 +202,46 @@ def main():
         nb = backend_count("/count")
         request("/nocache-proxy/count")
         check("对照 location 每次都回源", backend_count("/count") == nb + 1, f"cnt={backend_count('/count')}")
+
+        # ---- proxy_cache_revalidate：过期后带条件问一次，304 就复用存下来的 body ----
+        st, hsb, body = request("/rv/x")
+        check("R1 /rv 首次 MISS 并写入缓存",
+              hdr(hsb, "X-Cache-Status") == "MISS" and body.startswith("rv=1"),
+              f'xcs={hdr(hsb, "X-Cache-Status")} body={body!r}')
+        st, hsb, body2 = request("/rv/x")
+        check("R2 未过期时直接 HIT", hdr(hsb, "X-Cache-Status") == "HIT" and body2 == body,
+              f'xcs={hdr(hsb, "X-Cache-Status")} body={body2!r}')
+        time.sleep(2.4)                      # 上游 max-age=2 → 条目过期
+        nb = backend_count("/rv/x")
+        cond_b = conditionals.get("/rv/x", 0)
+        st, hsb, body3 = request("/rv/x")
+        check("R3 过期后答 304 时按 REVALIDATED 收口",
+              st == 200 and hdr(hsb, "X-Cache-Status") == "REVALIDATED",
+              f'st={st} xcs={hdr(hsb, "X-Cache-Status")}')
+        check("R4 复用的是缓存里那份 body（没有第二遍内容）", body3 == body,
+              f"cached={body!r} now={body3!r}")
+        check("R5 确实问了上游，而且是条件请求",
+              backend_count("/rv/x") == nb + 1 and conditionals.get("/rv/x", 0) == cond_b + 1,
+              f'backend={backend_count("/rv/x")} nb={nb} cond={conditionals.get("/rv/x", 0)}')
+        st, hsb, body4 = request("/rv/x")
+        check("R6 304 重算了有效期（紧接着是内存 HIT，不再问上游）",
+              hdr(hsb, "X-Cache-Status") == "HIT" and backend_count("/rv/x") == nb + 1
+              and body4 == body,
+              f'xcs={hdr(hsb, "X-Cache-Status")} backend={backend_count("/rv/x")}')
+        # 对照组：同样 max-age=2，但没开 revalidate → 过期只能整份重取，也从不发条件请求
+        request("/rvn/x")
+        time.sleep(2.4)
+        nb2 = backend_count("/rvn/x")
+        cond2 = conditionals.get("/rvn/x", 0)
+        st, hsb, body5 = request("/rvn/x")
+        # EXPIRED 而不是 REVALIDATED，且拿到的是第二份内容（rvn=2）：这就是开不开 revalidate 的
+        # 可观测差别——上游被问了同样的次数，但一次要重发整份 body，一次只用 304
+        check("R7 没开 revalidate 的对照组过期后整份重取（EXPIRED + 第二份内容）",
+              hdr(hsb, "X-Cache-Status") == "EXPIRED" and body5.startswith("rvn=2"),
+              f'xcs={hdr(hsb, "X-Cache-Status")} body={body5!r}')
+        check("R8 对照组没发过条件请求（上游没收到 If-None-Match）",
+              conditionals.get("/rvn/x", 0) == cond2 and backend_count("/rvn/x") == nb2 + 1,
+              f'cond={conditionals.get("/rvn/x", 0)} backend={backend_count("/rvn/x")}')
 
     finally:
         proc.terminate()

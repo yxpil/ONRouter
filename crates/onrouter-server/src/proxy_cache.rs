@@ -21,8 +21,12 @@
 //! 清理逻辑释放（容量本身由 LRU 上限兜底）。冷层只服务**未过期**的条目，所以
 //! `use_stale` 的过期回放仍然只在内存里发生——这是有意的：磁盘上留着一堆已过期的响应
 //! 只会让运维以为缓存还有内容，而 nginx 侧对应的是 `inactive` 回收，不是 stale 回放。
-//! 有意未实现（README 已标注）：revalidation（If-None-Match 回源校验）、`purge`、Vary、
-//! `proxy_cache_lock_age`。缓存响应统一带
+//! `proxy_cache_revalidate on;` 走 nginx 那条条件请求路径：条目过期后带上**缓存自己**的
+//! ETag/Last-Modified 去问一次，上游答 304 就只重算有效期、把存下来的 body 原样发回
+//! （`X-Cache-Status: REVALIDATED`），不再搬第二遍内容。这条路径上客户端自带的 If-* 会被替换掉：
+//! 「我们的副本没变」不等于「你手上的副本没变」，混在一起就会错发 304。
+//! 有意未实现（README 已标注）：`purge`、Vary、`proxy_cache_lock_age`、
+//! `proxy_cache_background_update`。缓存响应统一带
 //! `X-Cache-Status: HIT|MISS|EXPIRED|BYPASS|STALE` 头，便于外部验证；由冷层供的命中
 //! 状态仍是 `HIT`（nginx 的词表里没有"磁盘命中"这一档），另加一个 `X-Cache-Tier: disk`
 //! 把层级说出来，计数在 `/metrics` 的 `onrouter_proxy_cache_disk_*`。
@@ -958,6 +962,51 @@ impl ProxyCache {
 
 /// 从 `proxy_cache_valid` 规则里挑出匹配状态码的 TTL；`any` 作为兜底。
 /// 规则形如 [("200", dur), ("301 302", dur), ("any", dur)]，已在 router 里按码拆分。
+/// `proxy_cache_revalidate` 用的校验器：过期条目带着**自己那套**去问上游"还是这份吗"。
+///
+/// ETag 优先（强弱比较交给上游判），只有 Last-Modified 时就用它；两个都没有就没有
+/// 条件请求的依据，返回空表 → 调用方按普通回源处理，不发半个头的条件请求。
+pub fn revalidation_validators(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let find = |want: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(want))
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let mut out = Vec::new();
+    if let Some(etag) = find("etag") {
+        out.push(("if-none-match".to_string(), etag));
+    }
+    if let Some(lm) = find("last-modified") {
+        out.push(("if-modified-since".to_string(), lm));
+    }
+    out
+}
+
+/// 304 不带 body，它只说明"你手上那份还作数，有效期看这里"。所以刷新的是头：
+/// 304 里出现过的名字覆盖旧值（大小写不敏感、保留原书写顺序），没出现的一律原样留下——
+/// 尤其是 `content-type` 这类 body 的描述，304 里没有就不能凭空删掉。
+pub fn merge_revalidated(
+    stored: &[(String, String)],
+    fresh: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(stored.len());
+    for (k, v) in stored {
+        let replacement = fresh
+            .iter()
+            .find(|(fk, _)| fk.eq_ignore_ascii_case(k))
+            .map(|(_, fv)| fv.clone());
+        out.push((k.clone(), replacement.unwrap_or_else(|| v.clone())));
+    }
+    for (k, v) in fresh {
+        if !out.iter().any(|(sk, _)| sk.eq_ignore_ascii_case(k)) {
+            out.push((k.clone(), v.clone()));
+        }
+    }
+    out
+}
+
 pub fn ttl_from_valid(valid: &[(Vec<String>, Duration)], status: u16) -> Option<Duration> {
     let s = status.to_string();
     let mut any: Option<Duration> = None;
@@ -1506,6 +1555,56 @@ mod tests {
         c.force_expire("z", "k", Duration::ZERO);
         assert_eq!(c.lookup("z", "k").0, CacheHit::Miss);
         assert_eq!(c.len("z"), 0);
+    }
+
+    #[test]
+    fn revalidation_validators_prefer_etag_and_keep_last_modified() {
+        let both = vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("ETag".to_string(), "\"abc\"".to_string()),
+            ("Last-Modified".to_string(), "Tue, 15 Nov 2021 08:12:01 GMT".to_string()),
+        ];
+        assert_eq!(
+            revalidation_validators(&both),
+            vec![
+                ("if-none-match".to_string(), "\"abc\"".to_string()),
+                ("if-modified-since".to_string(), "Tue, 15 Nov 2021 08:12:01 GMT".to_string()),
+            ],
+            "两个都带上：上游可以任选其一判 304"
+        );
+        let only_lm = vec![("last-modified".to_string(), "x".to_string())];
+        assert_eq!(
+            revalidation_validators(&only_lm),
+            vec![("if-modified-since".to_string(), "x".to_string())]
+        );
+        let etag_blank = vec![("etag".to_string(), "   ".to_string())];
+        assert!(revalidation_validators(&etag_blank).is_empty(), "空值不能当校验器发出去");
+        assert!(revalidation_validators(&[("content-type".to_string(), "text".to_string())]).is_empty());
+    }
+
+    #[test]
+    fn merge_revalidated_refreshes_listed_headers_and_keeps_the_rest() {
+        let stored = vec![
+            ("content-type".to_string(), "text/html".to_string()),
+            ("cache-control".to_string(), "max-age=2".to_string()),
+            ("etag".to_string(), "\"v1\"".to_string()),
+        ];
+        // 304 常见形态：只带新的有效期与缓存相关头，没有 content-type
+        let fresh = vec![
+            ("Cache-Control".to_string(), "max-age=60".to_string()),
+            ("date".to_string(), "Wed, 21 Oct 2026 12:00:00 GMT".to_string()),
+        ];
+        let merged = merge_revalidated(&stored, &fresh);
+        assert_eq!(
+            merged,
+            vec![
+                ("content-type".to_string(), "text/html".to_string()),
+                ("cache-control".to_string(), "max-age=60".to_string()),
+                ("etag".to_string(), "\"v1\"".to_string()),
+                ("date".to_string(), "Wed, 21 Oct 2026 12:00:00 GMT".to_string()),
+            ],
+            "304 里出现过的名字覆盖旧值，其余原样保留，新的追加在尾部"
+        );
     }
 
     #[tokio::test]
