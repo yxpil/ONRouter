@@ -29,7 +29,22 @@ libraries such as tokio/hyper, all gateway logic is hand-written.
 - **WASM gateway plugins**: `wasm_plugin <name> <file.wat|file.wasm> [fuel=…] [memory=…];` plugged
   into `access_by_wasm`, `header_filter_by_wasm` and `body_filter_by_wasm`. A small stable host ABI
   exposes request/response headers, status and body; traps and fuel exhaustion fail closed.
-- **Release engineering**: CI runs unit tests + clippy + five real-traffic E2E suites, with an
+- **1.0.1 — cache and config semantics**:
+  - `proxy_cache_path <dir> … disk=on` gives the response cache the
+  same cold tier as `lua_shared_dict disk=`. What LRU pushes out of the `keys_zone` while it is still
+  fresh is spilled to that directory (always async, one writer thread per zone, temp+rename), the next
+  request for that key is served from the tier and promoted back into memory, and a restart rebuilds the
+  index by scanning the tree. Off unless you write `disk=on` — a zone without it never creates the
+  directory. A cold hit keeps the nginx vocabulary (`X-Cache-Status: HIT`) and adds
+    `X-Cache-Tier: disk`; counts land in `onrouter_proxy_cache_disk_*`.
+  - `proxy_cache_revalidate on;` asks the origin "still this one?" with the cached entry's own
+    `ETag`/`Last-Modified` and replays the stored body on a 304 (`X-Cache-Status: REVALIDATED`) —
+    no second transfer of an object nobody changed.
+  - `return` / `rewrite` / `set` / `if` work at `server` level too (nginx's SERVER-rewrite phase,
+    before location matching), so `server { return 301 https://$host$request_uri; }` — the plainest
+    HTTPS-redirect vhost there is — stops being a line in `-t`'s ignored list and starts being a
+    redirect. Server-level `set`/`rewrite` can therefore change *which* location answers.
+- **Release engineering**: CI runs unit tests + clippy + six real-traffic E2E suites, with an
   optional `workflow_dispatch` 21-minute soak that checks private-memory growth. The 1.0 docs are
   [OPERATIONS.md](docs/OPERATIONS.md) (run it in production) and
   [TUTORIAL.md](docs/TUTORIAL.md) (build it feature by feature).
@@ -161,7 +176,7 @@ libraries such as tokio/hyper, all gateway logic is hand-written.
 | `least_time off\|observe\|on` adaptive selection (ONRouter-only) | picks the backend that is **actually answering faster**, from two signals the gateway can measure itself (no backend-supplied load header): P2C — draw two candidates, take the lower `score = (in-flight/weight + 1) × latency-EWMA`, so a momentarily-fast node is never swarmed the way an argmin would herd it — over a time-decayed EWMA of the observed response-header time (`least_time_window`, default 5 s; convergence time is in wall-clock seconds and therefore independent of QPS, whereas nginx's `least_time` — a Plus feature, no source in this repo to check against — smooths by response count, so its memory length moves with traffic). Samples come only from requests that got a response header: a connect failure or read timeout costs "as long as the timeout", which says nothing about how fast that backend is, so it never enters the EWMA and is handled by `max_fails` instead. A node with no sample (or one older than 4× the window) scores negative — i.e. "unknown" — and is therefore explored, which is how a new backend gets traffic and how a backend that quietly got fast again proves it, instead of being starved by a stale estimate forever. Rollout is deliberately staged: `off` (default) writes no atomics and emits no metric lines, `observe` measures and publishes per-node EWMA plus a `would_differ` count while the **selection sequence stays identical to `off`** (unit-tested, E2E-asserted), and only `on` lets the score choose. `least_time` with `ip_hash` is a `-t` error (the hash already decides), a single-node pool is a warning; changing an `upstream {}` block needs a restart because the pool is built once. Measured on this host: **no resolvable per-request cost** against the default tier (the gap is smaller than its own round-to-round spread) and **−92.8% p50** when the backends genuinely differ in speed — see Benchmarks | `upstream.rs`, `proxy.rs`, `metrics.rs`, `tools/least_time_e2e.py`, `bench_least_time.py` |
 | `proxy_pass` reverse proxy | hyper connection pool, `proxy_set_header` variable interpolation, prefix replacement | `proxy.rs` |
 | `resolver` + async DNS | pure-Rust non-blocking UDP stub resolver (A/AAAA, RFC1035 + compression pointers), `valid=` TTL cache | `dns.rs` |
-| `proxy_cache` response caching | in-memory named zones sized from `keys_zone` with LRU eviction, `proxy_cache_valid`/key/methods/min_uses, `proxy_cache_lock` coalescing, `use_stale` (error/timeout/updating/http_xxx), `proxy_cache_bypass`/`proxy_no_cache` (multi-value, nginx truthiness: a value counts only when non-empty and not `"0"`), `proxy_ignore_headers`, upstream `Cache-Control`/`Expires` precedence, `X-Cache-Status` + `$upstream_cache_status` | `proxy_cache.rs` |
+| `proxy_cache` response caching | in-memory named zones sized from `keys_zone` with LRU eviction, `proxy_cache_valid`/key/methods/min_uses, `proxy_cache_lock` coalescing, `use_stale` (error/timeout/updating/http_xxx), `proxy_cache_bypass`/`proxy_no_cache` (multi-value, nginx truthiness: a value counts only when non-empty and not `"0"`), `proxy_ignore_headers`, upstream `Cache-Control`/`Expires` precedence, `X-Cache-Status` + `$upstream_cache_status`, and — with `disk=on` — the same disk cold tier as `lua_shared_dict` (evicted-but-fresh responses spill to the zone's path, a cold hit is read back and promoted, restart rebuilds by scanning) | `proxy_cache.rs`, `disk_cache.rs` |
 | `proxy_pass https://` / `wss://` backends | pure-Rust rustls client over one pooled `Service<Uri>` connector shared with http backends; `proxy_ssl_verify`/`_trusted_certificate`/`_name`/`_server_name` + `proxy_ssl_certificate`/`_certificate_key` (mTLS client cert), TLS policy incl. client cert in the pool key | `proxy_tls.rs`, `proxy.rs` |
 | `Still ONLine` last-known-good replay | separate **byte-budgeted** zones (`still_online_zone <name> <size>;`) opened per server/location with `still_online <zone>;` (`off` stops inheritance); only anonymous `GET` + 2xx responses without `Set-Cookie` are stored (`still_online_max_body`), retained copies replay as `200` + `X-Still-Online: stale` + `Age` + `$still_online` when the origin is unreachable **or** answers 5xx, until `still_online_max_age` expires them; recovery-triggered anonymous re-fetch runs through the normal request path (so `rewrite`/location/`limit_req`/ACL apply) with single-flight + exponential backoff (`still_online_retry`/`_retry_max`/`_retry_deadline`). Credential hard rules, with **no switch to turn them off**: `Set-Cookie` is never stored and never replayed, a request carrying `Cookie`/`Authorization` never writes a copy, and by default never reads one either — `still_online_allow_credentials on` only opens the *read* side | `still_online.rs`, `server.rs`, `router.rs` |
 | `rewrite ... last/break/redirect/permanent` | regex engine + `$1..$9` back-references | `engine.rs` |
@@ -267,7 +282,7 @@ See [docs/TUTORIAL.md](docs/TUTORIAL.md) for the walkthrough and
 
 `-t` validates listeners, certificates and limit references, then prints `配置测试通过。` **and every
 startup warning line** (`告警 N 条：` followed by one bullet each — e.g. an unknown directive that was
-ignored, or a server-level `return`/`rewrite`/`set`/`if` that is not supported there). Exit code stays
+ignored). Server-level `return`/`rewrite`/`set`/`if` are no longer in that category — they run in the SERVER-rewrite phase, before location matching. Exit code stays
 `0` for ignored directives, so read the printed warnings, not just the exit code.
 
 ### HTTPS / certificates
@@ -820,6 +835,17 @@ them as standalone runnable assertion scripts.
   `bypass`/`no_cache` store-vs-skip semantics, keys_zone-driven LRU eviction, and HEAD
   serving from (but never populating) the shared GET cache entry; the basic suite
   `tools/proxy_cache_e2e.py` remains 13/13.
+- `tools/proxy_disk_e2e.py`: 39/39 passing — the `proxy_cache` disk cold tier over real traffic with
+  three zones of the *same* 8-entry `keys_zone`: `disk=on spill_after=0` (mechanism), `disk=on
+  spill_after=3` (gate) and no `disk=` at all (control). Proved: the evicted-but-fresh entries really
+  land in the directory as self-describing `ORDK` records; a request for one of them returns
+  `X-Cache-Status: HIT` + `X-Cache-Tier: disk` **with the backend counter unchanged** (the only
+  evidence that matters — no origin call), then promotes it so the next hit is memory-only; the
+  control zone's directory is never even created and its evicted key goes back to the origin; the
+  gate zone writes nothing for one-shot traffic; flipping a byte in every cold file yields correct
+  bodies for all 12 keys, 12 origin refetches and a `corrupt` count that moves — never a wrong
+  response and never a 5xx; after a stop/start `warm_recovered` equals the index size that was
+  reported before shutdown and cold hits keep serving.
 - `tools/still_online_e2e.py`: 25/25 passing — Still ONLine under a real backend kill/restart. The
   backend is Python's `ThreadingHTTPServer` with keep-alive, so "crash" is simulated by hard-closing
   established connections too (a bare `shutdown()` would leave pooled connections serving 200s and
@@ -1033,6 +1059,20 @@ them as standalone runnable assertion scripts.
   **2,591,305 requests, 0 failures, 2064.7 req/s**, private memory 20.11 → 21.97 MiB
   (+1.86 MiB, +0.067 MiB/min; a first run added +2.19 MiB over 2,787,193 requests).
   Full tables in OPERATIONS §13.1.
+- 1.0.1 adds the response-cache cold tier and is verified the same way: `cargo test --workspace` →
+  498/498 (485 `onrouter-server` + 13 `onrouter-config`) with no new clippy findings, and the cache
+  suites it must not regress all pass on real traffic — `proxy_disk_e2e` 39/39 (spill → cold hit with
+  the backend counter unchanged → promote → restart `warm_recovered` → whole-directory corruption
+  counted and refetched, never served), `proxy_cache` 13/13, `cache_advanced` 32/32,
+  `cache_header_gap` 25/25, `disk_cache` 53/53, `learning_cache` 34/34, `still_online` 25/25,
+  `governor` 32/32. The six feature suites now total 184 assertions (canary 22, wasm 23,
+  resilience 17, affinity 7, proxy_split 76, proxy_disk 39) and `conf/tutorial_full.conf` verifies
+  end to end at 38/38 including its new `/cold` endpoint. The 21-minute soak now *churns* the tier
+  (an 8-entry `disk=on` zone against a repeating 256-key space — the old 4 MiB zone could never
+  evict, so a passing soak proved nothing about the new code): **2,175,742 requests, 0 failures**,
+  1733.5 req/s, private memory 17.98 → 19.05 MiB (+1.07 MiB, +0.111 MiB/min), and end-of-run tier
+  accounts of 79,603 spills / 78,873 cold hits / 78,873 promotions with `pending_jobs` 0,
+  `corrupt` 0 and `never_read` 0.
 - The pre-1.0 roll (0.8.0, 460 unit tests + 81 Python E2E scripts: every `tools/*_e2e.py`
   (73) plus the 8 root scenario/compat/security/static/upstream suites) was re-run on that
   build: every E2E script passes with real traffic
@@ -1435,8 +1475,11 @@ Already done (previously listed as gaps, now implemented):
   the *cache-decision* view only — an ignored `Cache-Control: no-store` no longer forbids caching and
   an ignored `Set-Cookie` no longer blocks storing, while both are still forwarded to the client
   unchanged; top-level
-  `proxy_cache_path … keys_zone=<name>:<size>` sets per-zone capacity (128 B/entry; the path itself
-  is never written — the cache is memory-only). Freshness precedence matches nginx: the upstream's
+  `proxy_cache_path … keys_zone=<name>:<size>` sets per-zone capacity (128 B/entry). Without `disk=on`
+  the path is only a name — nothing is written and the directory is not even created; with `disk=on`
+  it becomes that zone's cold tier root, honouring `max_size`/`levels`/`inactive` plus ONRouter's own
+  `spill_after`/`max_value`, so an evicted-but-still-fresh response is served from disk later instead
+  of going back to the origin. Freshness precedence matches nginx: the upstream's
   own `Cache-Control`/`Expires` wins (and an explicit `no-store`/`no-cache`/`private`/`max-age=0`
   forbids caching outright), falling back to `proxy_cache_valid` only when the upstream gives no
   hint. Responses carrying `Set-Cookie` are never stored (shared-cache safety) unless
@@ -1465,9 +1508,14 @@ Already done (previously listed as gaps, now implemented):
   `tools/cache_header_gap_e2e.py` 25/25 for the semantics aligned in this round: `add_header` variable
   expansion, `$upstream_cache_status` on a POST, multi-value `proxy_cache_bypass` / `proxy_no_cache`
   including all-`"0"` and never-set variables, and `proxy_ignore_headers` with a control location that
-  does not ignore.) Not yet
-  implemented: revalidation (`If-None-Match` to origin), `proxy_cache_purge`, `proxy_cache_lock_age`,
-  on-disk persistence, `Vary`-aware keying.
+  does not ignore.)
+  `proxy_cache_revalidate on;` is implemented: an expired entry takes *its own* `ETag` /
+  `Last-Modified` to the origin, and a 304 refreshes the expiry and replays the stored body
+  (`X-Cache-Status: REVALIDATED`) instead of transferring a second copy of an object nobody asked to
+  change — `tools/proxy_cache_e2e.py` proves it by counting the origin's conditional answers
+  separately from its full sends, so "asked" and "resent" cannot be confused. With `disk=on` the same
+  reuse applies to entries read back from the cold tier. Still not implemented:
+  `proxy_cache_purge`, `proxy_cache_lock_age`, `proxy_cache_background_update`, `Vary`-aware keying.
 - **Learning (ONRouter-only: cache admission, queue depth, client reputation)**: three small online
   models, all built on the premise that a gateway that learns must still be a gateway whose memory you
   can state in one sentence. Everything hangs off `learning on;` (**off by default**; with it off, the

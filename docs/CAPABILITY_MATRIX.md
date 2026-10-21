@@ -76,7 +76,7 @@ The remaining gaps are concentrated in four areas:
 | nginx config syntax, `include`, `-p/-g/-e`, `http{}` flattening, pid file | ✅ | parser unit tests, `compat_test.py` |
 | `*_by_lua_block { … }` for every phase | ✅ | lexer unit tests (nested tables/strings/comments/long brackets, line numbers) |
 | Unknown top-level directive warnings; `worker_processes`/`log_format` explicitly “ignored” | ✅ | `router::warn_unknown_top_level`, startup log |
-| `set` / `if` / `return` in the REWRITE phase, in config order (subset) | ✅ | `tools/set_if_e2e.py`, `engine`/`router` unit tests; unsupported `if` forms are parse errors, server-level ones warn |
+| `set` / `if` / `return` in the REWRITE phase, in config order (subset) | ✅ | `tools/set_if_e2e.py`, `engine`/`router` unit tests; unsupported `if` forms are parse errors; at `server` level they run in the SERVER-rewrite phase, before location matching |
 | `still_online*` directives: byte-budgeted zones, server→location inheritance, `-t` hard error on a zone nobody declared, warning on parameters in a block with no zone | ✅ | `router` unit tests `still_online_*` (6), `-t conf/still_online.conf` prints the zone list |
 | `init_by_lua*` once per VM | ✅ | `lua_engine` unit tests |
 | `init_worker_by_lua*` once per VM after scheduler start; timers/cosockets/`ngx.sleep` work | ✅ | `tools/init_worker_package_e2e.py` 21/21 |
@@ -250,8 +250,20 @@ The remaining gaps are concentrated in four areas:
   split counters over 16 000-request windows; the release build (5 passes, err=0 everywhere) puts the whole
   path at +2.2%/+4.1% against the no-split baseline at c=8/c=32 while those rows' own round-to-round spread
   is 4%/7%, so the defensible statement is an upper bound (≲5%), not a measurement.
-- **Proxy cache**: in-memory named zones with capacity from
-  `proxy_cache_path … keys_zone=<name>:<size>` (LRU eviction — or, with `proxy_cache_learning`,
+- **Proxy cache**: named zones with capacity from
+  `proxy_cache_path … keys_zone=<name>:<size>`, plus the same optional disk cold tier as
+  `ngx.shared.DICT` — `disk=on` makes the directive's path that zone's tier root, so an
+  evicted-but-still-fresh response is written asynchronously (one writer thread per zone,
+  temp+rename, self-describing entries under `levels=` sharding), a later request for that key is
+  served from disk and promoted back into memory, and a restart rebuilds the index by scanning the
+  tree. Opt-in: a zone without `disk=on` never creates the directory. Cold hits keep nginx's status
+  vocabulary (`X-Cache-Status: HIT`) and add `X-Cache-Tier: disk`; `max_size`/`inactive` bound the
+  tier and `spill_after`/`max_value` decide what is worth writing, so one-shot traffic cannot fill a
+  disk. Evidence: `tools/proxy_disk_e2e.py` 39/39 (real traffic, restart, whole-directory corruption
+  counted and dropped without ever serving wrong content) and 16 unit tests in `proxy_cache.rs`
+  (payload round-trip and every mangling rejection, spill gate both ways, promotion, warm start,
+  invalidate dropping the cold copy). `min_free_size=` and `use_temp_path=` remain unimplemented and
+  say so at `-t`. Capacity still drives eviction (LRU — or, with `proxy_cache_learning`,
   admission and the eviction victim decided by a TinyLFU frequency sketch; expiry cleanup
   every 128 stores), `proxy_cache_lock`/`_lock_timeout` request coalescing,
   `proxy_cache_use_stale` (`error`, `timeout`, `updating`, `http_4xx/5xx`),
@@ -261,7 +273,7 @@ The remaining gaps are concentrated in four areas:
   `Set-Cookie` stops blocking the store yet is still forwarded), upstream freshness precedence, HEAD
   lookup without HEAD-response cache population, `X-Cache-Status: HIT|MISS|EXPIRED|BYPASS|STALE` and
   the `$upstream_cache_status` variable (empty string when the request never engaged the cache).
-  Evidence: `tools/proxy_cache_e2e.py` 13/13, `tools/cache_advanced_e2e.py` 32/32,
+  Evidence: `tools/proxy_cache_e2e.py` 13/13, `tools/cache_advanced_e2e.py` 32/32, `tools/proxy_disk_e2e.py` 39/39 (cold tier: spill/promote/restart/corruption),
   `tools/cache_header_gap_e2e.py` 25/25 (add_header interpolation, `$upstream_cache_status`
   on a POST, multi-value bypass/no_cache, ignore_headers with control locations).
 - **Still ONLine (last-known-good replay, ONRouter-only)**: separate byte-budgeted zones
@@ -460,12 +472,20 @@ The remaining gaps are concentrated in four areas:
   config directory (use `$prefix` or absolute paths).
 - `ssl_session_cache shared:` is an in-process LRU, not a cross-process shared
   memory zone; capacity is per process.
-- `proxy_cache` is memory-only: `proxy_cache_path`'s directory/`levels`/`max_size`
-  are ignored (only `keys_zone` capacity is used), so entries do not survive a
-  restart. Missing: revalidation (`proxy_cache_revalidate`, If-None-Match → 304),
-  `proxy_cache_purge`, `proxy_cache_lock_age`, `proxy_cache_background_update`,
-  `proxy_cache_convert_head` (HEAD may read but never populate) and `Vary`-aware
-  keying.
+- `proxy_cache_path` honours `keys_zone`, and with `disk=on` also `max_size`/`levels`/
+  `inactive` plus `spill_after`/`max_value`; `min_free_size=` and `use_temp_path=` are
+  still parsed-and-warned, not implemented. The cold tier holds what memory evicted while
+  still fresh — it is a cold tier, not nginx's full write-through disk cache, so an entry
+  that never left memory is not on disk and does not survive a restart.
+  `proxy_cache_revalidate on` is implemented: an expired entry sends its own
+  `If-None-Match`/`If-Modified-Since`, and a 304 refreshes the expiry and replays the stored
+  body (`X-Cache-Status: REVALIDATED`) with no second transfer. The client's own `If-*` is
+  replaced on that path, because "our copy is unchanged" is not "your copy is unchanged".
+  Missing: `proxy_cache_purge`, `proxy_cache_lock_age`,
+  `proxy_cache_convert_head` (HEAD may read but never populate), `Vary`-aware keying and
+  `proxy_cache_background_update` — the last one needs an owned internal refresh (a background
+  fetch carries the *refreshing* client's content-negotiation headers into an entry that other
+  clients will read, which is a cache-variant question, not a threading question; see the roadmap).
 
 ### 2.3 Ecosystem / long tail
 
@@ -504,8 +524,8 @@ reports a healthy start — read the warning lines, not just the exit code.
 |---|---|---|
 | top | `worker_shutdown_timeout`, `ssl_stapling` | `shutdown_grace` is ONRouter's own drain knob; stapling is a §2.1 gap |
 | server | `valid_referers`, `secure_link`, `secure_link_md5`, `gzip_static` | referer/link checks: do in Lua or `content_by_rust`; pre-compressed `.gz` serving falls back to on-the-fly gzip |
-| server | `return`, `rewrite`, `set`, `if` | REWRITE-phase steps are only executed inside a `location`; a server-level one now warns with its line number and is skipped, where it used to be a silent no-op |
-| location | `limit_rate`, `auth_request`, `dav_methods`, `grpc_pass`, `fastcgi_pass`, `mirror`, `proxy_bind`, `proxy_cache_revalidate` | Downstream-protocol upstreams (`grpc`/`fastcgi`) and upstream source binding are simply not implemented. `if` is no longer in this list: the `set`/`if` subset above is implemented and unsupported `if` forms are parse-time errors |
+| server | — | REWRITE-phase steps (`return`/`rewrite`/`set`/`if`) execute at server level as well, in nginx's SERVER-rewrite phase, *before* location matching — so `server { return 301 …; }` answers 301 instead of falling through to 404, and a server-level `set`/`rewrite` can change which location matches. Server-level `return` runs before access control (nginx-consistent, and the only way a redirect-only vhost with no location can work); the deliberate ONRouter difference stays one level down: a *location-level* `return` still runs after `allow`/`deny`/`auth_basic`/`access_by_*` |
+| location | `limit_rate`, `auth_request`, `dav_methods`, `grpc_pass`, `fastcgi_pass`, `mirror`, `proxy_bind` | Downstream-protocol upstreams (`grpc`/`fastcgi`) and upstream source binding are simply not implemented. `if` is no longer in this list: the `set`/`if` subset above is implemented and unsupported `if` forms are parse-time errors |
 | scope | `client_body_timeout` (and the other process timeouts) is **root-level only** | `client_body_timeout 2s;` inside `server {}`/`location {}` warns as unknown and is ignored — it is a `Settings` field, not a per-vhost override (nginx allows it per server/location) |
 
 ## 3. Performance snapshot (Windows, 2026-10-18)
@@ -663,11 +683,7 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
 5. **Ecosystem**: `resty.websocket`/`jwt`/`mysql`/`dns` on top of the existing
    cosocket core; optional LuaJIT investigation (mlua supports LuaJIT builds, but
    the Rust module surface would need auditing).
-6. **Disk tier phase 2**: give `proxy_cache` the same cold-tier treatment as
-   `ngx.shared.DICT` — nginx `proxy_cache_path` semantics (`levels`/`max_size`/
-   `inactive`/`min_free_size`/`use_temp_path`), warm start by scanning the cache
-   tree, and `X-Cache-Status` reporting hits served from disk.
-7. **Learned eviction/scarcity scorer (offline-trained weights; design constraints, not yet
+6. **Learned eviction/scarcity scorer (offline-trained weights; design constraints, not yet
    built)** — the *online* tiny models shipped (§1.3: TinyLFU admission, per-key burst depth,
    client reputation, all a few KB per zone on one budgeted ledger); what is still open here is a
    scorer whose weights come from off-line training. Any
@@ -682,18 +698,26 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
    scoring pass per eviction decision, no per-request inference unless the location
    opts in. Small models only (the ≤5 MB envelope already agreed for this feature);
    WASM is out of scope.
-8. **CDN-awareness follow-ups**: the `Upgrade`/101 seam calls `apply_front_proxy` in the right place but
+7. **CDN-awareness follow-ups**: the `Upgrade`/101 seam calls `apply_front_proxy` in the right place but
    `tools/front_proxy_e2e.py` has no WebSocket-capable backend, so that path is wired rather than observed;
    `Cache-Status` is emitted on the buffered path only (the streaming path would have to decide the tag
    before the first byte leaves); and per-provider *deployment* examples — where the ranges are fetched from
    the vendor's published list at install time — belong in configs, which is why none ship in the engine.
-9. **Cache-governor follow-ups**: boost restores the sweep cadence and pre-warms demoted keys, but it
+8. **Cache-governor follow-ups**: boost restores the sweep cadence and pre-warms demoted keys, but it
    does **not** raise `limit_req_queue` ceilings — the limiter's learned depth still comes only from
    that queue's own history, so "boost" does not widen admission anywhere else. The minute-of-day
    profile is memory-only by design (a restart rebuilds it), and prediction pre-switches to boost
    only: a wrongly predicted quiet hour must never demote state on a guess. Deep sleep's
    `proxy_cache` eviction is LRU, not frequency-aware; frequency is the admission sketch's job, and
-   sleep is about dropping reconstructible bodies.
+   sleep is about dropping reconstructible bodies (with `disk=on` on that zone the victims are
+   spilled to the cold tier instead of dropped, so reclaiming memory stops costing a re-fetch).
+9. **`proxy_cache_background_update`** — deliberately paired with `Vary`/variant keying instead of
+   shipped half. The plumbing is already there (`run_capture` runs a full internal pipeline under the
+   parent's vhost), but a background refresh carries *its own* `Accept-Encoding`/`Accept` into an
+   entry that other clients will read, and the cache key today is
+   `$scheme$proxy_host$request_uri` with no variant dimension: a gzip-capable refetch can hand a
+   encoded body to a client that never asked for one. Serving stale while refreshing is therefore not
+   the hard part — deciding what a variant-agnostic key may overwrite is.
 
 ## References
 

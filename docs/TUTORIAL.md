@@ -209,6 +209,32 @@ keepalive 32;    # 到后端的空闲长连接池
 `lazy_rejoin`、`circuit_breaker`、权重）需要**重启进程**，热重载不会替换已经运行的池，
 具体边界见第 10 章。
 
+### 3.4 整站跳转与 server 级的 `return` / `set` / `if`
+
+只把 80 端口的流量搬到 443，配置就是一个不写任何 location 的 vhost：
+
+```nginx
+server {
+    listen 127.0.0.1:18081;
+    server_name www.example.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+`return` / `rewrite` / `set` / `if` 属于 nginx 的 REWRITE 相位，而这一相位在 **location 匹配之前**
+执行，所以 server 级的 `set`/`rewrite` 会改变"这个请求最终落到哪个 location"。
+1.0.0 之前这四条写在 `server` 块里只会留下一行"已被忽略"的告警——也就是说这条最常见的跳转
+配置会静默变成 404，`-t` 通过但线上没有跳转。现在它真的回 301。
+
+一处要当心的不对称：**server 级 `return` 先于访问控制**（nginx 一致，否则没有 location 的跳转
+vhost 根本无法工作），而 **location 级 `return` 在 ONRouter 里仍排在 `allow`/`deny`、`auth_basic`、
+`access_by_*` 之后**（这是本项目刻意的差异，见能力矩阵 §1.1）。同一个条件写在这两级，结果不同。
+
+可运行的证据在 `conf/set_if.conf` + `tools/set_if_e2e.py` 的 S16–S23：变量在 location 里可见、
+`if` 覆盖 server 级 `set`、server 级 `rewrite` 改了选中的 location、`if` 里的 `return` 与裸
+`return` 都生效、纯跳转 vhost 回 301，以及 `-t` 不再对这些指令报警。规则细节见
+[OPERATIONS.md](OPERATIONS.md) 第 5.1 节。
+
 ---
 
 ## 4. 后端挂了怎么办：摘除、懒重连、熔断
@@ -334,8 +360,31 @@ location = /cached {
 }
 ```
 
-`proxy_cache_path` 在这个版本是**纯内存缓存**：`path` 不落盘，`keys_zone` 的容量决定
-条目上限，按 LRU 淘汰。进程重启后缓存清空。
+不写 `disk=on` 时缓存是**纯内存**的：`path` 只是一个名字，连目录都不会创建，`keys_zone` 的
+容量决定条目上限，按 LRU 淘汰，进程重启后清空。
+
+想让它跨重启，给这个区加一层磁盘冷层：
+
+```nginx
+# 教学用的小容量区，方便看到落盘（生产请按 OPERATIONS §9.1 用正常容量）
+proxy_cache_path logs/tutorial_cold keys_zone=cold:1k disk=on max_size=32m max_value=1m;
+```
+
+`cold:1k` 只有 8 条内存容量，所以连续请求 9 个不同 URL 就会把第 1 条挤出去——它不会消失，
+而是被异步写进 `conf/logs/tutorial_cold/` 里。再请求第 1 个 URL 时：
+
+```bash
+curl -i http://127.0.0.1:18600/cold?id=1 | grep -iE "x-cache-status|x-cache-tier"
+# X-Cache-Status: HIT          ← 状态词仍是 HIT，没有新增 nginx 词表之外的值
+# X-Cache-Tier: disk           ← 层级由这个头说明：这次是磁盘供的
+```
+
+第二次同一 URL 就回到内存（`X-Cache-Tier` 消失），因为读回来时顺手提升了。重启网关后仍能
+这样命中：冷层索引由扫目录重建，`/metrics` 里的
+`onrouter_proxy_cache_disk_operations_total{zone="cold",op="warm_recovered"}` 就是重建回来的条数。
+两个要点：只写"被挤出去且还没过期"的对象（不是全量写盘），以及 `spill_after`（默认 1）
+决定谁值得写盘——开了 `proxy_cache_learning` 时它用同一把频率草图判据，一次性扫库流量
+既进不了内存也写不了磁盘。真实流量的完整断言见 `tools/proxy_disk_e2e.py`（39 项）。
 
 用固定落到 `beta` 的 Cookie 请求两次：
 
@@ -365,6 +414,33 @@ curl -s http://127.0.0.1:18600/metrics | grep onrouter_cache_requests_total
 - `POST` 等非缓存方法默认不进缓存。
 - 上游返回 `Set-Cookie` 的响应不会进入缓存。
 - 缓存只省回源；WASM 过滤器仍会在缓存命中时执行（过滤的是发给客户端的那一份）。
+
+### 5.1 条目过期之后：`proxy_cache_revalidate`
+
+默认行为是"过期 = 整份重取"，可观测的标志是 `X-Cache-Status: EXPIRED`，上游会把同一个 body
+再传一遍。加上 `proxy_cache_revalidate on;` 之后，网关改为先问一句：
+
+```nginx
+location /api/ {
+    proxy_pass http://app;
+    proxy_cache pages;
+    proxy_cache_valid 200 30s;
+    proxy_cache_revalidate on;   # 带上缓存自己那套 ETag / Last-Modified 去问
+}
+```
+
+上游答 304 时，`X-Cache-Status: REVALIDATED`，body 用的是缓存里那份，有效期按 304 的头重算。
+判断有没有真的省下来，别看状态词，要看**上游被打了几个"整份"**：
+`tools/proxy_cache_e2e.py` 里的后端把"收到条件请求"与"发出完整响应"分开计数，R3–R6 断言的正是
+"问了上游（+1）但没有重发（body 逐字节不变）"这两件事同时成立。
+
+两个必须知道的前提：
+
+- 上游得真的实现了条件请求（对 `If-None-Match` 回 304）。它要是无视条件头照样回 200，
+  行为就退回普通重取，不会出错，也省不下什么。
+- 这条路径会**替换掉客户端自带的 `If-None-Match` / `If-Modified-Since`**。因为"网关缓存里的副本
+  没变"和"你这个浏览器手上的副本没变"是两件事，混在同一个条件请求里就会把 304 发给
+  拿着另一份内容的客户端。需要让客户端自己做协商时，用 `proxy_cache_bypass` 让请求绕过缓存。
 
 Still ONLine（最后已知好副本）是另一层机制，默认只收匿名 GET + 2xx，规则见
 [OPERATIONS.md](OPERATIONS.md) 第 9.3 节。
@@ -741,7 +817,7 @@ cargo clippy --workspace --all-targets
 仓库现有代码里可能有一些历史 clippy 告警，CI 不把它们设为 `-D warnings`；但新增代码不应
 引入新的 warning。
 
-### 11.2 五组真实流量 E2E
+### 11.2 六组真实流量 E2E
 
 这些脚本会自己起网关、后端和探针，使用固定端口；运行前先停掉本机占用这些端口的进程。
 教程的 18600 不会冲突。
@@ -752,11 +828,13 @@ python tools/wasm_e2e.py         # 23 项
 python tools/resilience_e2e.py   # 17 项
 python tools/affinity_e2e.py     # 7 项
 python tools/proxy_split_e2e.py  # 76 项
+python tools/proxy_disk_e2e.py   # 39 项（响应缓存磁盘冷层）
 ```
 
 它们验证的是行为，不是“能编译”：灰度第一条命中、熔断半开、懒重连真实探针、WASM 改写
-状态/头/体、亲和性逐线程绑定、分流账本等（合计 145 项断言）。任何一项失败都会打印 HTTP
-状态、响应头或进程日志，先看脚本输出再改代码。
+状态/头/体、亲和性逐线程绑定、分流账本、缓存冷层的落盘/读回/跨重启/坏文件不发错内容等
+（合计 184 项断言）。任何一项失败都会打印 HTTP 状态、响应头或进程日志，先看脚本输出再改代码。
+缓存那条套件还额外盯着"后端计数不变"这一件事——它是唯一能证明命中真的没回源的证据。
 
 ### 11.3 21 分钟稳定性压测
 

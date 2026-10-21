@@ -124,6 +124,8 @@ onrouter -t -c conf/onrouter.conf
 - 调度窗口、缓存 governor、upstream 的 `least_time`/韧性摘要；
 - 每条业务分流（`proxy_pass http://$var`）的声明比例与候选版本；
 - 每个 WASM 插件的路径、fuel、内存上限、导出函数；
+- 每个开了 `disk=on` 的 `proxy_cache` 区：冷层目录、`max_size`、`levels`、`inactive`、
+  `spill_after`、`max_value`（没开的区一行都不打印，也不建目录）；
 - **所有“写了但没生效”的告警**（未知指令、被忽略的指令、掩码越界裁剪等）。
 
 退出码：
@@ -190,7 +192,7 @@ WantedBy=multi-user.target
 - canary / split_clients 规则（引用的 upstream 池必须启动时已存在）；
 - WASM 插件代码与 `*_by_wasm` 阶段引用；
 - TLS 证书与私钥（证书原地续期也会被检测到，不必改配置）；
-- `proxy_cache_path` 的 `keys_zone` 容量、`still_online_zone` 预算（已有条目立即按新上限裁剪）；
+- `proxy_cache_path` 的 `keys_zone` 容量、`still_online_zone` 预算（已有条目立即按新上限裁剪），以及各区冷层的开关（`disk=on` 增删会重开 store：先把旧队列排空再打开新的，避免同一目录被两个 store 同时持有）；
 - scheduled window 与 cache_governor 配置。
 
 必须重启：
@@ -254,8 +256,34 @@ access_log_keep 5;
 | `tcp_nodelay on/off;` | TCP_NODELAY | — |
 | `accept_backlog <n>;` | listen backlog | — |
 | `gzip ...` | 响应压缩 | 关闭 |
-| `proxy_cache_path <path> keys_zone=<name>:<size>;` | 内存缓存区 | — |
+| `proxy_cache_path <path> keys_zone=<name>:<size> [disk=on] [max_size=] [levels=] [inactive=] [spill_after=] [max_value=];` | 缓存区；`disk=on` 时 `<path>` 就是该区冷层目录 | 冷层关闭 |
+| `proxy_cache_revalidate on|off;` | 过期条目先带上缓存自己的 ETag/Last-Modified 问一次，304 就复用已存 body | `off` |
 | `still_online_zone <name> <size>;` | 最后已知好副本区 | — |
+
+### 5.1 server 级的 `return` / `rewrite` / `set` / `if`
+
+这四条属于 nginx 的 REWRITE 相位，在 **location 匹配之前**执行（SERVER-rewrite）。1.0.1 之前它们
+写在 `server` 块里只会得到一行"已被忽略"的告警，于是最常见的跳转 vhost 静默变成 404：
+
+```nginx
+server {
+    listen 80;
+    server_name www.example.com;
+    return 301 https://$host$request_uri;   # 现在真的回 301
+}
+```
+
+运维要点：
+
+- server 级 `set`/`rewrite` 改的是路径与变量，因此它们会**改变最终命中哪个 location**；写的时候
+  按"先 server、后 location"的顺序理解执行流。
+- server 级 `return` 先于访问控制执行（nginx 一致，否则没有 location 的跳转 vhost 无法工作）。
+  **location 级 `return` 仍然是 ONRouter 的刻意差异**：它排在 `allow`/`deny`/`auth_basic`/
+  `access_by_*` 之后，见 `docs/CAPABILITY_MATRIX.md` §1.1。同一个条件在两级写出来结果不同，
+  别指望它们等价。
+- 形态检查与 location 级共用同一套解析器：`if` 嵌套、`set plain 1`（变量名不是 `$` 开头）、
+  非法条件都会在 `-t` 直接失败，不是告警。
+- 执行仍受 `MAX_URI_CHANGES` 的环检测保护；server 级 rewrite 自身不消耗跳数额度。
 
 ---
 
@@ -467,12 +495,14 @@ P99 与缓存命中率。回滚只需把 `percent` 改成 0 或删掉对应条�
 ### 9.1 proxy_cache
 
 ```nginx
-proxy_cache_path logs/cache keys_zone=pages:64m;   # 仅内存，path 不落盘
+proxy_cache_path logs/cache keys_zone=pages:64m;                     # 纯内存（默认）
+proxy_cache_path logs/cache_disk keys_zone=big:64m disk=on max_size=2g;  # 冷层：path 就是目录
 
 location /api/ {
     proxy_cache pages;
     proxy_cache_valid 200 30s;
     proxy_cache_lock on;
+    proxy_cache_revalidate on;
     proxy_cache_use_stale error timeout updating http_502 http_503;
     proxy_pass http://app;
 }
@@ -480,10 +510,38 @@ location /api/ {
 
 - 区容量按 **128 B/条目** 估算；`64m` ≈ 52 万条（键+元数据，响应体另计）。容量不够时按 LRU
   淘汰，`keys_zone` 过小会表现为命中率上不去而不是报错。
-- 缓存完全在内存，进程重启即清空；`proxy_cache_path` 的路径不会写盘，不要把本地磁盘当缓存盘。
+- 不写 `disk=on` 时缓存**完全在内存**：`proxy_cache_path` 的路径只是一个名字，目录都不会被创建，
+  进程重启即清空。写了 `disk=on` 之后，路径成为该区的磁盘冷层，语义与 `lua_shared_dict disk=`
+  同源：被 `keys_zone` 容量挤出去**且还没过期**的响应异步落盘（每区一个写线程，temp+rename，
+  条目自描述带 CRC），下次同 key 请求从冷层读回并提升进内存，重启靠扫目录重建索引。
+- 冷层不是 nginx 那种全量写盘缓存：**只在内存淘汰时才写**。留在内存里的对象不在磁盘上，所以
+  重启能救回的是"上次运行中被挤出去过的那批"。要更大的热集合请加大 `keys_zone`，
+  而不是指望 `max_size`。`min_free_size=` / `use_temp_path=` 尚未实现，`-t` 会点名告警。
+- 落盘与冷读都不占请求线程：请求路径最多付一次"序列化 + 入队"，写文件在后台。`max_size` 满时
+  新的落盘直接被拒（`spill_skipped`），等后台按分数逐出，绝不把淘汰路径变成阻塞 IO。
+- 什么值得落盘由 `spill_after`（默认 1）决定：`proxy_cache_learning` 开着时这个数就是草图里的
+  频率估计，与内存准入同一口径，扫库式一次性 URL 既进不了内存也写不了磁盘。单条超过
+  `max_value`（默认 4 MiB）的响应留在内存，不落盘。
+- 把 `disk=on` 改回关闭**不会**删掉目录里已有的条目文件，只是从此不再读写它；下次再打开同一目录，
+  旧条目会按 TTL/`inactive` 被继续回收。要彻底清干净请在停服时自己删目录。
+- 冷命中在 nginx 的词表里仍然是 `X-Cache-Status: HIT`（不新增状态词，免得客户端与前置代理的
+  判断逻辑被我们改宽度），层级另用一个头 `X-Cache-Tier: disk` 说出来；账在
+  `onrouter_proxy_cache_disk_*`。磁盘条目坏掉（CRC 不符、截断、版本不认识）一律**按未命中处理并回源**，
+  计入 `corrupt`，绝不会把坏数据拼成响应发出去。
 - 新鲜度优先取上游 `Cache-Control`/`Expires`；上游没给提示才用 `proxy_cache_valid`。带
   `Set-Cookie` 的响应默认不缓存。
 - `proxy_cache_lock` 合并同键并发回源；对热点 key 的缓存击穿很有效。
+- `proxy_cache_revalidate on`：条目过期后不再直接重取整份，而是带上**缓存自己**的
+  `ETag`/`If-Modified-Since` 去问一次；上游答 304 就只重算有效期、把存下来的 body 原样发回，
+  响应头是 `X-Cache-Status: REVALIDATED`。省的是上游第二次传 body 的带宽与时间，
+  **不省**那次往返 —— 上游仍然被问了一次，所以别把它当"过期也不回源"用（那是
+  `proxy_cache_background_update`，还没实现，原因见能力矩阵 §5）。
+- 用了 revalidate 就要知道一件事：这条路径上客户端自带的 `If-None-Match` / `If-Modified-Since`
+  会被替换掉。"我们缓存里的副本没变"和"你浏览器里的副本没变"是两件事，混在一个条件请求里
+  就会把 304 发给没带对副本的客户端。客户端自己做协商时，请让请求绕过缓存
+  （`proxy_cache_bypass`）或别开 revalidate。
+- 304 里没有的头**不会被删掉**：`content-type` 这类描述 body 的头在 304 里通常缺席，
+  合并规则是"304 出现过的名字覆盖旧值，其余原样保留"。
 - 每个经过缓存的响应带 `X-Cache-Status`，并计入 `onrouter_cache_requests_total{status}`：
   `MISS` / `HIT` / `EXPIRED` / `STALE` / `BYPASS`。`BYPASS` 也包括“回源了但按规则不存”。
 
@@ -670,6 +728,8 @@ scrape_configs:
 | `onrouter_connections_accepted` / `_active` / `_capacity` | 连接水位 |
 | `onrouter_http_requests_total` / `onrouter_http_responses_total` | 请求量与状态码分布 |
 | `onrouter_cache_requests_total{status}` | MISS/HIT/EXPIRED/STALE/BYPASS |
+| `onrouter_proxy_cache_disk_{entries,bytes,value_bytes,capacity_bytes,pending_jobs,pending_bytes}` | 各区冷层的体量与排队情况（没开 `disk=on` 时整族不输出） |
+| `onrouter_proxy_cache_disk_operations_total{zone,op}` | `spill`/`spill_skipped`/`cold_hit`/`promote`/`evict`/`expire`/`corrupt`/`cold_error`/`never_read`/`warm_recovered` |
 | `onrouter_upstream_*` | 节点可选性（`server_available`）、主动检查、失败、懒探测、熔断 |
 | `onrouter_proxy_split_*` | 灰度落点与改投账本 |
 | `onrouter_wasm_*` | 插件调用、失败、fuel 耗尽、拒绝 |
@@ -719,6 +779,9 @@ python tools/wasm_e2e.py         # 23 项
 python tools/resilience_e2e.py   # 17 项
 python tools/affinity_e2e.py     # 7 项
 python tools/proxy_split_e2e.py  # 76 项
+python tools/proxy_disk_e2e.py   # 39 项（响应缓存磁盘冷层）
+python tools/proxy_cache_e2e.py  # 21 项（含 proxy_cache_revalidate 的 R1–R8）
+python tools/set_if_e2e.py       # 含 server 级 REWRITE 的 S16–S22
 
 # 稳定性压测：默认 20 分钟，混合反代/缓存/WASM/Lua/静态流量
 cargo build --release -p onrouter-server --bin onrouter
@@ -751,6 +814,25 @@ python tools/soak_test.py --minutes 20
 同配置的首次 21 分钟运行（保留为 `target/soak_report_run1.json`）同样 PASS：
 2,787,193 请求、0 失败、私有内存 17.89 → 20.08 MiB（+2.19 MiB，斜率 +0.163 MiB/min）。
 两次运行的涨幅都在噪声量级，且没有随请求量单调上涨，可以排除持续泄漏。
+
+1.0.1 加了响应缓存磁盘冷层，压测口径跟着改：`conf/soak.conf` 现在带一个
+`keys_zone=soakcold:1k disk=on`（8 条内存容量）配 256 个循环键的 `/cold` 路径——
+原来的 4m 区装得下 512 个键、根本不会淘汰，"压测通过"对新代码不构成证据。这一轮：
+
+| 指标 | 数值 |
+|---|---|
+| 结论 | **PASS**（`failures` 为空） |
+| 实际时长 / 平均吞吐 | 20.92 min / 1733.5 req/s |
+| 请求总数 / 失败 / 回源 | 2,175,742 / **0** / 1,656,093 |
+| 私有内存 | 17.98 MiB → 19.05 MiB（+1.07 MiB，峰值 20.69 MiB） |
+| 私有内存斜率 | +0.111 MiB/min（阈值 1.0） |
+| RSS | 27.60 MiB → 27.74 MiB |
+| 冷层账目（结束时） | 落盘 79,603 / 冷命中 78,873 / 提升 78,873 / 索引 256 条 1.06 MiB |
+| 冷层异常账目 | `spill_skipped` 0、`corrupt` 0、`cold_error` 0、`never_read` 0、`pending_jobs` 0 |
+
+冷层的落盘量与冷命中量近乎一比一、且 `never_read=0`，说明写下去的都是真被读回来的对象，
+不是"往磁盘倾倒垃圾"；`pending_jobs` 收尾归零说明异步写线程没被拖在后面。
+产物：`target/soak_report_v101_coldtier.json`、`target/soak_metrics_end_v101_coldtier.txt`。
 
 ### 13.2 上线前压测建议
 
