@@ -38,6 +38,7 @@ P12 = 18444        # 仅 TLS1.2
 P13 = 18445        # 仅 TLS1.3
 PPLAIN = 18446     # 明文
 PH2 = 18447        # TLS + ALPN h2
+PHMH = 18448       # TLS + ALPN h2 + 多域名（default_server 在最前）
 PORTS = [SNI_PORT, P12, P13, PPLAIN, PH2]
 
 results = []
@@ -580,6 +581,33 @@ def main():
                   and kv.get("PEER_SHA256") == fps["a"], f"probe={kv}")
         else:
             gap("Node h2 真实请求", "node 不在 PATH 上，跳过功能性 h2 请求")
+
+        # ========== 6b) 同一 TLS 端口 + ALPN h2 + 多域名 vhost ==========
+        # h2 没有 Host 头：站名只能从 :authority 取。这里三种情形都要对上：
+        # 具名站各归各、未知域名落到 default_server、SNI 与 authority 不一致时以
+        # authority 决定 vhost（内容）而证书由 SNI 决定 —— 两条都是 nginx 的行为。
+        if NODE:
+            for name, want_body, want_fp in (
+                ("a.local", "vhost-a", fps["a"]),
+                ("www.a.local", "vhost-a", fps["a"]),
+                ("b.local", "vhost-b", fps["b"]),
+                ("nobody.local", "vhost-default", fps["default"]),
+            ):
+                kv = node_h2(f"https://{HOST}:{PHMH}", name, name)
+                check(f"同端口 h2 + SNI/authority={name} → {want_body}",
+                      kv.get("STATUS") == "200" and kv.get("BODY", "").strip() == want_body
+                      and kv.get("ALPN") == "h2",
+                      f"probe={kv}")
+                check(f"同端口 h2 + authority={name} → 证书为 {want_body}",
+                      kv.get("PEER_SHA256") == want_fp,
+                      f"fp={str(kv.get('PEER_SHA256'))[:16]} want={want_fp[:16]}")
+            kv = node_h2(f"https://{HOST}:{PHMH}", "a.local", "b.local")
+            check("同端口 h2：SNI=a.local 但 :authority=b.local → 站按 authority 选、证书按 SNI 选",
+                  kv.get("STATUS") == "200" and kv.get("BODY", "").strip() == "vhost-b"
+                  and kv.get("PEER_SHA256") == fps["a"],
+                  f"probe={kv}")
+        else:
+            gap("同端口 h2 多域名", "node 不在 PATH 上，跳过 h2 vhost 断言")
 
         # ========== 7) 会话复用现状 ==========
         print("\n-- 7) 会话复用（TLS session resumption） --")
