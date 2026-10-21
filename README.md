@@ -1059,20 +1059,31 @@ them as standalone runnable assertion scripts.
   **2,591,305 requests, 0 failures, 2064.7 req/s**, private memory 20.11 → 21.97 MiB
   (+1.86 MiB, +0.067 MiB/min; a first run added +2.19 MiB over 2,787,193 requests).
   Full tables in OPERATIONS §13.1.
-- 1.0.1 adds the response-cache cold tier and is verified the same way: `cargo test --workspace` →
-  498/498 (485 `onrouter-server` + 13 `onrouter-config`) with no new clippy findings, and the cache
-  suites it must not regress all pass on real traffic — `proxy_disk_e2e` 39/39 (spill → cold hit with
+- 1.0.1 adds the response-cache cold tier, conditional revalidation and server-level REWRITE, and is
+  verified the same way: `cargo test --workspace` → **503/503** (490 `onrouter-server` + 13
+  `onrouter-config`) with no new clippy findings, and the cache suites it must not regress all pass on
+  real traffic — `proxy_disk_e2e` 39/39 (spill → cold hit with
   the backend counter unchanged → promote → restart `warm_recovered` → whole-directory corruption
-  counted and refetched, never served), `proxy_cache` 13/13, `cache_advanced` 32/32,
+  counted and refetched, never served), `proxy_cache` 21/21 (`proxy_cache_revalidate`'s R1–R8 run
+  against a backend that counts conditional answers separately from full sends, so "the origin was
+  asked" and "the origin resent the body" cannot be conflated, with a no-revalidate control showing
+  `EXPIRED` plus a second full copy), `set_if_e2e` 34/34 (server-level REWRITE: S16–S23, variable
+  visible in the location, `if` overriding `set`, a rewrite changing which location matches,
+  `if`-body `return` and bare `return` both terminating the phase, a redirect-only vhost answering
+  301 with `$host` expanded, and `-t` going quiet), `cache_advanced` 32/32,
   `cache_header_gap` 25/25, `disk_cache` 53/53, `learning_cache` 34/34, `still_online` 25/25,
   `governor` 32/32. The six feature suites now total 184 assertions (canary 22, wasm 23,
   resilience 17, affinity 7, proxy_split 76, proxy_disk 39) and `conf/tutorial_full.conf` verifies
   end to end at 38/38 including its new `/cold` endpoint. The 21-minute soak now *churns* the tier
   (an 8-entry `disk=on` zone against a repeating 256-key space — the old 4 MiB zone could never
-  evict, so a passing soak proved nothing about the new code): **2,175,742 requests, 0 failures**,
-  1733.5 req/s, private memory 17.98 → 19.05 MiB (+1.07 MiB, +0.111 MiB/min), and end-of-run tier
-  accounts of 79,603 spills / 78,873 cold hits / 78,873 promotions with `pending_jobs` 0,
-  `corrupt` 0 and `never_read` 0.
+  evict, so a passing soak proved nothing about the new code): **2,231,814 requests, 0 failures**,
+  20.92 min, 1778.1 req/s, private memory 18.58 → 19.29 MiB (+0.71 MiB, +0.021 MiB/min against a
+  1 MiB/min gate), peak 21.07 MiB, and end-of-run tier accounts of 81,723 spills / 80,986 cold hits /
+  80,986 promotions with `pending_jobs` 0, `corrupt` 0 and `never_read` 0. The whole roll runs on the
+  final binary: `python run_regression.py reg_101_roll.txt` → `TOTAL 86 scripts, nonzero=0` (the one
+  failure it first reported was `smoke_suite.py` asserting `add_header`'s value as the literal
+  `ONRouter/0.2` — a version pin passing itself off as a behaviour test, now an assertion on the
+  prefix).
 - The pre-1.0 roll (0.8.0, 460 unit tests + 81 Python E2E scripts: every `tools/*_e2e.py`
   (73) plus the 8 root scenario/compat/security/static/upstream suites) was re-run on that
   build: every E2E script passes with real traffic

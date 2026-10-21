@@ -781,7 +781,7 @@ python tools/affinity_e2e.py     # 7 项
 python tools/proxy_split_e2e.py  # 76 项
 python tools/proxy_disk_e2e.py   # 39 项（响应缓存磁盘冷层）
 python tools/proxy_cache_e2e.py  # 21 项（含 proxy_cache_revalidate 的 R1–R8）
-python tools/set_if_e2e.py       # 含 server 级 REWRITE 的 S16–S22
+python tools/set_if_e2e.py       # 34 项（含 server 级 REWRITE 的 S16–S23）
 
 # 稳定性压测：默认 20 分钟，混合反代/缓存/WASM/Lua/静态流量
 cargo build --release -p onrouter-server --bin onrouter
@@ -822,17 +822,20 @@ python tools/soak_test.py --minutes 20
 | 指标 | 数值 |
 |---|---|
 | 结论 | **PASS**（`failures` 为空） |
-| 实际时长 / 平均吞吐 | 20.92 min / 1733.5 req/s |
-| 请求总数 / 失败 / 回源 | 2,175,742 / **0** / 1,656,093 |
-| 私有内存 | 17.98 MiB → 19.05 MiB（+1.07 MiB，峰值 20.69 MiB） |
-| 私有内存斜率 | +0.111 MiB/min（阈值 1.0） |
-| RSS | 27.60 MiB → 27.74 MiB |
-| 冷层账目（结束时） | 落盘 79,603 / 冷命中 78,873 / 提升 78,873 / 索引 256 条 1.06 MiB |
+| 实际时长 / 平均吞吐 | 20.92 min / 1778.1 req/s |
+| 请求总数 / 失败 / 回源 | 2,231,814 / **0** / 1,696,741 |
+| 私有内存 | 18.58 MiB → 19.29 MiB（+0.71 MiB，峰值 21.07 MiB） |
+| 私有内存斜率 | +0.021 MiB/min（阈值 1.0，预热后 192 个样本） |
+| RSS | 26.08 MiB → 27.85 MiB |
+| 冷层账目（结束时） | 落盘 81,723 / 冷命中 80,986 / 提升 80,986 / 索引 256 条 |
 | 冷层异常账目 | `spill_skipped` 0、`corrupt` 0、`cold_error` 0、`never_read` 0、`pending_jobs` 0 |
 
 冷层的落盘量与冷命中量近乎一比一、且 `never_read=0`，说明写下去的都是真被读回来的对象，
 不是"往磁盘倾倒垃圾"；`pending_jobs` 收尾归零说明异步写线程没被拖在后面。
-产物：`target/soak_report_v101_coldtier.json`、`target/soak_metrics_end_v101_coldtier.txt`。
+这一轮跑的是 1.0.1 的全部改动（冷层 + `proxy_cache_revalidate` + server 级 REWRITE），产物：
+`target/soak_report_v101.json`、`target/soak_metrics_end_v101.txt`；冷层单独验证的那一轮（只有冷层）
+保留为 `target/soak_report_v101_coldtier.json`，两条曲线一致（+1.07 MiB 与 +0.71 MiB，都在噪声量级）。
+全量回归 `python run_regression.py reg_101_roll.txt` → `TOTAL 86 scripts, nonzero=0`。
 
 ### 13.2 上线前压测建议
 
