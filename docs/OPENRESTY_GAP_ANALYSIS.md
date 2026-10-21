@@ -1,6 +1,10 @@
 # ONRouter vs OpenResty — Gap Analysis
 
-Updated: 2026-10-21 (post-v0.7.0 main, Windows host). This revision also folds in the cache governor
+Updated: 2026-10-21 (post-v1.0.0 main, Windows host). This revision also folds in the 1.0
+release surface — configurable `worker_threads` with `worker_cpu_affinity`, lazy rejoin and
+`circuit_breaker` per upstream, the `canary` rule language (cookie/header/arg/UA/OS/percent,
+first match wins), and the WASM plugin host (`wasm_plugin`, access/header_filter/body_filter
+with fuel and memory bounds) — plus the cache governor
 (`cache_governor off|observe|auto` plus `low/high/hold/tier/learn/lead`: a trailing-8s traffic phase
 machine with hysteresis and a hold dwell, light vs deep sleep, force-spill demotion into each dict
 zone's `disk=` tier plus `proxy_cache` LRU eviction, boost pre-warming from a bounded demotion ring,
@@ -322,7 +326,7 @@ The remaining gaps are concentrated in four areas:
   + 1 `router` unit tests. Vendor knowledge stays data, not code: `grep -a -i -o` over the 0.6.0 release binary
   finds 0 occurrences of `Cloudflare`/`Fastly`/`CloudFront`/`Akamai` and 0 of their header names (`CF-Ray`,
   `True-Client-IP`, `CloudFront-Viewer-Address`, …), while the control words `front_proxy`/`auto_trust`
-  occur 49/10 times (re-measured against the 0.7.0 package by `tools/release_verify.py`) — the only
+  occur 49/10 times (re-measured against the 1.0.0 package by `tools/release_verify.py`) — the only
   baked-in header names are nginx's own (`x-real-ip` as the `real_ip_header`
   default, `x-forwarded-for` in the header interning table and in `$proxy_add_x_forwarded_for`).
   `conf/front_proxy_examples.conf` ships the copy-paste profiles for Cloudflare, CloudFront and a plain-XFF

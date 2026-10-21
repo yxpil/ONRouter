@@ -89,25 +89,49 @@ build_target() {
 create_archive() {
     local target=$1
     local output_dir="$BUILD_DIR/$target"
+    local stage_dir="$BUILD_DIR/stage-$target"
     local archive_name="onrouter-${VERSION}-${target}"
     
     log_info "Creating archive for $target..."
     
-    mkdir -p "$BUILD_DIR/archives"
+    mkdir -p "$BUILD_DIR/archives" "$stage_dir/conf" "$stage_dir/docs"
+    rm -rf "$stage_dir"
+    mkdir -p "$stage_dir/conf" "$stage_dir/docs"
+    
+    # Binaries + runnable examples + docs. Runtime state (logs/, cache/, .tmp_*)
+    # is not packaged: a download should not carry someone else's pids or logs.
+    cp "$output_dir"/*.exe "$stage_dir/" 2>/dev/null || cp "$output_dir"/* "$stage_dir/" 2>/dev/null || true
+    cp conf/*.conf "$stage_dir/conf/" 2>/dev/null || true
+    for d in wasm wasm_static soak_static auth_demo include_demo; do
+        [ -d "conf/$d" ] && cp -r "conf/$d" "$stage_dir/conf/"
+    done
+    [ -d lua ] && cp -r lua "$stage_dir/"
+    [ -d public ] && cp -r public "$stage_dir/"
+    for doc in docs/OPERATIONS.md docs/TUTORIAL.md; do
+        [ -f "$doc" ] && cp "$doc" "$stage_dir/docs/"
+    done
+    [ -f README.md ] && cp README.md "$stage_dir/"
+    
+    # conf/onrouter.conf ships a TLS listener; generate a throwaway pair at
+    # package time so a fresh extract passes -t. No private key lives in git.
+    mkdir -p "$stage_dir/certs"
+    if "$stage_dir/orr-gencert" "$stage_dir/certs/cert.pem" "$stage_dir/certs/key.pem" localhost >/dev/null 2>&1 \
+        || cargo run --quiet --release --bin orr-gencert -- "$stage_dir/certs/cert.pem" "$stage_dir/certs/key.pem" localhost >/dev/null 2>&1; then
+        :
+    else
+        log_warn "cert generation failed; packaged conf/onrouter.conf will need certs/ before -t"
+    fi
     
     if [[ "$target" == *"-windows-"* ]]; then
         # Windows: ZIP format
         if command -v zip &> /dev/null; then
-            cd "$output_dir"
-            zip "../../archives/${archive_name}.zip" onrouter.exe orr-gencert.exe 2>/dev/null || \
-            zip "../../archives/${archive_name}.zip" *.exe
-            cd - > /dev/null
+            (cd "$stage_dir" && zip -r "../../archives/${archive_name}.zip" .)
         else
             log_warn "zip not available, skipping Windows archive"
         fi
     else
         # Unix: tar.gz format
-        tar czf "$BUILD_DIR/archives/${archive_name}.tar.gz" -C "$output_dir" .
+        tar czf "$BUILD_DIR/archives/${archive_name}.tar.gz" -C "$stage_dir" .
     fi
     
     log_success "Archive created: $BUILD_DIR/archives/${archive_name}.*"

@@ -77,15 +77,43 @@ function Create-Archive {
     param([string]$Target)
     
     $OutputDir = "$BUILD_DIR\$Target"
+    $StageDir = "$BUILD_DIR\stage-$Target"
     $ArchiveName = "onrouter-$VERSION-$Target"
     
     Write-Info "Creating archive for $Target..."
     
     New-Item -ItemType Directory -Force -Path "$BUILD_DIR\archives" | Out-Null
+    if (Test-Path $StageDir) { Remove-Item -Recurse -Force $StageDir }
+    New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+    New-Item -ItemType Directory -Force -Path "$StageDir\conf" | Out-Null
+    New-Item -ItemType Directory -Force -Path "$StageDir\docs" | Out-Null
     
-    # Create ZIP archive
-    $Files = Get-ChildItem "$OutputDir\*.exe" | Select-Object -ExpandProperty FullName
-    Compress-Archive -Path $Files -DestinationPath "$BUILD_DIR\archives\$ArchiveName.zip" -Force
+    # Binaries
+    Copy-Item "$OutputDir\*.exe" "$StageDir\" -ErrorAction SilentlyContinue
+    
+    # Examples and docs ship with the binary: a download should be runnable, not
+    # just an executable with no config. Runtime state (logs/, cache/, .tmp_*) is
+    # deliberately not packaged.
+    Copy-Item "conf\*.conf" "$StageDir\conf\" -ErrorAction SilentlyContinue
+    foreach ($d in @("wasm", "wasm_static", "soak_static", "auth_demo", "include_demo")) {
+        if (Test-Path "conf\$d") { Copy-Item -Recurse "conf\$d" "$StageDir\conf\" }
+    }
+    if (Test-Path "lua") { Copy-Item -Recurse "lua" "$StageDir\" }
+    if (Test-Path "public") { Copy-Item -Recurse "public" "$StageDir\" }
+    foreach ($doc in @("docs\OPERATIONS.md", "docs\TUTORIAL.md")) {
+        if (Test-Path $doc) { Copy-Item $doc "$StageDir\docs\" }
+    }
+    if (Test-Path "README.md") { Copy-Item "README.md" "$StageDir\" }
+
+    # conf/onrouter.conf ships a TLS listener; generate a throwaway pair at
+    # package time so a fresh extract passes -t. No private key lives in git.
+    New-Item -ItemType Directory -Force -Path "$StageDir\certs" | Out-Null
+    & "$StageDir\orr-gencert.exe" "$StageDir\certs\cert.pem" "$StageDir\certs\key.pem" localhost | Out-Null
+    if (-not (Test-Path "$StageDir\certs\cert.pem")) {
+        Write-Warn "cert generation failed; packaged conf/onrouter.conf will need certs/ before -t"
+    }
+    
+    Compress-Archive -Path "$StageDir\*" -DestinationPath "$BUILD_DIR\archives\$ArchiveName.zip" -Force
     
     Write-Success "Archive created: $BUILD_DIR\archives\$ArchiveName.zip"
 }

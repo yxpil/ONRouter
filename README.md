@@ -11,6 +11,29 @@ balancing (with passive health checks), rewrite, virtual hosts, an embedded Lua 
 (the `ngx.*` API), plus native Rust modules. Apart from foundational libraries such as tokio/hyper,
 all gateway logic is hand-written.
 
+## What's new in 1.0
+
+- **CPU affinity**: `worker_threads N;` plus `worker_cpu_affinity auto|off|<hex masks>;`. Each tokio
+  worker can be pinned to a core (or a set of cores); masks rotate across threads, and `-t` prints
+  the per-thread plan before the process starts. Linux `sched_setaffinity`, Windows
+  `SetThreadAffinityMask`; macOS has no hard thread affinity and says so. See
+  [OPERATIONS.md §6](docs/OPERATIONS.md#6-cpu-亲和性).
+- **Resilience**: passive removal (`max_fails`/`fail_timeout`), `lazy_rejoin <interval>;` (a real
+  user request doubles as the recovery probe, so no separate health-check traffic), and
+  `circuit_breaker errors=… window=… open=…;` (closed → open → a single half-open probe), with
+  `onrouter_upstream_{server_available,server_healthy,lazy_probes_total,circuit_state,circuit_trips_total}`.
+- **Canary / grey release**: top-level `canary $var "<sticky key>" { cookie …; header …; arg …;
+  ua ~* …; os …; percent …; default …; }` selects a whole declared upstream per request, first
+  match wins. `$proxy_split` / `$proxy_split_served` and the per-branch ledger make a cross-version
+  failover (`proxy_split_failover on|off|http://target`) visible instead of silent.
+- **WASM gateway plugins**: `wasm_plugin <name> <file.wat|file.wasm> [fuel=…] [memory=…];` plugged
+  into `access_by_wasm`, `header_filter_by_wasm` and `body_filter_by_wasm`. A small stable host ABI
+  exposes request/response headers, status and body; traps and fuel exhaustion fail closed.
+- **Release engineering**: CI runs unit tests + clippy + five real-traffic E2E suites, with an
+  optional `workflow_dispatch` 21-minute soak that checks private-memory growth. The 1.0 docs are
+  [OPERATIONS.md](docs/OPERATIONS.md) (run it in production) and
+  [TUTORIAL.md](docs/TUTORIAL.md) (build it feature by feature).
+
 ## Blocking analysis & static-path optimization (spawn_blocking + file cache)
 
 - **Lua script file cache**: `LuaSource::File` used to read from disk synchronously on every request
@@ -86,7 +109,10 @@ all gateway logic is hand-written.
 
 ## Multi-core architecture
 
-- **tokio multi-threaded runtime**: worker thread count = number of logical CPU cores.
+- **tokio multi-threaded runtime**: `worker_threads N;` (default = number of logical CPU cores).
+  With `worker_cpu_affinity auto;` or explicit masks, each worker is pinned to its core; the
+  default is `off`, so existing deployments keep the OS scheduler's placement. `-t` reports the
+  per-thread plan and the startup log records each successful binding.
 - **Lua VM pool**: one independent Lua VM per CPU core (mirroring OpenResty's one VM per worker).
   Multiple requests execute scripts fully in parallel with no global single-point lock;
   `init_by_lua` runs once per VM (matching nginx's once-per-worker initialization semantics).
@@ -183,6 +209,10 @@ all gateway logic is hand-written.
 ```
 rust/
 ├── conf/onrouter.conf        # example gateway config (full-feature demo)
+├── conf/tutorial_hello.conf  # 1.0 tutorial: minimal static/return config
+├── conf/tutorial_full.conf   # 1.0 tutorial: proxy + resilience + cache + canary + WASM + Lua
+├── docs/OPERATIONS.md        # operations manual (process, capacity, release, rollback)
+├── docs/TUTORIAL.md          # step-by-step tutorial
 ├── lua/                     # Lua business scripts (auth.lua / time.lua / rewrite_mark.lua)
 ├── public/                  # static file root (includes logo.png)
 └── crates/
@@ -202,6 +232,8 @@ rust/
             ├── vip.rs       # client reputation table (limit verdicts in, queue ceiling + cache retention out)
             ├── front_proxy.rs # vendor-free CDN/LB profiles: probes, header dialects, trust gate, Cache-Status
             ├── lua_engine.rs# Lua VM + ngx.* API
+            ├── wasm.rs      # WASM plugin host: ABI, fuel/memory bounds, 3 phases
+            ├── affinity.rs  # worker_cpu_affinity plan + per-thread pinning
             ├── access_log.rs# combined access log
             ├── stream.rs    # L4 stream{} proxy + ssl_preread SNI routing (byte-transparent TCP)
             └── server.rs    # HTTP pipeline: rewrite -> access -> content -> log
@@ -222,7 +254,16 @@ python -m http.server 9002 --bind 127.0.0.1
 
 # config test (also the place to see which directives were accepted and which were ignored)
 target\release\onrouter.exe -t conf\onrouter.conf
+
+# 1.0 tutorial: two tiny backends + the complete example (gateway on 127.0.0.1:18600)
+python tools/tutorial_backend.py a 18601
+python tools/tutorial_backend.py b 18602
+target\release\onrouter.exe -t conf\tutorial_full.conf
+target\release\onrouter.exe -c conf\tutorial_full.conf
 ```
+
+See [docs/TUTORIAL.md](docs/TUTORIAL.md) for the walkthrough and
+[docs/OPERATIONS.md](docs/OPERATIONS.md) for production operation.
 
 `-t` validates listeners, certificates and limit references, then prints `配置测试通过。` **and every
 startup warning line** (`告警 N 条：` followed by one bullet each — e.g. an unknown directive that was
@@ -645,7 +686,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   is booted, not eyeballed: `tools/front_proxy_examples_e2e.py` (24 checks) runs the gateway on it and proves
   both halves — `-t` echoes all three profiles with their chains and 22/0/3 range counts, and at runtime a
   full Cloudflare-shaped header set is *labelled* but never *applied* from a loopback peer, the probe is
-  AND-ed, and per-profile counters stay in their own accounts. `grep -a -i -o` over the 0.7.0 release binary
+  AND-ed, and per-profile counters stay in their own accounts. `grep -a -i -o` over the 1.0.0 release binary
   finds 0 hits for any provider name or its headers, while the controls `front_proxy`/`auto_trust` hit 49/10
   times (re-measured against the packaged zip by `tools/release_verify.py`).
 - Proxy response-header rewrite — the nginx `proxy_redirect` + `proxy_cookie_domain`/`proxy_cookie_path`
@@ -978,9 +1019,23 @@ them as standalone runnable assertion scripts.
   Boundary, asserted by construction rather than by omission: WebSocket upgrades stay HTTP/1.1
   (RFC 8441/9220 over h2/h3 are not implemented, matching nginx), and h2/h3 to upstreams remain
   open as noted below.
-- The whole suite (460 unit tests + 81 Python E2E scripts: every `tools/*_e2e.py`
-  (73) plus the 8 root scenario/compat/security/static/upstream suites) is re-run after
-  these changes: every E2E script passes with real traffic
+- The 1.0 batch is verified on its own release build: `cargo test --workspace` → 482/482
+  (469 in `onrouter-server` + 13 in `onrouter-config`), clippy clean, and five real-traffic
+  suites pass 145/145 — `canary_e2e` 22/22 (cookie/header/arg/UA/OS/percent rules,
+  first-match-wins, stickiness across a cache purge), `wasm_e2e` 23/23
+  (access/header_filter/body_filter, host ABI, fail-closed), `resilience_e2e` 17/17
+  (passive removal, lazy rejoin driven by a real request, circuit open/half-open, and the
+  `server_available` gauge), `affinity_e2e` 7/7 (mask parsing, rotation, topology and `-t`),
+  plus the existing `proxy_split` 76/76. The tutorial walkthrough itself is exercised end to
+  end — `conf/tutorial_full.conf` with 33 assertions across static, canary, rewrite, cache,
+  WASM, shared dict, circuit and lazy rejoin — and passes 33/33. A 21-minute soak on the
+  release build (24 short + 4 keep-alive workers, 5-minute warmup) reports PASS:
+  **2,591,305 requests, 0 failures, 2064.7 req/s**, private memory 20.11 → 21.97 MiB
+  (+1.86 MiB, +0.067 MiB/min; a first run added +2.19 MiB over 2,787,193 requests).
+  Full tables in OPERATIONS §13.1.
+- The pre-1.0 roll (0.8.0, 460 unit tests + 81 Python E2E scripts: every `tools/*_e2e.py`
+  (73) plus the 8 root scenario/compat/security/static/upstream suites) was re-run on that
+  build: every E2E script passes with real traffic
   (`python run_regression.py reg_proto_20261021.txt` → `TOTAL 81 scripts, nonzero=0`,
   2026-10-21 — the run over the protocol-matrix build, adding `protocol_matrix_e2e` 37/37
   (HTTP/1.0, HTTP/1.1, h2c/TLS h2, HTTP/3 and ws/wss on one process) to `governor_e2e`
@@ -994,8 +1049,10 @@ them as standalone runnable assertion scripts.
   (447 in `onrouter-server` + 13 in `onrouter-config`; the previous 0.7.0 roll is
   `reg_070_20261020.txt` → `TOTAL 79 scripts, nonzero=0`, and `reg_fpopt_20261020.txt`
   re-ran the same 79 over the post-de-allocation build).
-  The packaged artefact is checked separately by `tools/release_verify.py` (26/26 for 0.7.0 —
-  24 prior checks plus two new ones: the extracted binary must `-t` the shipped
+  The packaged artefact is checked separately by `tools/release_verify.py` (26/26 for 1.0.0 —
+  the fresh extract `-t`s the shipped `conf/onrouter.conf` including its 8443 TLS listener,
+  using the self-signed pair generated at packaging time —
+  including the 0.7.0 schedule checks: the extracted binary must `-t` the shipped
   `conf/schedule.conf` to exit 0 *and* print the per-window `describe` lines, proving the
   gate feature is compiled into what users download):
   it extracts the shipped zip — not the build tree, which another suite may have swapped the
@@ -1273,7 +1330,9 @@ Already done (previously listed as gaps, now implemented):
   `onrouter_access_log_dropped_total` instead of blocking the request task. The upstream pool is
   registered once at startup (`register_upstreams` keeps the live `Arc`s, so reloads stay current)
   and renders per-node `onrouter_upstream_server_connections{upstream,server}`,
-  `onrouter_upstream_server_healthy` and
+  `onrouter_upstream_server_healthy` (active-check verdict),
+  `onrouter_upstream_server_available` (schedulable now: not `down`, not passively removed,
+  circuit not open) and
   `onrouter_upstream_requests_total{upstream,server,result="success|failure"}`; the success/failure
   counters live on the nodes themselves, not under the SWRR scheduling lock. Adaptive selection adds
   `onrouter_upstream_least_time_mode{upstream}` (0/1/2 = off/observe/on), the per-node
