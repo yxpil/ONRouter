@@ -1126,8 +1126,8 @@ python tools/soak_test.py --minutes 21
 |---|---|---|
 | 配置通过但行为没变 | `-t` 的“告警 N 条” | 指令可能拼错或被忽略；按告警逐条修 |
 | 启动即退出 | `-t` 退出码、`error_log` | 监听端口占用、证书不可读、引用不存在 |
-| 502 | `onrouter_upstream_requests_total{result="failure"}` | 后端不可达/超时；看 `healthy` 与熔断状态 |
-| 504 | `proxy_read_timeout`/后端日志 | 后端慢；不要用增大超时掩盖容量问题 |
+| 502 | `onrouter_upstream_requests_total{result="failure"}` | 后端连不上、响应非法、或所有节点都在摘除期；看 `healthy` 与熔断状态 |
+| 504 | `proxy_read_timeout`/后端日志 | 后端慢；不要用增大超时掩盖容量问题。口径见 7.1：**等满超时才是 504**，同一现象返回 502 说明卡在连接层而不是慢 |
 | 灰度不生效 | `proxy_split_targets_total`、`$proxy_split` 头 | 条件顺序、cookie 名、percent、default |
 | 灰度整池挂掉仍 502 | `proxy_split_failover` | 默认 on 会改投；写 off 的实验本来就不串台 |
 | 缓存一直 MISS | 上游 `Cache-Control`/`Set-Cookie`、方法、key | 见第 9.1 节排查顺序 |
