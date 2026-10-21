@@ -428,6 +428,32 @@ server {
 - 已知边界：网关到后端只说 HTTP/1.1（ALPN 固定 `http/1.1`，没有 h2/h3 upstream）；
   WebSocket over h2/h3（RFC 8441 / 9220）未实现——要 WS 就走 h1.1 的 Upgrade 那条路。
 
+### 5.5 同一端口多个站点：证书按 SNI，站点按 Host
+
+一个 TLS 端口上挂多个 `server` 块（多域名单端口，`yxpil.com` 这类部署的常态）时，**有两本独立
+的账**，它们各自的取法不一样：
+
+| 决定什么 | 依据 | 取法 |
+|---|---|---|
+| 出示哪张证书 | ClientHello 的 **SNI** | 精确名 > `*.通配` > 该地址的**默认 server** |
+| 请求由哪个站点应答 | HTTP 的 `Host`（h1）或 `:authority`（h2/h3） | 同样是 精确 > 通配 > 默认 server |
+
+- 默认 server = 写了 `listen … default_server` 的那个块；**没写**才是配置顺序里的第一个块。
+  这一条是 v1.0.2 **之后**发现的静默不一致（当前已发布的那批二进制还没有它）：兜底证书原先跟着
+  "配置顺序第一个"走，于是 SNI 匹配不上时出示的是"恰好第一个写的 vhost"的证书，而不是
+  `default_server` 的证书——两个后果都不体面：带错域名的客户端看到一个与请求域名无关的证书
+  （浏览器报名称不匹配），而换一行配置顺序就会换一张证书。站点选择那半边一直是对的，
+  所以从 HTTP 侧完全看不出异常。
+- 两本账**可以分开**：`SNI=a.com` 而 `Host=b.com` 时，出示 a 的证书、由 b 站应答（nginx 同）。
+  这也是 `https_matrix` 里那条专门断言。
+- 因此证书与站点的对应关系要按"这个站点配了哪张证书"来检查，而不是按配置顺序想当然。
+  `-t` 打印的 `监听 … TLS -> [default.local(default), a.local]` 里括号标的就是默认 server，
+  它对证书和站点同时生效。
+- 验证：`tools/https_matrix_e2e.py` 76/76。其中 18443 那组把 `default_server` 写在**第一个**块，
+  两种实现看不出差别；18449 那组把它写在**最后一个**块——只有这一组能分辨"跟配置顺序"和
+  "跟默认 server"，兜底证书那条红就是靠它复现的。`tools/random_scenarios_e2e.py` 每轮随机
+  把兜底块放在最前或最后，并让 SNI 与 authority 各取来源，证书指纹逐探针比对。
+
 ---
 
 ## 6. CPU 亲和性
@@ -1011,6 +1037,8 @@ python tools/flash_sale_e2e.py                                   # 大促/闪购
 python tools/game_udp_e2e.py                                     # 游戏服务器 UDP（31 项）
 python tools/quic_business_e2e.py                                # 同一站点 over h1/h2/h3 的跨传输一致性（41 项）
 python tools/production_shape_e2e.py                               # 800 文件静态站 + WASM + Lua 同进程（529 项）
+python tools/https_matrix_e2e.py                                # 多域名单端口 TLS：证书按 SNI、站点按 Host（76 项，含 default_server 写在最后的 18449 组）
+python tools/random_scenarios_e2e.py --iters 20                 # 随机拓扑对撞（每轮换一份配置：端口聚合/别名/正则/rewrite/L4 SNI），20 轮 4122 项
 
 # 教程示例本身的核对（文档里那几行配置照抄能不能得到同样结果）
 python tools/tutorial_limit_check.py                             # §12 的 17 项（含 rate/burst/队列实测值）
@@ -1019,6 +1047,14 @@ python tools/tutorial_limit_check.py                             # §12 的 17 �
 cargo build --release -p onrouter-server --bin onrouter
 python tools/soak_test.py --minutes 21
 ```
+
+TLS 套件的证书夹具由 `tools/selfsigned.py` 现造（每套件一个目录，入口先 `ensure()`）。
+约定来自一次只在 CI 复现的红：`production_shape` 的配置读的是别套件的 `certs_random/`，
+那个目录在 `.gitignore` 里，干净检出根本不存在，本机却因为跑过 `random_scenarios` 而一直藏着
+一份。两条约束写在 `selfsigned.py` 里：`openssl req -x509` 默认给自签证书打 `CA:TRUE`，
+rustls 会拒绝把它当末端证书（`CaUsedAsEndEntity`），而 h3 客户端正是拿这张证书当自己的受信根；
+SAN 必须包含连接用的名字，QUIC 强制校验。
+
 
 `soak_test.py` 的结论口径：
 
@@ -1092,7 +1128,15 @@ python tools/soak_test.py --minutes 21
 1.0.2 的发布闸门跑在最终二进制上：`python run_regression.py reg_102_ship.txt` →
 `TOTAL 94 scripts, nonzero=0`（比 1.0.1 多出 `expires`、`limit_key`、`herd`、`game_udp`、
 `course_selection`、`flash_sale`、`production_shape`、`quic_business` 这八条业务形状套件；
-`random_scenarios_e2e` 仍然按 §13.1 记在 `run_regression.py` 的 `SKIP` 里，不是"忘了它"）。
+那时 `random_scenarios_e2e` 还按旧 §13.1 的理由记在 `SKIP` 里）。
+
+**v1.0.2 之后的一批**（兜底证书跟 `default_server`、TLS 夹具自给）把回归重新数过：
+`random_scenarios_e2e` 回到 roll 里，套件数 **95**。它的 TLS 预言机原先把"证书按 SNI"与
+"站点按 Host/:authority"记成同一件事，而且探针根本没把 SNI 发出去（`HTTPSConnection("127.0.0.1")`
+把 IP 当了 SNI），于是证书指纹成片红——红的是夹具，报出来的却是"网关选错站/发错证书"。
+三条一起修（预言机按 SNI 单算、探针显式发 SNI、网关兜底证书跟默认 server），
+20 轮随机拓扑 4122/4122。`https_matrix` 由 71 条涨到 76 条，多出来的正是"`default_server`
+写在最后一个块"那组——只有它能把两种实现分开。
 
 ### 13.2 上线前压测建议
 
@@ -1128,6 +1172,7 @@ python tools/soak_test.py --minutes 21
 | 启动即退出 | `-t` 退出码、`error_log` | 监听端口占用、证书不可读、引用不存在 |
 | 502 | `onrouter_upstream_requests_total{result="failure"}` | 后端连不上、响应非法、或所有节点都在摘除期；看 `healthy` 与熔断状态 |
 | 504 | `proxy_read_timeout`/后端日志 | 后端慢；不要用增大超时掩盖容量问题。口径见 7.1：**等满超时才是 504**，同一现象返回 502 说明卡在连接层而不是慢 |
+| 浏览器报"证书与域名不符" | `-t` 输出的 `TLS -> […(default)]`、各块的 `ssl_certificate` | 见 5.5：SNI 匹配不上时出示的是该地址**默认 server** 的证书。要么给这个域名补一个带自己证书的站点，要么让 `default_server` 那个块配上通配/兜底证书 |
 | 灰度不生效 | `proxy_split_targets_total`、`$proxy_split` 头 | 条件顺序、cookie 名、percent、default |
 | 灰度整池挂掉仍 502 | `proxy_split_failover` | 默认 on 会改投；写 off 的实验本来就不串台 |
 | 缓存一直 MISS | 上游 `Cache-Control`/`Set-Cookie`、方法、key | 见第 9.1 节排查顺序 |
@@ -1171,9 +1216,11 @@ tail -n 200 conf/logs/error.log
 
 - [ ] `cargo test --workspace` 全绿；
 - [ ] `cargo clippy --workspace --all-targets` 无 error；
-- [ ] 全量回归 `python run_regression.py <本次发布名>.txt` 记录零非零退出（`random_scenarios_e2e`
-      除外，原因写在脚本顶部的 `SKIP` 里，不是"忘了"）；
-- [ ] CI 的两个 E2E 步骤（功能契约 + 业务形状）在 Linux 上全绿；
+- [ ] 全量回归 `python run_regression.py <本次发布名>.txt` 记录零非零退出（`run_regression.py`
+      顶部的 `SKIP` 集是**唯一**允许"不参与"的地方，往里加一条必须同时写清为什么它的红绿
+      不构成证据；当前 `SKIP` 为空）；
+- [ ] CI 的三个 E2E 步骤在 Linux 上全绿：功能契约（10 条）、业务形状（选课/静态站+WASM+Lua/游戏
+      UDP 共 3 条）、跨传输一致性（`orr-h3check` 探针 + `quic_business` 1 条）；
 - [ ] 21 分钟 soak 通过，私有内存预热后走平；
 - [ ] 发布包内二进制的 `-V` 与 `Cargo.toml` 版本一致；
 - [ ] 用发布包里的二进制跑 `-t` 与一次真实请求；

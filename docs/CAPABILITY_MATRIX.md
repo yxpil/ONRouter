@@ -154,8 +154,17 @@ The remaining gaps are concentrated in four areas:
   HTTP/2 (RFC 8441) / HTTP/3 (RFC 9220) and h2/h3 *upstreams* are not implemented
   (nginx does not implement them either); ws/wss as HTTP/1.1 upgrades are covered
   end-to-end by `tools/protocol_matrix_e2e.py` 37/37.
-- Multi-certificate SNI vhosts on shared listen ports; exact > wildcard > default;
-  Host routing independent of SNI.
+- Multi-certificate SNI vhosts on shared listen ports; the certificate is chosen by
+  **SNI** (exact > wildcard > that address's *default server*), independently of which
+  vhost serves the request (chosen by `Host` / `:authority`). The fallback certificate
+  follows `default_server`, not config order — matching nginx; before this fix an
+  unmatched/absent SNI got whichever block happened to be written first, which is
+  invisible from the HTTP side (routing was always right) and only shows up as a
+  wrong-name certificate at the handshake. `router::tests::fallback_cert_follows_default_server_not_config_order`,
+  `tools/https_matrix_e2e.py` 76/76 (port 18443 writes `default_server` first — the two
+  implementations are indistinguishable there; port **18449** writes it *last*, which is
+  the only shape that discriminates) and `tools/random_scenarios_e2e.py` (each round puts
+  the catch-all block at a random position; 20 rounds 4122/4122).
 - TLS 1.2/1.3 via rustls; legacy TLS 1.0/1.1 via the optional `native-tls`
   platform backend.
 - **TLS sessions**: process-wide `ssl_session_cache` (`off` / `builtin[:n]` /
@@ -711,6 +720,22 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
     SSE delivery, 50 multiplexed streams on one h3 connection, 20 abandoned h3 streams leaving the
     connection usable, 504 for an upstream timeout on both transports, identical code for a dead
     upstream, and `Alt-Svc` advertised from the TCP side)
+  - `https_matrix` 76/76 (multi-domain TLS on one port, with the **two accounts kept separate**: the
+    certificate is chosen by SNI (exact > `*.wild` > that address's `default_server`) and the vhost by
+    `Host`/`:authority`, and a probe that mixes them (SNI=a, authority=b) must get a's cert from b's
+    vhost. Port 18443 writes `default_server` first — where "follow config order" and "follow the
+    default server" are the same thing, which is why the fallback-cert bug survived every earlier
+    suite — so port **18449** writes it *last*; that group is the control that makes the assertion
+    able to fail. Also covers cert-chain/SAN hostname verification, TLS1.2 vs 1.3 suites, ALPN
+    negotiation and no-overlap fallback, session resumption across ports, and h2 on a shared port)
+  - `random_scenarios` 4122/4122 over 20 rounds (a *different generated topology* each round: port
+    aggregation, alias/wildcard vhosts, `=`/prefix/`^~`/regex location precedence, server-level
+    rewrite, L4 `sni_match` ordering, plus random SNI/authority pairs). Its value is exactly that it
+    hits shapes nobody would write by hand — it is the suite that surfaced the duplicated-`Host:`
+    bug. It was held out of the roll while its TLS oracle conflated cert-by-SNI with vhost-by-Host
+    (and while its probe sent `127.0.0.1` as the SNI instead of the name it claimed); both are fixed,
+    the oracle now models cert lookup independently and the L4 expectations follow
+    first-match-in-order, and `run_regression.py`'s `SKIP` set is empty again)
   - `front_proxy` 54/54 (the CDN-awareness round over six ports: egress rewriting `$remote_addr` proven
     through the access log's first column and a `geo` variable rather than through a header echo, forged
     vendor headers from an out-of-range peer proven to change nothing while still being *labelled*,
@@ -742,11 +767,13 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
     *variable* sits in the host position, so a header- or query-supplied value must still resolve to a target the
     config wrote down,
     encoded-CRLF splitting), `static_stream` 19/19, `streaming_body` 7/7
-  - Full regression: 94 scripts (8 root scenario/compat/security/static/upstream
-    suites + all but one of the 86 `tools/*_e2e.py` — `random_scenarios_e2e.py` is held
-    out of the roll, and `run_regression.py` carries the written reason in its `SKIP` set
-    rather than leaving a permanently-red suite in the bubble; it can still be run by hand
-    and it is what surfaced the duplicated-`Host:` bug) incl. TLS matrix, HTTP/2, HTTP/3, hot reload,
+  - Full regression: 95 scripts (8 root scenario/compat/security/static/upstream
+    suites + **all** of the 87 `tools/*_e2e.py`; `run_regression.py`'s `SKIP` set is now empty —
+    `random_scenarios_e2e.py` was the last holdout, and it came back once its TLS oracle was
+    corrected to derive certificates from SNI rather than from the vhost the Host selected, and
+    its probe actually sent the SNI it claimed. It had been the suite that surfaced the
+    duplicated-`Host:` bug, so keeping it out of the roll was costing real coverage)
+    incl. TLS matrix, HTTP/2, HTTP/3, hot reload,
     the cache/header-semantics gap suite, the `set`/`if` suite, cache, the DICT disk
     cold tier, Still ONLine, the three learning suites, CDN/front-proxy awareness and its
     vendor-example companion, adaptive upstream selection,

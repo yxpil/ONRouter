@@ -281,6 +281,43 @@ vhost 根本无法工作），而 **location 级 `return` 在 ONRouter 里仍排
 `return` 都生效、纯跳转 vhost 回 301，以及 `-t` 不再对这些指令报警。规则细节见
 [OPERATIONS.md](OPERATIONS.md) 第 5.1 节。
 
+### 3.4 一个 TLS 端口放多个域名
+
+一个 `listen 443 ssl` 上写多个 `server` 块是最常见的省端口做法，这里有两本独立的账：
+**证书在握手期按 SNI 选，站点在收到请求后按 `Host`（h2/h3 是 `:authority`）选**。
+两本的取法一样（精确名 > `*.通配` > 该端口的默认 server），但依据不同，可以给出不同答案：
+SNI 写 `a.example.com`、Host 写 `b.example.com` 时，出示 a 的证书、由 b 站应答。
+
+```nginx
+server {
+    listen 127.0.0.1:18443 ssl default_server;   # 该端口的默认 server
+    server_name catchall.example.com;
+    ssl_certificate ../certs/catchall.pem;       # SNI 匹配不上时出示的就是它
+    ...
+}
+
+server {
+    listen 127.0.0.1:18443 ssl;
+    server_name shop.example.com www.shop.example.com;
+    ssl_certificate ../certs/shop.pem;
+    ...
+}
+```
+
+- 默认 server 是写了 `default_server` 的那个块；没写则是配置顺序里的第一个块。
+  `-t` 的输出把这件事直接说出来：`监听 … TLS -> [catchall.example.com(default), shop.example.com]`。
+- 每个 `ssl` 站点都必须自己写 `ssl_certificate`/`_key`，缺一个 `-t` 就失败（不会静默共用别人的证书）。
+- 通配证书按 `*.example.com` 这类 `server_name` 声明；它只吃恰好一级子域，`example.com` 本身
+  要另写一个名字。
+- 已知并修掉的一处（**v1.0.2 之后**，当前已发布的那批二进制还没有它）：SNI 匹配不上时，
+  兜底证书跟的是"配置顺序第一个块"而不是"默认 server"，于是换一行配置顺序就会换一张证书，
+  带错域名的客户端会看到一个跟它请求的域名无关的证书。站点选择那半边一直是对的，
+  所以从 HTTP 侧看不出任何异常——只能从握手侧发现。现在两边都跟 `default_server`。
+
+可运行的证据是 `tools/https_matrix_e2e.py` 的 18449 那一组（把 `default_server` 故意写在最后）
+和 `tools/random_scenarios_e2e.py`（每轮随机决定兜底块的位置）。更多运维口径见
+[OPERATIONS.md](OPERATIONS.md) 第 5.5 节。
+
 ---
 
 ## 4. 后端挂了怎么办：摘除、懒重连、熔断
@@ -899,6 +936,19 @@ python tools/flash_sale_e2e.py         # 秒杀：瞬时并发 + 排队 + 库存
 python tools/security_matrix_e2e.py    # 攻击面矩阵：49 项，含 -t 应当否决的写法
 ```
 
+**部署形状**——多站点、多传输凑在一个端口上时，各本账不能互相污染：
+
+```bash
+python tools/https_matrix_e2e.py         # 76 项：一个 TLS 端口多个域名。证书按 SNI、站点按 Host，
+                                         # 两本账分别验；18449 那组把 default_server 写在最后一个块，
+                                         # 只有它能分辨"兜底证书跟配置顺序"与"跟默认 server"
+python tools/quic_business_e2e.py        # 41 项：同一站点分别 over h1.1-TLS / h2-TLS / h3，
+                                         # body、缓存、限流桶、状态码逐项对齐
+python tools/random_scenarios_e2e.py --iters 20
+                                         # 每轮现掷一份配置（端口聚合、别名、正则、server 级 rewrite、
+                                         # L4 SNI），20 轮 4122 项；专治"只有某种拓扑才有的红"
+```
+
 它们验证的是行为，不是"能编译"：选课那条要求**源站实际报名人数等于网关放行数**（把 409
 当成"被拦"会得出假矛盾）；惊群那条数的是 TTL 到期的那一刻有几个请求真的回源；UDP 那条
 逐包核对回包有没有串到别的客户端手上；缓存那条还额外盯着"后端计数不变"这一件事——它是
@@ -1090,6 +1140,13 @@ stream {
 
 字节透明：网关不解密、不改内容、不解析协议；窥探失败（不是 TLS、握手分片不全、无 SNI）时
 按 `proxy_pass` 接线，并把已经读到的字节原样补给后端。
+
+`sni_match` **依序取第一条命中**，所以顺序有意义：上面这两行的写法是安全的（精确名在前），
+把 `"*.example.com"` 写在前面就会把 `a.example.com` 一起截走，而后面的精确名一行都不会再命中。
+两个细节：`*.example.com` 只吃**恰好一级**子域（`a.example.com` 命中，`example.com` 和
+`x.y.example.com` 都不命中）；单独的 `"*"` 不是"全匹配"，它只是一个精确名（想全匹配就别写
+`sni_match`，直接靠 `proxy_pass` 兜底）。这条顺序是 `tools/random_scenarios_e2e.py` 的 L4 半边
+按同一规则算预期才测出来的——随机拓扑真的会把它排在前面。
 
 ### 13.2 UDP：三种业务形状
 
