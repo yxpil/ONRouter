@@ -129,10 +129,9 @@ libraries such as tokio/hyper, all gateway logic is hand-written.
     the roll is **95 scripts** with `SKIP` empty), and a 21-minute soak on the release binary
     (**2,275,361 requests, 0 failures**, private memory +0.49 MiB with slope +0.055 MiB/min against
     a 1.0 MiB/min gate, cold-tier accounts clean: `corrupt` 0 / `never_read` 0 / `pending_jobs` 0) as
-    recorded in [OPERATIONS.md](docs/OPERATIONS.md) §13.1, and `tools/release_verify.py` 26/26 against the **unpacked** `target/dist/archives/onrouter-v1.0.2-*.zip` (the artifact a user actually downloads, not the build tree's binary). CI's E2E job was widened this round from six suites
-    to fourteen across three steps (functional contract, business shapes, HTTP/3+HTTPS transport parity).
+    recorded in [OPERATIONS.md](docs/OPERATIONS.md) §13.1, and `tools/release_verify.py` 26/26 against the **unpacked** `target/dist/archives/onrouter-v1.0.2-*.zip` (the artifact a user actually downloads, not the build tree's binary). CI's E2E job was widened in 1.0.2 from six suites to fourteen across three steps (functional contract, business shapes, HTTP/3+HTTPS transport parity), and is **fifteen** now: `https_matrix` joined the functional-contract step because it is the only suite that can tell "the fallback certificate follows config order" from "it follows `default_server`".
 
-- **Release engineering**: CI runs unit tests + clippy + fourteen real-traffic E2E suites in three
+- **Release engineering**: CI runs unit tests + clippy + fifteen real-traffic E2E suites in three
   steps (functional contract, business shapes, then the h1/h2/h3 transport-parity suite), with an
   optional `workflow_dispatch` 21-minute soak that checks private-memory growth. The 1.0 docs are
   [OPERATIONS.md](docs/OPERATIONS.md) (run it in production) and

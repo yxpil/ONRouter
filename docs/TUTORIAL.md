@@ -996,10 +996,17 @@ target/soak_metrics_end.txt
 `.github/workflows/ci.yml` 在 push / PR 到 `master`/`main` 时运行：
 
 - `unit`：`cargo test --workspace` + clippy；
-- `e2e`：release 构建后依次跑上面这些脚本，失败时上传 `conf/logs/`；
+- `e2e`：release 构建后分三步跑 **15 条**套件——功能契约 11 条（canary、wasm、resilience、affinity、
+  proxy_split、proxy_disk、limit_key、expires、herd、security_matrix、https_matrix），
+  业务形状 3 条（course_selection、production_shape、game_udp），
+  跨传输 1 条（先 `cargo build --bin orr-h3check`，再 quic_business）。
+  这一步是刻意挑的而不是"全跑"：全量回归在本地按发布闸门跑（§11.2），CI 负责每次 push 都过一遍
+  最容易因平台差异而退化的部分。失败时上传 `conf/logs/`；
 - `soak`：仅 `workflow_dispatch` 且输入分钟数非 0 时运行（建议填 21），报告作为 artifact 上传。
 
 本地通过不等于 CI 通过：CI 是 Linux，端口、路径大小写、证书和信号行为都要以它为准。
+这条不是抽象提醒——1.0.2 的那批测试有两条就是只在 CI 上红的：一条是就绪探测没兜住"网关还在
+bind"（本机 bind 够快看不出来），一条是 TLS 套件借用了别人的证书目录（本机恰好藏着一份）。
 
 ---
 
