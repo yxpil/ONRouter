@@ -1,4 +1,9 @@
-# ONRouter vs OpenResty — Gap Analysis
+# ONRouter Capability Matrix — What Is Implemented, and What Is Not Yet
+
+This is a status inventory of ONRouter itself: what the gateway does today, the unit/E2E evidence
+that enforces each row, and the list of what is still missing. Where an nginx or `ngx.*` behaviour
+is the contract a config author expects, it is named as the contract — the point of every row is
+what this binary actually does, not a ranking against somebody else's.
 
 Updated: 2026-10-21 (post-v1.0.0 main, Windows host). This revision also folds in the 1.0
 release surface — configurable `worker_threads` with `worker_cpu_affinity`, lazy rejoin and
@@ -28,8 +33,8 @@ E2E/unit evidence that enforces each row.
 
 ## Executive summary
 
-ONRouter now covers the core nginx request pipeline plus a broad OpenResty Lua
-surface: all request phases (including response filters and log phase), timers,
+ONRouter now covers the core nginx request pipeline plus a broad Lua (`ngx.*`) surface:
+all request phases (including response filters and log phase), timers,
 TCP/UDP cosockets, light threads, `ngx.semaphore`, subrequests (including
 concurrent `capture_multi`), shared dicts, `resty.lock` / `resty.http` /
 `resty.redis` / `resty.string` / `resty.cookie` / `resty.limit.req|count|conn`,

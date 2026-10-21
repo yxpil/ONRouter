@@ -1169,7 +1169,7 @@ them as standalone runnable assertion scripts.
   machinery runs on every request (`routed` delta == requests) without measurably moving throughput.
   The single-node row is again only a shape reference (6.5k req/s at c=32 against 10.9k for the two-node
   rows on the release build — one Python process is the cap, not the gateway).
-- `docs/OPENRESTY_GAP_ANALYSIS.md` is the capability matrix with test evidence.
+- `docs/CAPABILITY_MATRIX.md` is the capability matrix with test evidence.
 - `docs/USR2_HOT_UPGRADE.md` explains why nginx-style USR2 needs a process-model change,
   gives two designs (SO_REUSEPORT handover / master+worker FD inheritance), and a Linux test plan.
 
