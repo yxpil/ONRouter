@@ -144,9 +144,18 @@ class Plan:
                 self.stations[st] = self.make_station(st, cfg["tls"], cert_of.get(st, "fallback"))
         # --- L4：sni_match 精确 + 通配 + 兜底
         chosen = rng.sample(L4_PORTS, rng.randint(2, len(L4_PORTS)))
-        self.stream_sni.append((chosen[0] == L4_PORTS[0] and "*.w.test" or f"{names[0]}", chosen[0]))
+        # pattern 必须唯一：同一个 SNI 写两条时网关按配置顺序取第一条，而预言机是逐条比对的，
+        # 第二条就会拿到"错误"的端口（重复本身不是被禁止的写法，是这一轮的预言机判不了它）。
+        used = set()
+
+        def add_sni_rule(pat, port):
+            if pat.lower() not in used:
+                used.add(pat.lower())
+                self.stream_sni.append((pat, port))
+
+        add_sni_rule(chosen[0] == L4_PORTS[0] and "*.w.test" or f"{names[0]}", chosen[0])
         for p in chosen[1:]:
-            self.stream_sni.append((f"{rng.choice(names)}", p))
+            add_sni_rule(f"{rng.choice(names)}", p)
         if rng.random() < 0.6:
             self.stream_sni = [("*" if pat == "*.w.test" else pat, port) for pat, port in self.stream_sni]
         self.emit()
@@ -364,6 +373,20 @@ def wildcard_suffixes(st):
     return []
 
 
+def sni_rule_matches(pat, sni):
+    """对齐 stream.rs::sni_pattern_matches：精确名大小写不敏感；`*.s` 只吃**恰好一级**子域
+    （`a.e.com` 命中 `*.e.com`，`e.com` 和 `x.y.e.com` 都不命中）；单独的 `*` 不是全匹配，
+    它只是一个精确名。L4 预言机按声明顺序取第一条命中的规则。"""
+    p, n = pat.lower(), sni.lower()
+    if p.startswith("*."):
+        suffix = "." + p[2:]
+        if not n.endswith(suffix):
+            return False
+        prefix = n[:len(n) - len(suffix)]
+        return bool(prefix) and "." not in prefix
+    return n == p
+
+
 def pick_location(locs, path):
     """nginx：`=` 精确 → 最长前缀记下 → `^~` 命中即停 → 按序正则 → 回落记下的最长前缀"""
     best, best_len = None, -1
@@ -390,24 +413,48 @@ def pick_location(locs, path):
 
 
 def expect_for(plan, port, authority, path):
+    """Host/:authority → 哪个站应答、命中哪个 location。**这里不含证书**：
+    证书由 SNI 在握手期决定，与 Host 选站是两件事（旧预言机把它们记成一件，
+    于是同一端口多站时证书断言成片红，报出来的却是"网关选错站"）。"""
     st = pick_station(plan_ports(plan), port, authority, plan.stations)
     if st == "fallback" and "fallback" not in plan.ports[port]["servers"]:
         return None
     info = plan.stations.get(st)
     if info is None:
-        return {"station": st, "cert": "fallback", "status": 404,
+        return {"station": st, "status": 404,
                 "body": st + "|nofile\n", "route": None}
-    cert = info["cert"]
     loc = pick_location(info["locs"], path)
     act = loc["action"]
     if act[0] == "return":
-        return {"station": st, "cert": cert, "status": act[1], "body": act[2] + "\n", "route": None}
+        return {"station": st, "status": act[1], "body": act[2] + "\n", "route": None}
     if act[0] == "rewrite":
         target = re.sub(act[1], act[2], path)
-        return {"station": st, "cert": cert, "status": 200,
+        return {"station": st, "status": 200,
                 "body": f"{st}|rewrite-target\n", "route": None, "rewritten": target}
-    return {"station": st, "cert": cert, "status": 200, "backend": f"be{act[1]}",
+    return {"station": st, "status": 200, "backend": f"be{act[1]}",
             "route": act[2], "body": None, "cache": bool(loc.get("cache"))}
+
+
+def pick_cert(plan, port, sni):
+    """SNI → 该端口上哪张证书：精确 server_name > 通配 > 该端口的默认 server。
+    默认 server = 写了 `default_server` 的那个块；没写则是配置顺序第一个（nginx 同）。
+    证书选择在握手期完成，此时还没有 Host，所以**不能**用选站结果反推证书。"""
+    servers = plan.ports[port]["servers"]
+    host = (sni or "").split(":")[0].lower()
+    if host:
+        for s in servers:
+            if s == "fallback":
+                continue
+            if host in station_aliases(s, plan.stations):
+                return plan.stations[s]["cert"]
+        for s in servers:
+            if s == "fallback":
+                continue
+            if any(host.endswith("." + suf) and len(host) > len(suf) + 1
+                   for suf in wildcard_suffixes(s)):
+                return plan.stations[s]["cert"]
+    default = "fallback" if "fallback" in servers else servers[0]
+    return plan.stations[default]["cert"]
 
 
 def st_in_plan(plan, st):
@@ -443,9 +490,12 @@ def http_connect(port, host, tls, ctx):
     import http.client
 
     if tls:
-        c = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=8)
-        # 显式控制 SNI：走底层 socket 更直接
-        c.connect()
+        # 显式控制 SNI：不能用 HTTPSConnection("127.0.0.1", port)，那会把 SNI 写成 IP，
+        # 网关按"匹配不到"回落默认证书，而预言机以为探针发的是 host —— 报出来的就成了
+        # "证书指纹不对"。先自己 wrap 出带 SNI 的 socket，再交给 http.client 走 HTTP。
+        raw = socket.create_connection(("127.0.0.1", port), timeout=8)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=8)
+        c.sock = ctx.wrap_socket(raw, server_hostname=host)
         return c
     return http.client.HTTPConnection("127.0.0.1", port, timeout=8)
 
@@ -564,8 +614,8 @@ def run_iteration(seed, verbose=False):
                 check(f"{label} 站点归属 X-Station", headers.get("x-station") == exp["station"],
                       f"x-station={headers.get('x-station')!r} want={exp['station']!r}")
             if tls and fp:
-                want = cert_fp(exp["cert"])
-                check(f"h1 {port} {host} 证书指纹", fp == want, f"{fp[:12]} != {want[:12]}")
+                want = cert_fp(pick_cert(plan, port, host))
+                check(f"h1 {port} SNI={host} 证书指纹", fp == want, f"{fp[:12]} != {want[:12]}")
             # rewrite 之后不得再落到本 location 的兜底 return
             if exp.get("rewritten"):
                 check(f"h1 {port} {host} rewrite 到 {exp['rewritten']}",
@@ -577,7 +627,7 @@ def run_iteration(seed, verbose=False):
             srvs = [s for s in plan.ports[port]["servers"] if s != "fallback"]
             if len(srvs) < 1:
                 continue
-            sni = rng.choice(srvs)
+            sni = rng.choice(srvs + ["nomatch.invalid"])
             auth = rng.choice(srvs + ["nope.invalid"])
             path = rng.sample(paths, 1)[0]
             kv = h2_probe(port, sni, auth, path)
@@ -592,14 +642,23 @@ def run_iteration(seed, verbose=False):
                   f"probe={kv}")
             if kv.get("PEER_SHA256"):
                 check(f"h2 {port} 证书按 SNI={sni}",
-                      kv["PEER_SHA256"] == cert_fp(plan.stations[sni]["cert"]), f"probe={kv}")
+                      kv["PEER_SHA256"] == cert_fp(pick_cert(plan, port, sni)), f"probe={kv}")
         # L4：sni_match 分流 + 兜底 + 纯 TCP 聚合
-        for pat, port in plan.stream_sni:
-            sni = "one.w.test" if pat == "*.w.test" else pat
-            got = tls_tls_l4(sni, port)
-            check(f"L4 sni_match {pat} → l4{L4_PORTS.index(port)}",
-                  got == f"l4{L4_PORTS.index(port)}:sni={sni}",
-                  f"got={got!r}")
+        # sni_match 是**依序取第一条命中**（stream.rs::pick_sni_target），所以一条通配写在
+        # 前面就会遮住后面的精确名，而 `sni_match "*"` 这种"看起来像全匹配"的写法在实现里
+        # 只是名字恰好等于 "*" 的精确名。预言机必须按同一个顺序算，不能逐条独立预期——
+        # 之前逐条预期就是这里剩下的那条红。
+        probes = [("one.w.test" if pat == "*.w.test" else pat) for pat, _ in plan.stream_sni]
+        probes.append("nomatch.l4.test")          # 谁都不命中 → proxy_pass 兜底
+        for sni in dict.fromkeys(probes):         # 去重且保持顺序
+            hit = next((port for pat, port in plan.stream_sni if sni_rule_matches(pat, sni)),
+                       plan.stream_default)
+            shadowed = [pat for pat, _ in plan.stream_sni
+                        if sni_rule_matches(pat, sni) and pat != sni]
+            got = tls_tls_l4(sni, hit)
+            check(f"L4 SNI={sni} → l4{L4_PORTS.index(hit)}"
+                  + (f"（被 {shadowed} 这类先写的规则命中，依序第一条）" if shadowed else ""),
+                  got == f"l4{L4_PORTS.index(hit)}:sni={sni}", f"got={got!r}")
         got = l4_probe(GW_L4_PLAIN, "rawtcp")
         check("L4 纯 TCP 聚合端口（明文后端）", got.endswith(":rawtcp") and got.startswith("plain"),
               f"got={got!r}")

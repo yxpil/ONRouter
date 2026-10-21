@@ -30,14 +30,13 @@ OUT = os.path.join(ROOT, "logs", "regression", argv[0] if argv else "summaryD.tx
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 
 # 不进气泡回归的套件：红/绿目前不构成证据，宁可写清原因，也不留一条"长期红"的噪声。
-# 手工执行仍然有效，问题是它现在会误报。
+# 手工执行仍然有效，但回归里不认它。
 SKIP = {
-    # tools/random_scenarios_e2e.py：站点路由/别名/L4 那半边是可信的（正是它把"双 Host 头"
-    # 这个真问题挖出来的），但 TLS 那半边的预言机把"证书按 SNI"与"站点按 :authority"两件事
-    # 记成了一件：一轮随机拓扑里同一端口上的多个站点会共享一份证书账，于是证书指纹断言成片红。
-    # 多域名单端口的证书/串站判定由 tools/https_matrix_e2e.py 71/71（含变异校验）负责。
-    # TODO(证书账): 让 plan 记录每个站点实际写出的 ssl_certificate 再纳回回归。
-    "tools" + chr(92) + "random_scenarios_e2e.py",
+    # （此处曾长期挂着 tools/random_scenarios_e2e.py：它的 TLS 预言机把"证书按 SNI 选"
+    #  与"站点按 Host/:authority 选"记成了同一件事，证书断言成片红。2026-10-22 三条都修了：
+    #  探针改为真的按 host 发 SNI（原来把 127.0.0.1 当了 SNI）、预言机按 SNI 单独算证书
+    #  （精确 > 通配 > 该地址 default_server）、网关的兜底证书也改成跟 default_server 而不是
+    #  跟配置顺序。20 轮随机拓扑 4122/4122，所以它回到回归里了。）
 }
 
 scripts = sorted(
