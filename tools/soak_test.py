@@ -4,7 +4,8 @@
 # 流量不是"打一个 /ping"：每条路径都有不同的内存增长风险，并且都校验响应语义：
 #   /plain     反代 8 KiB 响应，连接池/缓冲区反复建立与回收
 #   /wasm      每请求实例化 WASM 插件，改写状态/响应头并缓冲 32 KiB 响应体
-#   /cached    4 MiB 缓存区、512 个键反复填充与淘汰（MISS/HIT 混合）
+#   /cached    4 MiB 缓存区、512 个键（装得下，MISS/HIT 混合）
+#   /cold      1k 冷层区、256 个键循环（淘汰→落盘→冷读→提升全程都在跑）
 #   /lua       每请求跑一段 Lua
 #   /static    8 KiB 静态文件走 WASM 过滤器
 # 另有 4 条长连接 worker 持续复用 keep-alive，专门看连接级缓冲是否随时间上涨。
@@ -78,6 +79,9 @@ def _make_backend_handler():
                 prefix, size = "WASM-", 32768
             elif p.path == "/cached":
                 prefix, size = "CACHE-", 2048
+            elif p.path == "/cold":
+                # 长 TTL 是有意的：冷层只收"还新鲜"的条目，10s 就过期的对象永远测不到落盘
+                prefix, size = "COLD-", 4096
             else:
                 self.send_error(404)
                 return
@@ -88,7 +92,8 @@ def _make_backend_handler():
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Soak-Backend", "1")
             self.send_header("X-Backend-Secret", "hidden")
-            self.send_header("Cache-Control", "public, max-age=10")
+            ttl = "600" if p.path == "/cold" else "10"
+            self.send_header("Cache-Control", f"public, max-age={ttl}")
             self.end_headers()
             self.wfile.write(body)
             COUNTERS.backend += 1
@@ -169,6 +174,8 @@ def choose_path(rng):
         return "/wasm?k=" + tok()
     if r < 0.85:
         return "/cached?k=" + str(rng.randrange(512))
+    if r < 0.90:
+        return "/cold?k=" + str(rng.randrange(256))
     if r < 0.95:
         return "/lua?k=" + tok()
     return "/static.txt"
@@ -198,6 +205,14 @@ def validate(path, status, headers, body):
         xc = headers.get("x-cache")
         if xc not in {"MISS", "HIT", "STALE", "EXPIRED", "BYPASS", "UPDATING", "REVALIDATED"}:
             return f"cached-header-{xc!r}"
+    elif path.startswith("/cold"):
+        if status != 200:
+            return f"cold-status-{status}"
+        if len(body) != 4096 or not body.startswith(b"COLD-"):
+            return f"cold-body-{len(body)}"
+        xc = headers.get("x-cache")
+        if xc not in {"MISS", "HIT", "STALE", "EXPIRED", "BYPASS", "UPDATING", "REVALIDATED"}:
+            return f"cold-header-{xc!r}"
     elif path.startswith("/lua"):
         if status != 200:
             return f"lua-status-{status}"
