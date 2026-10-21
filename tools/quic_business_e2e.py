@@ -268,6 +268,8 @@ def main():
           "HTTP/3" in tout, tout[-400:])
 
     srv = origin_server()
+    # CI 是干净检出：logs/ 在 .gitignore 里，套件自己把它建出来
+    os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
     logf = open(os.path.join(ROOT, "logs", "qbiz_out.log"), "wb")
     proc = subprocess.Popen([gw_exe, "-c", CONF], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
     try:

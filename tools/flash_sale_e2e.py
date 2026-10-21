@@ -288,6 +288,8 @@ def main():
     check("-t 没有未知指令告警", "未知指令" not in tout, tout[-200:])
     check("-t 报告了限流队列", "zone=cq" in tout, tout[-200:])
 
+    # CI 是干净检出：logs/ 在 .gitignore 里，套件自己把它建出来
+    os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
     logf = open(os.path.join(ROOT, "logs", "flash_sale_out.log"), "wb")
     proc = subprocess.Popen([exe, CONF], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
     try:

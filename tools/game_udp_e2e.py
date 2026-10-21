@@ -221,6 +221,8 @@ def main():
     check("-t 列出 UDP 监听", "udp://0.0.0.0:18613" in tout, tout[-200:])
     check("-t 说清 proxy_responses", "proxy_responses=0" in tout and "proxy_responses=4" in tout, tout[-200:])
 
+    # CI 是干净检出：logs/ 在 .gitignore 里，套件自己把它建出来
+    os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
     logf = open(os.path.join(ROOT, "logs", "game_udp_out.log"), "wb")
     proc = subprocess.Popen([exe, CONF], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
     try:

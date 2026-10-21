@@ -162,6 +162,8 @@ def main():
     t_key_checks(exe)
 
     origin = start_origin()
+    # CI 是干净检出：logs/ 在 .gitignore 里，套件自己把它建出来
+    os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
     logf = open(os.path.join(ROOT, "logs", "expires_out.log"), "wb")
     proc = subprocess.Popen([exe, CONF], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
     try:
