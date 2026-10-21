@@ -1402,11 +1402,15 @@ mod tests {
 
     #[test]
     fn tokens_refill_over_time() {
-        let z = ReqZone::new("t", 1000.0, 0.0, "$remote_addr");
-        assert!(z.check("k", None).is_none());
-        assert!(z.check("k", None).is_some());
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(z.check("k", None).is_none(), "1000r/s 下 10ms 应补回令牌");
+        // 2 r/s = 每 500ms 补一个令牌：判断用的时间尺度比调度抖动大两个数量级。
+        // 这里不能用高速率（原来写的是 1000r/s）：那等于要求"两次背靠背的 check"落在同一个
+        // 毫秒内——本机全过，Linux CI 上跑满 CPU 时中间那条"应拒绝"会被补回来的令牌翻成放行，
+        // 红的是测试对调度抖动敏感，不是补牌逻辑。
+        let z = ReqZone::new("t", 2.0, 0.0, "$remote_addr");
+        assert!(z.check("k", None).is_none(), "首个请求放行");
+        assert!(z.check("k", None).is_some(), "桶空时应拒绝");
+        std::thread::sleep(std::time::Duration::from_millis(650));
+        assert!(z.check("k", None).is_none(), "按速率补回令牌后应再次放行");
     }
 
     #[test]
