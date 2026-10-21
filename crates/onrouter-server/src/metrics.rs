@@ -820,7 +820,14 @@ impl Metrics {
         s.push_str("# TYPE onrouter_lua_phase_scheduled_total counter\n");
         s.push_str(&format!("onrouter_lua_phase_scheduled_total {}\n", g(&self.lua_scheduled)));
         // ngx.shared.DICT 磁盘冷层：运维要看分层到底有没有在转（落盘/冷命中/提升）
-        push_dict_zones(&mut s, &crate::disk_cache::snapshot());
+        push_cold_zones(&mut s, &crate::disk_cache::snapshot(), "dict", "dict");
+        // proxy_cache 的冷层同一套账，另起一族名字：响应缓存的落盘不能被读成字典的落盘
+        push_cold_zones(
+            &mut s,
+            &crate::disk_cache::proxy_snapshot(),
+            "proxy_cache",
+            "zone",
+        );
         s
     }
 }
@@ -832,66 +839,98 @@ fn label(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// ngx.shared.DICT 磁盘冷层指标。只在真的开了 `disk=` 的区才输出——
-/// 没开磁盘层的部署里，这些 0 值序列只是噪音。
-fn push_dict_zones(s: &mut String, zones: &[(String, crate::disk_cache::DiskStore)]) {
+/// 磁盘冷层指标族：`family` 决定序列名（`onrouter_<family>_disk_*`），`label_key` 决定标签名
+/// （共享字典侧是 `dict`，`proxy_cache` 侧是 `zone`）。
+///
+/// 两家共用同一个 [`crate::disk_cache`] 实现，账目口径必须一致，所以渲染也只写一份；
+/// 分开的只有序列名——把响应缓存的落盘记到 `onrouter_dict_disk_*` 头上会误导告警。
+/// 只在真的开了冷层的区才输出：没开磁盘层的部署里，这些 0 值序列只是噪音。
+fn push_cold_zones(
+    s: &mut String,
+    zones: &[(String, crate::disk_cache::DiskStore)],
+    family: &str,
+    label_key: &str,
+) {
     if zones.is_empty() {
         return;
     }
-    s.push_str("# HELP onrouter_dict_disk_entries Cold tier entries currently indexed on disk.\n");
-    s.push_str("# TYPE onrouter_dict_disk_entries gauge\n");
-    for (name, z) in zones {
-        let n = label(name);
-        s.push_str(&format!("onrouter_dict_disk_entries{{dict=\"{n}\"}} {}\n", z.entries()));
+    // 两个宏而不是两个闭包：同一份 `s` 被两个 `FnMut` 同时可变借用会被借用检查拒绝，
+    // 而展开点就在本函数里，`s`/`family`/`label_key` 全都原地可见，不需要绕。
+    macro_rules! gauge {
+        ($metric:expr, $help:expr) => {
+            s.push_str(&format!(
+                "# HELP onrouter_{family}_disk_{} {}
+# TYPE onrouter_{family}_disk_{} gauge
+",
+                $metric, $help, $metric
+            ));
+        };
     }
-    s.push_str("# HELP onrouter_dict_disk_bytes Bytes occupied by committed cold tier entries (headers included).\n");
-    s.push_str("# TYPE onrouter_dict_disk_bytes gauge\n");
-    for (name, z) in zones {
-        s.push_str(&format!(
-            "onrouter_dict_disk_bytes{{dict=\"{}\"}} {}\n",
-            label(name),
-            z.bytes_used()
-        ));
+    macro_rules! row {
+        ($metric:expr, $zone:expr, $value:expr) => {
+            s.push_str(&format!(
+                "onrouter_{family}_disk_{}{{{}=\"{}\"}} {}
+",
+                $metric,
+                label_key,
+                label($zone),
+                $value
+            ));
+        };
     }
-    s.push_str("# HELP onrouter_dict_disk_value_bytes Value bytes of live cold entries, excluding headers.\n");
-    s.push_str("# TYPE onrouter_dict_disk_value_bytes gauge\n");
+    gauge!(
+        "entries",
+        "Cold tier entries currently indexed on disk."
+    );
     for (name, z) in zones {
-        s.push_str(&format!(
-            "onrouter_dict_disk_value_bytes{{dict=\"{}\"}} {}\n",
-            label(name),
-            z.value_bytes()
-        ));
+        row!("entries", name, z.entries() as u64);
     }
-    s.push_str("# HELP onrouter_dict_disk_capacity_bytes disk= max_bytes quota for the cold tier.\n");
-    s.push_str("# TYPE onrouter_dict_disk_capacity_bytes gauge\n");
+    gauge!(
+        "bytes",
+        "Bytes occupied by committed cold tier entries (headers included)."
+    );
     for (name, z) in zones {
-        s.push_str(&format!(
-            "onrouter_dict_disk_capacity_bytes{{dict=\"{}\"}} {}\n",
-            label(name),
-            z.config().max_bytes
-        ));
+        row!("bytes", name, z.bytes_used());
     }
-    s.push_str("# HELP onrouter_dict_disk_pending_jobs Spill/trim jobs queued but not yet performed by the writer thread.\n");
-    s.push_str("# TYPE onrouter_dict_disk_pending_jobs gauge\n");
+    gauge!(
+        "value_bytes",
+        "Value bytes of live cold entries, excluding headers."
+    );
     for (name, z) in zones {
-        let n = label(name);
-        let st = z.stats();
-        s.push_str(&format!(
-            "onrouter_dict_disk_pending_jobs{{dict=\"{n}\"}} {}\n",
-            st.pending_jobs.load(Ordering::Relaxed)
-        ));
+        row!("value_bytes", name, z.value_bytes() as u64);
     }
-    s.push_str("# HELP onrouter_dict_disk_pending_bytes Bytes queued but not yet on disk.\n");
-    s.push_str("# TYPE onrouter_dict_disk_pending_bytes gauge\n");
+    gauge!(
+        "capacity_bytes",
+        "Configured max_bytes quota for the cold tier."
+    );
     for (name, z) in zones {
-        s.push_str(&format!(
-            "onrouter_dict_disk_pending_bytes{{dict=\"{}\"}} {}\n",
-            label(name),
+        row!("capacity_bytes", name, z.config().max_bytes);
+    }
+    gauge!(
+        "pending_jobs",
+        "Spill/trim jobs queued but not yet performed by the writer thread."
+    );
+    for (name, z) in zones {
+        row!(
+            "pending_jobs",
+            name,
+            z.stats().pending_jobs.load(Ordering::Relaxed)
+        );
+    }
+    gauge!("pending_bytes", "Bytes queued but not yet on disk.");
+    for (name, z) in zones {
+        row!(
+            "pending_bytes",
+            name,
             z.stats().pending_bytes.load(Ordering::Relaxed)
-        ));
+        );
     }
-    s.push_str("# HELP onrouter_dict_disk_operations_total Cold tier operations by kind.\n");
-    s.push_str("# TYPE onrouter_dict_disk_operations_total counter\n");
+    s.push_str(&format!(
+        "# HELP onrouter_{family}_disk_operations_total Cold tier operations by kind.\n"
+    ));
+    s.push_str(&format!(
+        "# TYPE onrouter_{family}_disk_operations_total counter\n"
+    ));
     for (name, z) in zones {
         let n = label(name);
         let st = z.stats();
@@ -908,7 +947,7 @@ fn push_dict_zones(s: &mut String, zones: &[(String, crate::disk_cache::DiskStor
             ("warm_recovered", &st.warm_recovered),
         ] {
             s.push_str(&format!(
-                "onrouter_dict_disk_operations_total{{dict=\"{n}\",op=\"{op}\"}} {}\n",
+                "onrouter_{family}_disk_operations_total{{{label_key}=\"{n}\",op=\"{op}\"}} {}\n",
                 cell.load(Ordering::Relaxed)
             ));
         }
@@ -1036,7 +1075,7 @@ mod tests {
         assert!(store.spill("k", b"hello", None, 4.0));
         store.flush_pending();
         let mut text = String::new();
-        push_dict_zones(&mut text, &[("api cache".to_string(), store.clone())]);
+        push_cold_zones(&mut text, &[("api cache".to_string(), store.clone())], "dict", "dict");
         for needle in [
             "onrouter_dict_disk_entries{dict=\"api cache\"} 1",
             "onrouter_dict_disk_value_bytes{dict=\"api cache\"} 5",
@@ -1053,8 +1092,29 @@ mod tests {
         );
         // 没开 disk= 的部署里，这一族完全不应出现
         let mut none = String::new();
-        push_dict_zones(&mut none, &[]);
+        push_cold_zones(&mut none, &[], "dict", "dict");
         assert!(none.is_empty(), "无冷层时不该输出任何指标，实际：{none}");
+        // 同一个 store 交给 proxy_cache 那一族渲染：序列名和标签名都必须换掉，
+        // 否则响应缓存的落盘会被读成共享字典的落盘（告警会指错地方）。
+        let mut proxy = String::new();
+        push_cold_zones(
+            &mut proxy,
+            &[("pages".to_string(), store.clone())],
+            "proxy_cache",
+            "zone",
+        );
+        assert!(
+            proxy.contains("onrouter_proxy_cache_disk_entries{zone=\"pages\"} 1"),
+            "{proxy}"
+        );
+        assert!(
+            proxy.contains("# TYPE onrouter_proxy_cache_disk_operations_total counter"),
+            "{proxy}"
+        );
+        assert!(
+            !proxy.contains("onrouter_dict_"),
+            "proxy_cache 的账不能挂 dict 的名字：\n{proxy}"
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

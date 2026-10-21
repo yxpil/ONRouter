@@ -489,7 +489,10 @@ fn check(
                 println!("  {}", governor::describe_conf(&c));
                 if c.mode == governor::GovernorMode::Auto
                     && c.tier == governor::SleepTier::Deep
+                    // 深睡的动作是"把内存里的东西下沉到冷层"。共享字典的 `disk=` 与
+                    // proxy_cache 的 `disk=on` 都算，两边一个都没有才是真的没东西可沉。
                     && shared_dict::config_disk_zone_count(config) == 0
+                    && proxy_cache::ProxyCache::config_disk_zone_count(config) == 0
                 {
                     println!(
                         "  Warning cache_governor_tier deep but no lua_shared_dict declares disk=: \
@@ -526,6 +529,11 @@ fn check(
     // WASM 插件：-t 把编译成功的模块、指令预算、内存上限和导出函数列出来。模块在构建路由时
     // 就已完成校验与编译，这里看到的就是线上将要执行的那一份。
     for line in crate::wasm::describe() {
+        println!("  {line}");
+    }
+    // proxy_cache 冷层：配置里写了 disk=on 才有行。目录、上限、门槛都在这一行说清楚，
+    // 因为"这个区的缓存会不会跨重启"从配置上看不出来。-t 不创建目录，只复述配置。
+    for line in proxy_cache::ProxyCache::describe_disk(&router.cache_disk) {
         println!("  {line}");
     }
     if !warnings.is_empty() {
@@ -572,6 +580,18 @@ async fn run(
     };
     let proxy_cache =
         proxy_cache::ProxyCache::with_capacities(router.cache_zones.clone(), Arc::clone(&learning));
+    // proxy_cache 的磁盘冷层：`router.cache_disk` 里没有区 = 不创建任何目录，落盘与冷读两条
+    // 路径全程短路。打开失败就直接失败——`disk=on` 许的是"这份缓存要落盘"。
+    let proxy_disks = proxy_cache::ProxyCache::open_disk_zones(&router.cache_disk)?;
+    if !proxy_disks.is_empty() {
+        disk_cache::register_proxy_zones(
+            proxy_disks
+                .iter()
+                .map(|(n, s)| (n.clone(), s.clone()))
+                .collect(),
+        );
+    }
+    proxy_cache.attach_disks(proxy_disks);
     let still_online =
         still_online::StillOnline::with_budgets(router.still_zones.clone());
     let access_log = access_log::AccessLog::new(&config, &base_dir);
@@ -817,6 +837,18 @@ async fn run(
         let cold = disk_cache::snapshot();
         log_info!(
             "DICT 磁盘冷层：{} 个区已启用（{}），落盘/冷命中见 /metrics 的 onrouter_dict_disk_*",
+            cold.len(),
+            cold
+                .iter()
+                .map(|(n, s)| format!("{n}: {:?}", s.config().root))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if disk_cache::proxy_enabled() {
+        let cold = disk_cache::proxy_snapshot();
+        log_info!(
+            "proxy_cache 磁盘冷层：{} 个区已启用（{}）；被内存挤出去的新鲜响应会落盘，冷命中额外带 X-Cache-Tier: disk，账目见 /metrics 的 onrouter_proxy_cache_disk_*",
             cold.len(),
             cold
                 .iter()
@@ -1153,6 +1185,23 @@ fn do_reload(
             Err(e) => log_error!("热重载失败：路由构建出错，保持旧配置继续服务: {e}"),
             Ok((new_router, fresh_listeners)) => {
                 let warnings = new_router.warnings.clone();
+                // proxy_cache 冷层先打开、后换路由：打不开就整次重载作废并保留旧配置，
+                // 否则会出现"路由是新的、磁盘层还是旧的（或没有）"这种对不上账的状态。
+                // 新配置里没写 disk=on 时这里传入空表 = 摘掉全部冷层并排空旧队列。
+                let proxy_disks = match proxy_cache::ProxyCache::open_disk_zones(&new_router.cache_disk) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log_error!("热重载失败：{e}，保持旧配置继续服务");
+                        return;
+                    }
+                };
+                disk_cache::register_proxy_zones(
+                    proxy_disks
+                        .iter()
+                        .map(|(n, s)| (n.clone(), s.clone()))
+                        .collect(),
+                );
+                state.proxy_cache.attach_disks(proxy_disks);
                 state.swap_router(new_router);
                 // 缓存学习：账本跨重载延续（见 learning::Budget），这里只换配置并逐区对齐
                 let learning = learning::Learning::parse_all(&cfg);

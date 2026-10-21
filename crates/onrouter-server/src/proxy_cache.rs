@@ -1,7 +1,10 @@
 //! `proxy_cache`：反向代理响应缓存（对标 nginx ngx_http_proxy_cache_module）。
 //!
-//! 纯内存实现（不做磁盘持久化；`proxy_cache_path` 只取 `keys_zone` 容量用于 LRU，
-//! 不建共享内存段），语义对齐 nginx 的常用子集：
+//! 默认是纯内存实现（`proxy_cache_path` 取 `keys_zone` 容量用于 LRU，不建共享内存段）；
+//! 加上 `disk=on` 后，路径参数就是该区的磁盘冷层根目录（[`crate::disk_cache`]，与
+//! `lua_shared_dict disk=` 同一套机制）：被 LRU 挤出去但**仍然新鲜**的响应落盘，
+//! 下次同 key 未命中时从冷层读回并提升进内存，重启时靠扫目录重建索引。
+//! 语义对齐 nginx 的常用子集：
 //!   * `proxy_cache <zone>|off;`     —— 命中且未过期直接返回缓存，不再打后端
 //!   * `proxy_cache_key <模板>;`      —— 默认 `$scheme$proxy_host$request_uri`
 //!   * `proxy_cache_valid [码...] <时长>;` —— 哪些状态码缓存多久；`any` 兜底
@@ -11,13 +14,18 @@
 //!   * `proxy_cache_use_stale error|timeout|updating|http_xxx` —— 失败/刷新中回放过期内容
 //!   * `proxy_cache_bypass` / `proxy_no_cache` —— 按表达式跳过读取 / 跳过写入
 //!   * `proxy_cache_path ... keys_zone=<名>:<容量>` —— 容量按 128 B/条换算，LRU 淘汰
+//!   * `... <路径> disk=on [max_size] [levels] [inactive] [spill_after] [max_value]` —— 磁盘冷层；不写 `disk=on` 就一个字节都不落盘，行为与纯内存时代逐字节一致
 //! 未写 `proxy_cache_valid` 时回落到上游的 `Cache-Control: max-age` / `Expires`；都没有则不缓存。
 //!
 //! 过期条目在内存里额外滞留 `STALE_GRACE`，供 `use_stale` 回放；之后由写入计数触发的
-//! 清理逻辑释放（容量本身由 LRU 上限兜底）。
+//! 清理逻辑释放（容量本身由 LRU 上限兜底）。冷层只服务**未过期**的条目，所以
+//! `use_stale` 的过期回放仍然只在内存里发生——这是有意的：磁盘上留着一堆已过期的响应
+//! 只会让运维以为缓存还有内容，而 nginx 侧对应的是 `inactive` 回收，不是 stale 回放。
 //! 有意未实现（README 已标注）：revalidation（If-None-Match 回源校验）、`purge`、Vary、
-//! `proxy_cache_lock_age`、磁盘持久化。缓存响应统一带
-//! `X-Cache-Status: HIT|MISS|EXPIRED|BYPASS|STALE` 头，便于外部验证。
+//! `proxy_cache_lock_age`。缓存响应统一带
+//! `X-Cache-Status: HIT|MISS|EXPIRED|BYPASS|STALE` 头，便于外部验证；由冷层供的命中
+//! 状态仍是 `HIT`（nginx 的词表里没有"磁盘命中"这一档），另加一个 `X-Cache-Tier: disk`
+//! 把层级说出来，计数在 `/metrics` 的 `onrouter_proxy_cache_disk_*`。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -25,12 +33,101 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
+use crate::disk_cache::DiskStore;
+
 /// 一份可回放的缓存响应（body 已在内存，可被多个并发请求共享）。
+///
+/// `Clone` 只服务一条冷路径：从磁盘读回一份响应后，既要提升进内存（那边存 `Arc`）又要当场
+/// 回给请求，靠克隆头部 + `Arc<Bytes>` 引用计数完成，不再复制 body。
+#[derive(Clone)]
 pub struct CachedResponse {
     pub status: u16,
     /// 已剔除 hop-by-hop 与 Content-Length 的头（回发时按 body 长度重算 Content-Length）
     pub headers: Vec<(String, String)>,
     pub body: Arc<Bytes>,
+}
+
+/// 冷层条目格式的版本号。布局变了就要涨它——[`decode_response`] 见到不认识的版本一律按
+/// 坏条目丢弃，这样旧目录被新二进制扫到时是"少几条缓存"，不是"发出畸形响应"。
+const RESP_FORMAT: u8 = 1;
+/// 单条响应体的解码上限。落盘侧由 `max_value` 把关，这里是**读侧**的自保：
+/// 磁盘上一个撒谎的长度字段不能变成一次 64 GiB 的分配。
+const RESP_BODY_CAP: u64 = 256 * 1024 * 1024;
+const RESP_HEADER_CAP: usize = 512;
+const RESP_FIELD_CAP: usize = 64 * 1024;
+
+/// 把一份响应压成冷层字节流：`ORPC` + 版本 + 状态 + 头 + 体，全小端、定长前缀。
+///
+/// 自描述、无索引文件（与 [`crate::disk_cache`] 的条目格式同一思路）：
+/// 重启扫目录时只读文件本身就能重建可用条目。
+pub fn encode_response(resp: &CachedResponse) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + resp.body.len());
+    out.extend_from_slice(b"ORPC");
+    out.push(RESP_FORMAT);
+    out.extend_from_slice(&resp.status.to_le_bytes());
+    out.extend_from_slice(&(resp.headers.len() as u16).to_le_bytes());
+    for (k, v) in &resp.headers {
+        out.extend_from_slice(&(k.len() as u16).to_le_bytes());
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(&(v.len() as u16).to_le_bytes());
+        out.extend_from_slice(v.as_bytes());
+    }
+    out.extend_from_slice(&(resp.body.len() as u64).to_le_bytes());
+    out.extend_from_slice(&resp.body);
+    out
+}
+
+/// 解码冷层条目。任何越界、截断、版本不符、尾随字节都返回 None（调用方按坏条目摘除）。
+pub fn decode_response(bytes: &[u8]) -> Option<CachedResponse> {
+    if bytes.len() < 17 || &bytes[..4] != b"ORPC" {
+        return None;
+    }
+    if bytes[4] != RESP_FORMAT {
+        return None;
+    }
+    let mut cur = 5usize;
+    let read_u16 = |b: &[u8], cur: &mut usize| -> Option<u16> {
+        let raw = b.get(*cur..*cur + 2)?;
+        *cur += 2;
+        Some(u16::from_le_bytes([raw[0], raw[1]]))
+    };
+    let status = read_u16(bytes, &mut cur)?;
+    let header_count = read_u16(bytes, &mut cur)? as usize;
+    if header_count > RESP_HEADER_CAP {
+        return None;
+    }
+    let read_field = |b: &[u8], cur: &mut usize| -> Option<String> {
+        let len = read_u16(b, cur)? as usize;
+        if len > RESP_FIELD_CAP {
+            return None;
+        }
+        let raw = b.get(*cur..*cur + len)?;
+        *cur += len;
+        String::from_utf8(raw.to_vec()).ok()
+    };
+    let mut headers = Vec::with_capacity(header_count.min(32));
+    for _ in 0..header_count {
+        let name = read_field(bytes, &mut cur)?;
+        let value = read_field(bytes, &mut cur)?;
+        headers.push((name, value));
+    }
+    let raw: [u8; 8] = bytes.get(cur..cur + 8)?.try_into().ok()?;
+    let body_len = u64::from_le_bytes(raw);
+    cur += 8;
+    if body_len > RESP_BODY_CAP || bytes.len() - cur != body_len as usize {
+        return None;
+    }
+    Some(CachedResponse {
+        status,
+        headers,
+        body: Arc::new(Bytes::from(bytes[cur..].to_vec())),
+    })
+}
+
+/// `Instant` 的剩余寿命换成冷层用的绝对秒制时刻（冷层与 DICT 共用同一把时钟）。
+fn epoch_from_instant(now: Instant, at: Instant) -> f64 {
+    let left = at.saturating_duration_since(now).as_secs_f64();
+    crate::disk_cache::epoch_now() + left
 }
 
 struct Slot {
@@ -154,6 +251,9 @@ pub struct ProxyCache {
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 缓存学习的配置与全局字节预算（默认关闭 → 所有学习路径短路）
     learning: Mutex<Arc<crate::learning::Learning>>,
+    /// 每区的磁盘冷层句柄（区名 → store）。空表 = 谁都没配 `disk=on`，
+    /// 此时落盘与冷读两条路径都在第一次 `is_none()` 上短路，不产生任何额外开销。
+    disks: Mutex<HashMap<String, DiskStore>>,
 }
 
 impl ProxyCache {
@@ -170,13 +270,21 @@ impl ProxyCache {
         let mut zones = self.zones.lock().unwrap_or_else(|e| e.into_inner());
         let mut n = 0usize;
         let mut bytes = 0u64;
-        for z in zones.values_mut() {
+        for name in zones.keys().cloned().collect::<Vec<String>>() {
+            let z = match zones.get_mut(&name) {
+                Some(z) => z,
+                None => continue,
+            };
             for _ in 0..max_per_zone {
                 // BTreeMap iterates by tick order: first entry = least recently used.
                 let Some(key) = z.lru.values().next().cloned() else { break };
                 if let Some(slot) = z.remove(&key) {
                     n += 1;
                     bytes += (slot.resp.body.len() + key.len()) as u64;
+                    // 深睡是为了还内存，不是为了扔数据：配了冷层的区把这批交给磁盘，
+                    // 醒来后同 key 直接冷命中，不必再打一遍后端。
+                    let freq = Self::victim_freq(z, &key);
+                    self.spill_slot(&name, &key, &slot, freq);
                 }
             }
         }
@@ -203,7 +311,106 @@ impl ProxyCache {
             capacities: Mutex::new(capacities),
             locks: Mutex::new(HashMap::new()),
             learning: Mutex::new(learning),
+            disks: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// 挂上各区的磁盘冷层（启动与热重载同一条路径）。整表替换：新的配置里没写 `disk=on`
+    /// 的区就此脱钩，被摘掉的 store 由 [`crate::disk_cache::register_proxy_zones`] 排空队列。
+    pub fn attach_disks(&self, disks: HashMap<String, DiskStore>) {
+        *self.disks.lock().unwrap_or_else(|e| e.into_inner()) = disks;
+    }
+
+    fn disk_for(&self, zone: &str) -> Option<DiskStore> {
+        self.disks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(zone)
+            .cloned()
+    }
+
+    /// 打开各区的磁盘冷层（启动与热重载共用）。
+    ///
+    /// 顺序与 DICT 侧同一套约定（见 [`crate::disk_cache::register_zones`] 的文档）：先排空
+    /// 旧 store 承诺的落盘，再 `open` 新 store——这样启动扫描看到的才是完整的目录，
+    /// 否则上次退出时还在队列里的条目会被当成"不存在"，冷层凭空少一批。
+    ///
+    /// 打不开就直接失败：`disk=on` 是运维明确许下的"这份缓存要落盘"，静默退回内存只会
+    /// 让人以为磁盘上有东西。热重载路径拿到 Err 会保留旧配置继续服务。
+    pub fn open_disk_zones(
+        specs: &HashMap<String, crate::disk_cache::DiskConfig>,
+    ) -> Result<HashMap<String, DiskStore>, crate::AppError> {
+        if specs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        crate::disk_cache::flush_all_pending();
+        // 固定顺序打开：出错时要回滚已建好的 store，日志里的区列表也必须可比对，
+        // HashMap 的迭代顺序两者都不合适。
+        let mut names: Vec<&String> = specs.keys().collect();
+        names.sort();
+        let mut opened: Vec<(String, DiskStore)> = Vec::new();
+        for name in names {
+            match DiskStore::open(specs[name].clone(), None) {
+                Ok(store) => opened.push((name.clone(), store)),
+                Err(e) => {
+                    for (_, store) in &opened {
+                        store.flush_pending();
+                    }
+                    return Err(crate::AppError::Other(format!(
+                        "proxy_cache 区 '{name}' 的磁盘冷层启动失败: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(opened.into_iter().collect())
+    }
+
+    /// `-t` 的深睡判据：配置里有几个 `proxy_cache_path` 声明了 `disk=on`。
+    ///
+    /// 与 `shared_dict::config_disk_zone_count` 同一先例——`-t` 阶段运行期登记表还是空的，
+    /// 只能直接从指令上数。
+    pub fn config_disk_zone_count(config: &onrouter_config::Config) -> usize {
+        config
+            .root
+            .block
+            .iter()
+            .filter(|d| {
+                d.name == "proxy_cache_path"
+                    && d.args.iter().any(|kv| {
+                        kv.split_once('=')
+                            .map(|(k, v)| k.trim() == "disk" && v.trim().eq_ignore_ascii_case("on"))
+                            .unwrap_or(false)
+                    })
+            })
+            .count()
+    }
+
+    /// `-t` 与启动横幅用的自述：哪些区会往磁盘写、写到哪、上限多少。
+    ///
+    /// 需要这行是因为 `disk=on` 是个开关：没写的区一行都不落盘，写了的区从此有磁盘账。
+    /// 光看配置很难看出"这个区的缓存到底会不会跨重启"。
+    pub fn describe_disk(specs: &HashMap<String, crate::disk_cache::DiskConfig>) -> Vec<String> {
+        let mut names: Vec<&String> = specs.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let c = &specs[name];
+                format!(
+                    "proxy_cache 冷层 区 {name} -> {:?}（上限 {} B，levels={}，inactive={}s，spill_after={}，max_value={} B）",
+                    c.root,
+                    c.max_bytes,
+                    c.levels
+                        .iter()
+                        .map(|l| l.to_string())
+                        .collect::<Vec<_>>()
+                        .join(":"),
+                    c.inactive.as_secs(),
+                    c.spill_after,
+                    c.max_value
+                )
+            })
+            .collect()
     }
 
     /// 当前生效的学习配置快照（取锁极短：只克隆 Arc）。
@@ -327,7 +534,7 @@ impl ProxyCache {
                 .get(name)
                 .copied()
                 .unwrap_or(DEFAULT_MAX_ENTRIES_PER_ZONE);
-            Self::trim(z);
+            self.trim(name, z);
         }
     }
 
@@ -342,14 +549,71 @@ impl ProxyCache {
 
     /// 查缓存并把该 key 的请求计数 +1（返回自增后的计数，用于 min_uses 判定）。
     /// 对 zone/key 做一次加锁即可完成「查 + 计数 + 刷新 LRU」，避免多次加锁间的竞态。
-    pub fn lookup(&self, zone: &str, key: &str) -> (CacheHit, Option<Arc<CachedResponse>>, u32) {
-        self.lookup_impl(zone, key, true)
+    ///
+    /// 第四项 = 这条命中是不是从磁盘冷层读回来的。内存未命中才会去问冷层，所以
+    /// 没配 `disk=on` 的区永远拿到 `false`，多出来的只是一次 `Option` 判空。
+    pub fn lookup(
+        &self,
+        zone: &str,
+        key: &str,
+    ) -> (CacheHit, Option<Arc<CachedResponse>>, u32, bool) {
+        let (hit, resp, count) = self.lookup_impl(zone, key, true);
+        if hit != CacheHit::Miss {
+            return (hit, resp, count, false);
+        }
+        let (hit, resp, from_disk) = self.cold_read(zone, key);
+        (hit, resp, count, from_disk)
     }
 
     /// 拿到 proxy_cache_lock 之后的二次检查：命中的话直接返回，且不重复累计 min_uses。
-    pub fn peek(&self, zone: &str, key: &str) -> (CacheHit, Option<Arc<CachedResponse>>) {
+    pub fn peek(&self, zone: &str, key: &str) -> (CacheHit, Option<Arc<CachedResponse>>, bool) {
         let (hit, resp, _) = self.lookup_impl(zone, key, false);
-        (hit, resp)
+        if hit != CacheHit::Miss {
+            return (hit, resp, false);
+        }
+        self.cold_read(zone, key)
+    }
+
+    /// 内存没有这条时问一次冷层。
+    ///
+    /// 磁盘 IO 刻意**不持区锁**：`zones` 那把锁是每个缓存请求都要过的公共路径，把一次
+    /// body 读取塞进去会把互不相关的请求串起来。代价是读回后再走一遍写入路径提升，
+    /// 期间别的请求可能已经提升过同一条——覆盖写无害。
+    ///
+    /// 只服务未过期的冷条目：过期回放在这里是内存语义（`use_stale` 的滞留窗口），
+    /// 磁盘上留着的过期响应既不该被当成新鲜内容，也不该悄悄变成 5 分钟前的版本。
+    fn cold_read(&self, zone: &str, key: &str) -> (CacheHit, Option<Arc<CachedResponse>>, bool) {
+        let Some(store) = self.disk_for(zone) else {
+            return (CacheHit::Miss, None, false);
+        };
+        let Some(cold) = store.read(key, false) else {
+            return (CacheHit::Miss, None, false);
+        };
+        let Some(resp) = decode_response(&cold.value) else {
+            // 解不出来就摘掉：留着它，每次冷命中都要重新付一次读 + 失败
+            store.forget(key);
+            return (CacheHit::Miss, None, false);
+        };
+        let left = cold
+            .expires
+            .map(|t| t - crate::disk_cache::epoch_now())
+            .filter(|s| *s > 0.0)
+            .map(Duration::from_secs_f64);
+        let Some(ttl) = left else {
+            store.forget(key);
+            return (CacheHit::Miss, None, false);
+        };
+        self.promote(zone, key, resp.clone(), ttl);
+        (CacheHit::Hit, Some(Arc::new(resp)), true)
+    }
+
+    /// 冷条目提升回内存。走的正是普通写入路径（包括学习的准入闸门），
+    /// 所以"磁盘上有"不等于"内存里给它留了位置"——一次性流量照旧挤不动热对象。
+    fn promote(&self, zone: &str, key: &str, resp: CachedResponse, ttl: Duration) {
+        self.store_with_grace(zone, key, resp, ttl, STALE_GRACE, false);
+        if let Some(store) = self.disk_for(zone) {
+            store.note_promoted();
+        }
     }
 
     fn lookup_impl(
@@ -490,8 +754,13 @@ impl ProxyCache {
                     z.admission_rejected += 1;
                     return;
                 }
-                if z.remove(&victim).is_some() {
+                let slot = z.remove(&victim);
+                if slot.is_some() {
                     z.evicted_cold += 1;
+                }
+                if let Some(slot) = slot {
+                    let freq = Self::victim_freq(z, &victim);
+                    self.spill_slot(zone, &victim, &slot, freq);
                 }
             }
         }
@@ -520,17 +789,23 @@ impl ProxyCache {
         if z.stores % 128 == 0 {
             Self::cleanup(z, now);
         }
-        Self::trim(z);
+        self.trim(zone, z);
     }
 
     /// 淘汰到容量上限：未学习时是纯 LRU（取最久未使用），学习开启时从最老窗口里
     /// 挑估计频率最低的那个——被访问得更勤的条目（包括 VIP 加权过的）更容易留下来。
-    fn trim(z: &mut Zone) {
+    /// 被挤掉且还新鲜的条目交给冷层（配了 `disk=on` 才有这一步）。
+    fn trim(&self, zone: &str, z: &mut Zone) {
         while z.entries.len() > z.capacity {
             if z.sketch.is_some() {
                 if let Some((victim, _)) = z.coldest_in_window() {
-                    if z.remove(&victim).is_some() {
+                    let slot = z.remove(&victim);
+                    if slot.is_some() {
                         z.evicted_cold += 1;
+                    }
+                    if let Some(slot) = slot {
+                        let freq = Self::victim_freq(z, &victim);
+                        self.spill_slot(zone, &victim, &slot, freq);
                     }
                     continue;
                 }
@@ -538,8 +813,43 @@ impl ProxyCache {
             let Some((_, key)) = z.lru.pop_first() else {
                 break;
             };
-            z.entries.remove(&key);
+            let slot = z.entries.remove(&key);
+            if let Some(slot) = slot {
+                let freq = Self::victim_freq(z, &key);
+                self.spill_slot(zone, &key, &slot, freq);
+            }
         }
+    }
+
+    /// 淘汰受害者的频次口径：学习开着就用草图估计（与内存准入同一个数，一次性流量
+    /// 既进不了内存也落不了盘）；没学就退回请求计数，上限截到 1024 免得计数把门形同虚设。
+    fn victim_freq(z: &Zone, key: &str) -> f32 {
+        if let Some(sk) = z.sketch.as_ref() {
+            return sk.estimate(key) as f32;
+        }
+        z.uses.get(key).copied().unwrap_or(0).min(1024) as f32
+    }
+
+    /// 把一条要被扔掉的内存条目交给冷层。
+    ///
+    /// 这里只付"准入判定 + 序列化 + 入队"的成本：文件写由 store 自己的写线程做
+    /// （temp+rename），所以淘汰路径不会被磁盘拖住。过期的条目不落盘——冷层里堆满
+    /// 过期响应只会让 `max_size` 提前饱和，把还新鲜的对象挤出去。
+    fn spill_slot(&self, zone: &str, key: &str, slot: &Slot, freq: f32) {
+        let Some(store) = self.disk_for(zone) else {
+            return;
+        };
+        let now = Instant::now();
+        let left = slot.expires.saturating_duration_since(now);
+        if left.is_zero() {
+            return;
+        }
+        let expires = epoch_from_instant(now, slot.expires);
+        if !store.admit(freq, slot.resp.body.len(), Some(expires)) {
+            return;
+        }
+        let payload = encode_response(&slot.resp);
+        store.spill(key, &payload, Some(expires), freq);
     }
 
     /// 清理超过 stale 滞留期的条目，并压缩无人再查询的 min_uses 计数。
@@ -575,6 +885,11 @@ impl ProxyCache {
     /// 主动失效一个 key（proxy_cache off/配置变更时可用），返回是否删除。
     #[allow(dead_code)]
     pub fn invalidate(&self, zone: &str, key: &str) -> bool {
+        // 冷层里的副本一起摘：只删内存的话，下一条同 key 请求会从磁盘把"已经作废"的
+        // 响应重新提升回来，等于这次失效白做。冷层没有这条时 forget 是纯索引操作。
+        if let Some(store) = self.disk_for(zone) {
+            store.forget(key);
+        }
         let mut g = self.zones.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(z) = g.get_mut(zone) {
             z.uses.remove(key);
@@ -814,11 +1129,11 @@ mod tests {
     #[test]
     fn miss_then_hit_then_expire() {
         let c = ProxyCache::new();
-        let (hit, _, count) = c.lookup("z", "k");
+        let (hit, _, count, _) = c.lookup("z", "k");
         assert_eq!(hit, CacheHit::Miss);
         assert_eq!(count, 1);
         c.store("z", "k", entry(), Duration::from_secs(60));
-        let (hit, resp, _) = c.lookup("z", "k");
+        let (hit, resp, _, _) = c.lookup("z", "k");
         assert_eq!(hit, CacheHit::Hit);
         assert_eq!(&resp.unwrap().body[..], b"hi");
     }
@@ -833,7 +1148,7 @@ mod tests {
             let z = g.get_mut("z").unwrap();
             z.entries.get_mut("k").unwrap().expires = Instant::now() - Duration::from_secs(1);
         }
-        let (hit, _, _) = c.lookup("z", "k");
+        let (hit, _, _, _) = c.lookup("z", "k");
         assert_eq!(hit, CacheHit::Expired);
     }
 
@@ -848,7 +1163,7 @@ mod tests {
     fn use_count_increments() {
         let c = ProxyCache::new();
         for i in 1..=3 {
-            let (_, _, count) = c.lookup("z", "k");
+            let (_, _, count, _) = c.lookup("z", "k");
             assert_eq!(count, i);
         }
     }
@@ -1184,7 +1499,7 @@ mod tests {
         let c = ProxyCache::new();
         c.store("z", "k", entry(), Duration::from_secs(60));
         c.force_expire("z", "k", Duration::from_secs(30));
-        let (hit, resp, _) = c.lookup("z", "k");
+        let (hit, resp, _, _) = c.lookup("z", "k");
         assert_eq!(hit, CacheHit::Expired);
         assert_eq!(&resp.unwrap().body[..], b"hi");
         // 超过 stale 滞留期 → 真正删除，避免内存永久占用
@@ -1205,5 +1520,268 @@ mod tests {
         assert!(l2.try_lock_owned().is_ok());
         // 不同 key 互不影响
         assert!(!Arc::ptr_eq(&c.cache_lock("z", "k2"), &l1));
+    }
+
+    // ---------------------------------------------------------------- 磁盘冷层
+
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "onrouter-pcache-{}-{n}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn tier(dir: PathBuf, spill_after: f32) -> crate::disk_cache::DiskConfig {
+        crate::disk_cache::DiskConfig {
+            root: dir,
+            max_bytes: 8 * 1024 * 1024,
+            levels: vec![1, 2],
+            inactive: Duration::ZERO,
+            spill_after,
+            max_value: 1024 * 1024,
+        }
+    }
+
+    fn entry_body(body: &[u8]) -> CachedResponse {
+        CachedResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "text/plain".into())],
+            body: Arc::new(Bytes::from(body.to_vec())),
+        }
+    }
+
+    /// 一个容量只有 `cap` 条、并且挂了冷层的缓存；返回的 store 供测试读账目。
+    fn cache_with_tier(cap: usize, cfg: crate::disk_cache::DiskConfig) -> (Arc<ProxyCache>, DiskStore) {
+        let store = DiskStore::open(cfg, None).expect("冷层应能打开");
+        let mut disks = HashMap::new();
+        disks.insert("z".to_string(), store.clone());
+        let mut caps = HashMap::new();
+        caps.insert("z".to_string(), cap);
+        let c = ProxyCache::with_capacities(caps, Arc::new(crate::learning::Learning::default()));
+        c.attach_disks(disks);
+        (c, store)
+    }
+
+    #[test]
+    fn cold_payload_round_trips() {
+        let resp = CachedResponse {
+            status: 201,
+            headers: vec![
+                ("content-type".into(), "text/plain; charset=utf-8".into()),
+                ("x-odd".into(), "a\"b\\c".into()),
+                ("set-cookie".into(), "sid=9; Path=/".into()),
+            ],
+            body: Arc::new(Bytes::from_static(b"hello body")),
+        };
+        let back = decode_response(&encode_response(&resp)).expect("应能解回原样");
+        assert_eq!(back.status, 201);
+        assert_eq!(back.headers, resp.headers, "头部顺序与内容都要原样回来");
+        assert_eq!(&back.body[..], b"hello body");
+        // 空 body 也是合法条目（204 这类）
+        let empty = CachedResponse {
+            status: 204,
+            headers: vec![],
+            body: Arc::new(Bytes::new()),
+        };
+        let back = decode_response(&encode_response(&empty)).expect("空体也要能解回");
+        assert_eq!(back.status, 204);
+        assert!(back.headers.is_empty());
+        assert!(back.body.is_empty());
+    }
+
+    #[test]
+    fn cold_payload_rejects_mangling() {
+        let good = encode_response(&entry_body(b"payload-bytes"));
+        // 截断：长度字段说 13 字节，实际少一个
+        assert!(decode_response(&good[..good.len() - 1]).is_none());
+        // magic 坏 / 版本不认识
+        let mut bad_magic = good.clone();
+        bad_magic[0] = b'X';
+        assert!(decode_response(&bad_magic).is_none());
+        let mut bad_version = good.clone();
+        bad_version[4] = 99;
+        assert!(decode_response(&bad_version).is_none());
+        // 头部数量撒谎（超过 RESP_HEADER_CAP）
+        let mut many = good.clone();
+        many[7..9].copy_from_slice(&513u16.to_le_bytes());
+        assert!(decode_response(&many).is_none());
+        // 尾随字节：条目必须正好用完输入
+        let mut extra = good.clone();
+        extra.push(0);
+        assert!(decode_response(&extra).is_none());
+        assert!(decode_response(&[]).is_none());
+    }
+
+    #[test]
+    fn evicted_victim_spills_and_reads_back() {
+        let dir = tmpdir("spill");
+        let (c, store) = cache_with_tier(2, tier(dir.clone(), 0.0));
+        c.store("z", "a", entry_body(b"AAA"), Duration::from_secs(60));
+        c.store("z", "b", entry_body(b"BBB"), Duration::from_secs(60));
+        // 第三条挤掉最老的 a：a 还新鲜，所以进冷层而不是消失
+        c.store("z", "c", entry_body(b"CCC"), Duration::from_secs(60));
+        store.flush_pending();
+        assert_eq!(store.stats().spilled.load(Ordering::Relaxed), 1);
+        assert!(c.len("z") <= 2, "内存条目仍受 keys_zone 容量约束");
+
+        let (hit, resp, _, from_disk) = c.lookup("z", "a");
+        assert_eq!(hit, CacheHit::Hit, "内存没有但磁盘有 → 仍是命中");
+        assert!(from_disk, "第一次命中应标注来自冷层");
+        assert_eq!(&resp.expect("应有响应体").body[..], b"AAA");
+
+        // 提升回内存后，第二次命中就走在内存里了（层级标记只说这一次是从哪来的）
+        let (_, _, _, from_disk) = c.lookup("z", "a");
+        assert!(!from_disk, "已提升，不该再报冷层");
+        assert_eq!(store.stats().promoted.load(Ordering::Relaxed), 1);
+        assert_eq!(store.stats().cold_hit.load(Ordering::Relaxed), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_gate_follows_the_frequency_ledger() {
+        // spill_after=3：从没被复查过的对象不值得落盘——一次性流量不该把磁盘写满；
+        // 而被访问到阈值的对象照样进冷层。门槛两侧都要有证据，否则这个数就是摆设。
+        let dir = tmpdir("gate");
+        let (c, store) = cache_with_tier(2, tier(dir.clone(), 3.0));
+        c.store("z", "a", entry_body(b"AAA"), Duration::from_secs(60));
+        c.store("z", "b", entry_body(b"BBB"), Duration::from_secs(60));
+        c.store("z", "c", entry_body(b"CCC"), Duration::from_secs(60)); // 挤掉 a（uses=0）
+        store.flush_pending();
+        assert_eq!(store.stats().spilled.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            store.entries(),
+            0,
+            "被门槛挡下的条目不能在冷层索引里留下记录（目录本身有 levels 分片子目录，所以看索引）"
+        );
+        let (hit, _, _, from_disk) = c.lookup("z", "a");
+        assert_eq!(hit, CacheHit::Miss);
+        assert!(!from_disk);
+
+        for _ in 0..3 {
+            c.note_use("z", "b");
+        }
+        c.store("z", "d", entry_body(b"DDD"), Duration::from_secs(60)); // 挤掉 b（uses=3）
+        store.flush_pending();
+        assert_eq!(store.stats().spilled.load(Ordering::Relaxed), 1);
+        let (hit, resp, _, from_disk) = c.lookup("z", "b");
+        assert_eq!(hit, CacheHit::Hit, "达到阈值的对象才配进冷层");
+        assert!(from_disk);
+        assert_eq!(&resp.unwrap().body[..], b"BBB");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_entries_are_not_spilled() {
+        // 落盘只收"还新鲜"的条目：过期响应堆在冷层里只会把 max_size 提前占满
+        let dir = tmpdir("expired");
+        let (c, store) = cache_with_tier(2, tier(dir.clone(), 0.0));
+        c.store("z", "a", entry_body(b"AAA"), Duration::from_secs(60));
+        c.store("z", "b", entry_body(b"BBB"), Duration::from_secs(60));
+        c.force_expire("z", "a", Duration::ZERO);
+        c.store("z", "c", entry_body(b"CCC"), Duration::from_secs(60));
+        store.flush_pending();
+        let st = store.stats();
+        let spilled = st.spilled.load(Ordering::Relaxed);
+        let _ = spilled;
+        // a 已过期 → 它出局时不落盘；这里只要求"过期条目没进冷层索引"
+        assert!(!store.has("a"), "过期条目不该被留在冷层");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_tier_means_no_disk_traffic_at_all() {
+        let mut caps = HashMap::new();
+        caps.insert("z".to_string(), 1usize);
+        let c = ProxyCache::with_capacities(caps, Arc::new(crate::learning::Learning::default()));
+        assert!(c.disk_for("z").is_none(), "没配 disk=on 就没有冷层");
+        c.store("z", "a", entry_body(b"AAA"), Duration::from_secs(60));
+        c.store("z", "b", entry_body(b"BBB"), Duration::from_secs(60));
+        // a 被挤掉了，但没有冷层 → 老老实实回源，且第四项永远是 false
+        let (hit, _, _, from_disk) = c.lookup("z", "a");
+        assert_eq!(hit, CacheHit::Miss);
+        assert!(!from_disk);
+    }
+
+    #[test]
+    fn invalidate_drops_the_cold_copy_too() {
+        let dir = tmpdir("invalidate");
+        let (c, store) = cache_with_tier(2, tier(dir.clone(), 0.0));
+        c.store("z", "a", entry_body(b"AAA"), Duration::from_secs(60));
+        c.store("z", "b", entry_body(b"BBB"), Duration::from_secs(60));
+        c.store("z", "c", entry_body(b"CCC"), Duration::from_secs(60));
+        store.flush_pending();
+        assert!(store.has("a"), "前置条件：a 已在冷层");
+        c.invalidate("z", "a");
+        assert!(!store.has("a"), "失效必须连冷层一起摘，否则下一条请求会把它读回来");
+        let (hit, _, _, _) = c.lookup("z", "a");
+        assert_eq!(hit, CacheHit::Miss);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_recovers_the_cold_tier_by_scanning() {
+        // 模拟重启：同一目录再开一次 store，索引由扫目录重建，冷命中照旧成立
+        let dir = tmpdir("warm");
+        {
+            let (c, store) = cache_with_tier(2, tier(dir.clone(), 0.0));
+            c.store("z", "a", entry_body(b"AAA"), Duration::from_secs(600));
+            c.store("z", "b", entry_body(b"BBB"), Duration::from_secs(600));
+            c.store("z", "c", entry_body(b"CCC"), Duration::from_secs(600));
+            store.flush_pending();
+        }
+        let cfg = tier(dir.clone(), 0.0);
+        let store = DiskStore::open(cfg, None).expect("重启后应能重新打开冷层");
+        assert_eq!(store.stats().warm_recovered.load(Ordering::Relaxed), 1);
+        let mut disks = HashMap::new();
+        disks.insert("z".to_string(), store.clone());
+        let mut caps = HashMap::new();
+        caps.insert("z".to_string(), 2usize);
+        let c = ProxyCache::with_capacities(caps, Arc::new(crate::learning::Learning::default()));
+        c.attach_disks(disks);
+        let (hit, resp, _, from_disk) = c.lookup("z", "a");
+        assert_eq!(hit, CacheHit::Hit, "上一个进程落盘的响应，新进程仍不该打后端");
+        assert!(from_disk);
+        assert_eq!(&resp.expect("重启后仍能读到原 body").body[..], b"AAA");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_cold_entry_is_dropped_and_reports_miss() {
+        let dir = tmpdir("corrupt");
+        let cfg = tier(dir.clone(), 0.0);
+        // 先造一条内容坏掉的冷层条目（合法外壳 + 无法解析的 payload）
+        let store = DiskStore::open(cfg, None).unwrap();
+        assert!(store.spill("a", b"not-a-response-payload", Some(crate::disk_cache::epoch_now() + 60.0), 1.0));
+        store.flush_pending();
+        let mut disks = HashMap::new();
+        disks.insert("z".to_string(), store.clone());
+        let c = ProxyCache::with_capacities(HashMap::new(), Arc::new(crate::learning::Learning::default()));
+        c.attach_disks(disks);
+        let (hit, _, _, from_disk) = c.lookup("z", "a");
+        assert_eq!(hit, CacheHit::Miss, "解析不出来的条目不能当成命中发出去");
+        assert!(!from_disk);
+        assert!(!store.has("a"), "坏条目应被顺手摘掉，免得每次都重付一次读+失败");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn describe_disk_lists_tiers_in_a_stable_order() {
+        let mut specs = HashMap::new();
+        specs.insert("pages".to_string(), tier(tmpdir("d1"), 1.0));
+        specs.insert("api".to_string(), tier(tmpdir("d2"), 2.5));
+        let lines = ProxyCache::describe_disk(&specs);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("区 api"), "{lines:?}");
+        assert!(lines[1].contains("区 pages"), "{lines:?}");
+        assert!(lines[0].contains("spill_after=2.5"), "{lines:?}");
+        assert!(lines[0].contains("levels=1:2"), "{lines:?}");
+        assert!(ProxyCache::describe_disk(&HashMap::new()).is_empty());
     }
 }

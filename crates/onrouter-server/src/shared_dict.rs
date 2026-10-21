@@ -1022,7 +1022,7 @@ pub struct SharedDicts {
 
 /// 比较两个 `disk=` 根目录是否指向同一处：优先问操作系统（能识别符号链接、`./`
 /// 与大小写差异），目录还不存在时退回按路径分量比较。
-fn canonical_root(p: &std::path::Path) -> PathBuf {
+pub(crate) fn canonical_root(p: &std::path::Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| {
         let mut out = PathBuf::new();
         for c in p.components() {

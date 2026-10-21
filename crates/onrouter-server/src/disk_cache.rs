@@ -87,6 +87,12 @@ fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// 冷层用的同一个时钟，暴露给 DICT 之外的调用方（`proxy_cache` 落盘时要算绝对到期时刻）。
+/// 自己调 `SystemTime` 会引入第二套口径，条目 TTL 与索引记账就对不上了。
+pub fn epoch_now() -> f64 {
+    now_epoch()
+}
+
 /// 跨进程稳定的 key 哈希，用于目录分片与文件名。
 ///
 /// 不能用 `DefaultHasher`/`RandomState`：冷层路径必须能在进程重启后由同一个 key 重新
@@ -1451,18 +1457,58 @@ pub fn snapshot() -> Vec<(String, DiskStore)> {
 
 /// 后台维护入口：清扫每个区，返回本轮回收条数。
 pub fn sweep_all() -> usize {
-    snapshot().into_iter().map(|(_, store)| store.sweep()).sum()
+    snapshot()
+        .into_iter()
+        .chain(proxy_snapshot())
+        .map(|(_, store)| store.sweep())
+        .sum()
 }
 
 /// 停机前把排队中的落盘写完（有界等待）。
 pub fn flush_all_pending() {
-    for (_, store) in snapshot() {
+    for (_, store) in snapshot().into_iter().chain(proxy_snapshot()) {
         store.flush_pending();
     }
 }
 
 pub fn enabled() -> bool {
     !registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+}
+
+/// `proxy_cache` 的冷层登记表，与 DICT 那张分开。
+///
+/// 分开的理由只有一条：两家的 `/metrics` 家族不同名
+/// （`onrouter_dict_disk_*` / `onrouter_proxy_cache_disk_*`），合成一张表就会把响应缓存
+/// 的落盘账记到共享字典头上。维护任务与停机排空则同时覆盖两张表。
+static PROXY_REGISTRY: OnceLock<Mutex<Vec<(String, DiskStore)>>> = OnceLock::new();
+
+fn proxy_registry() -> &'static Mutex<Vec<(String, DiskStore)>> {
+    PROXY_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 替换 `proxy_cache` 的冷层登记，并排空被替换掉的旧 store（热重载与启动同一条路径）。
+pub fn register_proxy_zones(zones: Vec<(String, DiskStore)>) {
+    let old = {
+        let mut r = proxy_registry().lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *r, zones)
+    };
+    for (_, store) in &old {
+        store.flush_pending();
+    }
+}
+
+pub fn proxy_snapshot() -> Vec<(String, DiskStore)> {
+    proxy_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub fn proxy_enabled() -> bool {
+    !proxy_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_empty()

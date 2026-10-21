@@ -1674,27 +1674,38 @@ async fn process(
         let no_cache = cache_target.is_some() && cache_expr_truthy(&loc.proxy_no_cache, ctx);
         let lookup = match (&cache_target, bypass) {
             (Some((zone, key)), false) => {
-                let (hit, cached, count) = state.proxy_cache.lookup(zone, key);
-                Some((zone.clone(), key.clone(), hit, cached, count))
+                let (hit, cached, count, from_disk) = state.proxy_cache.lookup(zone, key);
+                Some((zone.clone(), key.clone(), hit, cached, count, from_disk))
             }
             _ => None,
         };
-        if let Some((_, _, CacheHit::Hit, Some(resp), _)) = &lookup {
-            let resp = Arc::clone(resp);
+        if let Some((_, _, CacheHit::Hit, Some(resp), _, from_disk)) = &lookup {
             ctx.cache_status = "HIT".to_string();
+            let resp = if *from_disk {
+                // 磁盘冷层供的命中：状态词仍是 HIT（nginx 的 `$upstream_cache_status` 词表里
+                // 没有"磁盘命中"这一档，客户端与 CDN 的判断逻辑不该被我们改宽度），
+                // 层级另用一个 ONRouter 自己的头说出来。
+                let mut marked = (**resp).clone();
+                marked
+                    .headers
+                    .push(("x-cache-tier".to_string(), "disk".to_string()));
+                Arc::new(marked)
+            } else {
+                Arc::clone(resp)
+            };
             return serve_from_cache(resp, loc, server, "HIT", ctx);
         }
         // 过期条目在 stale 滞留期内仍可被 use_stale 回放
         let stale_response = match &lookup {
-            Some((_, _, CacheHit::Expired, Some(resp), _)) => Some(Arc::clone(resp)),
+            Some((_, _, CacheHit::Expired, Some(resp), _, _)) => Some(Arc::clone(resp)),
             _ => None,
         };
         let status_tag = if bypass || (caching_zone.is_some() && cache_target.is_none()) {
             "BYPASS"
         } else {
             match &lookup {
-                Some((_, _, CacheHit::Expired, _, _)) => "EXPIRED",
-                Some((_, _, CacheHit::Miss, _, _)) => "MISS",
+                Some((_, _, CacheHit::Expired, _, _, _)) => "EXPIRED",
+                Some((_, _, CacheHit::Miss, _, _, _)) => "MISS",
                 _ => "",
             }
         };
@@ -1746,10 +1757,19 @@ async fn process(
                         };
                 }
                 if acquired.is_some() {
-                    let (hit, cached) = state.proxy_cache.peek(zone, key);
+                    let (hit, cached, from_disk) = state.proxy_cache.peek(zone, key);
                     if hit == CacheHit::Hit {
                         if let Some(resp) = cached {
                             ctx.cache_status = "HIT".to_string();
+                            let resp = if from_disk {
+                                let mut marked = (*resp).clone();
+                                marked
+                                    .headers
+                                    .push(("x-cache-tier".to_string(), "disk".to_string()));
+                                Arc::new(marked)
+                            } else {
+                                resp
+                            };
                             return serve_from_cache(resp, loc, server, "HIT", ctx);
                         }
                     }
@@ -1761,7 +1781,7 @@ async fn process(
 
         // min_uses 计数：bypass 请求不做 lookup，但仍要计入“第 N 次才写缓存”
         let use_count = match &lookup {
-            Some((_, _, _, _, c)) => *c,
+            Some((_, _, _, _, c, _)) => *c,
             None => match &cache_target {
                 Some((zone, key)) => state.proxy_cache.note_use(zone, key),
                 None => 0,

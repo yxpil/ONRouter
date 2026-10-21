@@ -458,6 +458,9 @@ pub struct Router {
     pub stream: Vec<StreamServer>,
     /// 顶层 `proxy_cache_path ... keys_zone=name:size` 换算出的每区条目上限
     pub cache_zones: HashMap<String, usize>,
+    /// 写了 `disk=on` 的 `proxy_cache_path` 区 → 该区的磁盘冷层配置（根目录已按配置文件
+    /// 所在目录解析）。不在这张表里的区一个字节都不落盘。
+    pub cache_disk: HashMap<String, crate::disk_cache::DiskConfig>,
     /// 顶层 `still_online_zone <名称> <容量>;` 换算出的每区**字节**预算。
     /// 副本存的是完整响应体，条数上限约束不了内存，所以这里按字节计。
     pub still_zones: HashMap<String, usize>,
@@ -2518,6 +2521,7 @@ impl Router {
 
         let stream = Self::parse_streams(config, &mut warnings)?;
         let cache_zones = Self::parse_cache_zones(config, &mut warnings);
+        let cache_disk = Self::parse_cache_disk(config, base_dir, &mut warnings)?;
         // 缓存学习引用未声明的 keys_zone：这行学习配置一行都不会生效（apply_learning 只遍历已存在的区）。
         // 与队列学习、副本区同一先例——写错区名硬失败，不该只在日志里飘过一行。
         for d in config
@@ -2653,6 +2657,7 @@ impl Router {
                 warnings,
                 stream,
                 cache_zones,
+                cache_disk,
                 still_zones,
                 split_routes,
             },
@@ -2702,6 +2707,152 @@ impl Router {
             out.insert(name.to_string(), capacity);
         }
         out
+    }
+
+    /// `proxy_cache_path <路径> ... keys_zone=<名>:<容量> disk=on ...;` 解析出的每区磁盘冷层。
+    ///
+    /// 机制与 `lua_shared_dict disk=` 完全同源（[`crate::disk_cache`]），开关写法不同：
+    /// DICT 那边 `disk=<路径>` 既当开关又给目录；这里的目录本来就是 `proxy_cache_path` 的第一个
+    /// 位置参数（nginx 配置就是这么写的），所以开关单独用 `disk=on` 表达。没写它的区连目录都不
+    /// 创建，落盘与冷读两条路径全程短路，行为与纯内存时代逐字节一致。
+    ///
+    /// 认的键：`max_size=`（冷层字节上限，默认 256m）、`levels=`（默认 1:2）、`inactive=`
+    /// （默认 0 = 不按闲置回收）、`spill_after=`（默认 1：被内存挤出去过一次的对象就值得留下）、
+    /// `max_value=`（默认 4m；响应体本来就比字典值大，沿用 DICT 的 64k 会让它形同虚设）。
+    /// `min_free_size=` / `use_temp_path=` 尚未实现——写出来只 warn，不静悄悄假装生效。
+    fn parse_cache_disk(
+        config: &Config,
+        base_dir: &PathBuf,
+        warnings: &mut Vec<String>,
+    ) -> Result<HashMap<String, crate::disk_cache::DiskConfig>, AppError> {
+        use crate::disk_cache::DiskConfig;
+        let mut out = HashMap::new();
+        for d in config
+            .root
+            .block
+            .iter()
+            .filter(|d| d.name == "proxy_cache_path")
+        {
+            let Some(spec) = d.args.iter().find_map(|a| a.strip_prefix("disk=")) else {
+                continue;
+            };
+            let spec = spec.trim();
+            if !spec.eq_ignore_ascii_case("on") && !spec.eq_ignore_ascii_case("off") {
+                warnings.push(format!(
+                    "顶层第 {} 行 proxy_cache_path 的 disk='{spec}' 无效（只认 on|off；冷层目录请用第一个位置参数），已忽略",
+                    d.line
+                ));
+                continue;
+            }
+            if spec.eq_ignore_ascii_case("off") {
+                continue;
+            }
+            let Some(kz) = d.args.iter().find_map(|a| a.strip_prefix("keys_zone=")) else {
+                warnings.push(format!(
+                    "顶层第 {} 行 proxy_cache_path 写了 disk=on 但没有 keys_zone=<名称>:<容量>，冷层无处可挂，已忽略",
+                    d.line
+                ));
+                continue;
+            };
+            let name = kz.split_once(':').map(|(n, _)| n).unwrap_or(kz).trim();
+            if name.is_empty() {
+                warnings.push(format!(
+                    "顶层第 {} 行 proxy_cache_path 的 keys_zone 缺少名称，冷层已忽略",
+                    d.line
+                ));
+                continue;
+            }
+            let Some(path) = d.arg(0) else {
+                warnings.push(format!(
+                    "顶层第 {} 行 proxy_cache_path disk=on 需要目录（`proxy_cache_path <目录> keys_zone=…`），已忽略",
+                    d.line
+                ));
+                continue;
+            };
+            let mut cfg = DiskConfig {
+                root: crate::resolve_path(path, base_dir),
+                max_bytes: crate::disk_cache::DEFAULT_MAX_DISK,
+                levels: vec![1, 2],
+                inactive: std::time::Duration::ZERO,
+                // 默认 1 而不是 DICT 那边的 3：内存里能走到"被淘汰"这一步的对象本来就已经
+                // 是容量压力的受害者，门槛再抬高只会让冷层空着。
+                spill_after: 1.0,
+                max_value: 4 * 1024 * 1024,
+            };
+            for a in &d.args {
+                let Some((k, v)) = a.split_once('=') else { continue };
+                let (k, v) = (k.trim(), v.trim());
+                match k {
+                    "max_size" => match parse_size(v) {
+                        Some(n) => cfg.max_bytes = n,
+                        None => {
+                            warnings.push(format!(
+                                "顶层第 {} 行 proxy_cache_path 的 max_size='{v}' 非法，改用默认 {} 字节",
+                                d.line, cfg.max_bytes
+                            ));
+                        }
+                    },
+                    "levels" => match crate::disk_cache::parse_levels(v) {
+                        Some(l) => cfg.levels = l,
+                        None => warnings.push(format!(
+                            "顶层第 {} 行 proxy_cache_path 的 levels='{v}' 非法（对标 nginx：1~3 级，每级 1..3），改用默认 1:2",
+                            d.line
+                        )),
+                    },
+                    "inactive" => match crate::settings::parse_duration(v) {
+                        Some(t) => cfg.inactive = t,
+                        None => warnings.push(format!(
+                            "顶层第 {} 行 proxy_cache_path 的 inactive='{v}' 非法，改为不按闲置回收",
+                            d.line
+                        )),
+                    },
+                    "spill_after" => match v.parse::<f32>() {
+                        Ok(n) => cfg.spill_after = n,
+                        Err(_) => warnings.push(format!(
+                            "顶层第 {} 行 proxy_cache_path 的 spill_after='{v}' 非法（要一个数字），改用默认 1",
+                            d.line
+                        )),
+                    },
+                    "max_value" => match parse_size(v) {
+                        Some(n) => cfg.max_value = n as usize,
+                        None => warnings.push(format!(
+                            "顶层第 {} 行 proxy_cache_path 的 max_value='{v}' 非法，改用默认 4m",
+                            d.line
+                        )),
+                    },
+                    // nginx 认识但 ONRouter 还没实现的两个容量/落盘开关：点名说清楚，
+                    // 免得运维以为配上了（其余未知键照旧由 parse_cache_zones 的口径处理）。
+                    "min_free_size" | "use_temp_path" => {
+                        warnings.push(format!(
+                            "顶层第 {} 行 proxy_cache_path 的 {k}= 暂未实现，冷层按磁盘上限（max_size）自行收敛",
+                            d.line
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            let root = cfg.root.clone();
+            if let Some(prev) = out.insert(name.to_string(), cfg) {
+                warnings.push(format!(
+                    "顶层有两条 proxy_cache_path 都给区 '{name}' 声明了冷层（{:?} 与 {:?}），按后一条生效",
+                    prev.root, root
+                ));
+            }
+        }
+        // 两个区指向同一个目录会让两边的条目互相踩（同一把 key 哈希、同一份索引），
+        // 与 `lua_shared_dict disk=` 同一先例：硬失败，让 -t 就拦下来。
+        let mut roots: Vec<(PathBuf, String)> = Vec::new();
+        for (name, cfg) in out.iter() {
+            let mine = crate::shared_dict::canonical_root(&cfg.root);
+            if let Some((_, other)) = roots.iter().find(|(p, _)| *p == mine) {
+                return Err(AppError::Other(format!(
+                    "proxy_cache_path 区 '{name}' 的冷层目录 {:?} 与区 {other} 重复，两个区必须各用一个目录",
+                    cfg.root
+                )));
+            }
+            roots.push((mine, name.clone()));
+        }
+        Ok(out)
     }
 
     /// 顶层 `still_online_zone <名称> <容量>;`：容量直接按**字节**作为该区预算
@@ -4677,6 +4828,153 @@ mod tests {
         let zones = Router::parse_cache_zones(&cfg("proxy_cache_path /tmp/c;"), &mut w);
         assert!(zones.is_empty());
         assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn proxy_cache_disk_tier_parses_its_own_knobs() {
+        let base = PathBuf::from("conf");
+        let conf = cfg("proxy_cache_path cache/pages keys_zone=pages:1m disk=on max_size=64m levels=2:2 inactive=5m spill_after=2 max_value=2m;");
+        let mut w = Vec::new();
+        let disks = Router::parse_cache_disk(&conf, &base, &mut w).expect("应能解析");
+        assert!(w.is_empty(), "{w:?}");
+        let d = disks.get("pages").expect("冷层应挂在 pages 区");
+        assert_eq!(d.max_bytes, 64 * 1024 * 1024);
+        assert_eq!(d.levels, vec![2, 2]);
+        assert_eq!(d.inactive, std::time::Duration::from_secs(300));
+        assert_eq!(d.spill_after, 2.0);
+        assert_eq!(d.max_value, 2 * 1024 * 1024);
+        // 目录就是配置里的第一个位置参数（nginx 用户写的那个），相对路径按配置文件所在目录解析
+        assert_eq!(d.root, base.join("cache").join("pages"));
+    }
+
+    #[test]
+    fn proxy_cache_disk_tier_defaults_are_ours_not_dicts() {
+        let conf = cfg("proxy_cache_path cache/d keys_zone=d:1m disk=on;");
+        let mut w = Vec::new();
+        let d = Router::parse_cache_disk(&conf, &PathBuf::from("."), &mut w)
+            .unwrap()
+            .remove("d")
+            .expect("disk=on 应建冷层");
+        assert!(w.is_empty(), "{w:?}");
+        // 响应体比字典值大得多：沿用 DICT 的 64k/3.0 会让这两项形同虚设
+        assert_eq!(d.max_value, 4 * 1024 * 1024);
+        assert_eq!(d.spill_after, 1.0);
+        assert_eq!(d.max_bytes, crate::disk_cache::DEFAULT_MAX_DISK);
+        assert_eq!(d.levels, vec![1, 2]);
+        assert_eq!(d.inactive, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn proxy_cache_disk_tier_is_opt_in() {
+        for line in [
+            "proxy_cache_path cache/a keys_zone=pages:1m;",
+            "proxy_cache_path cache/a keys_zone=pages:1m disk=off;",
+            "proxy_cache_path cache/a keys_zone=pages:1m levels=1:2 max_size=1g;",
+        ] {
+            let mut w = Vec::new();
+            let disks =
+                Router::parse_cache_disk(&cfg(line), &PathBuf::from("."), &mut w).expect(line);
+            assert!(disks.is_empty(), "{line} 不该建冷层：{disks:?}");
+            assert!(
+                !w.iter().any(|x| x.contains("proxy_cache_path")),
+                "不该告警：{w:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_cache_disk_bad_values_are_named_not_swallowed() {
+        // disk= 只认 on|off：写错了这行整体不生效，并且要说出来
+        let mut w = Vec::new();
+        let d = Router::parse_cache_disk(
+            &cfg("proxy_cache_path cache/a keys_zone=pages:1m disk=sure;"),
+            &PathBuf::from("."),
+            &mut w,
+        )
+        .unwrap();
+        assert!(d.is_empty());
+        assert!(w.iter().any(|x| x.contains("disk='sure'")), "{w:?}");
+
+        // 写了 disk=on 却忘了 keys_zone：冷层无处可挂
+        let mut w2 = Vec::new();
+        let d2 = Router::parse_cache_disk(
+            &cfg("proxy_cache_path cache/a disk=on;"),
+            &PathBuf::from("."),
+            &mut w2,
+        )
+        .unwrap();
+        assert!(d2.is_empty());
+        assert!(w2.iter().any(|x| x.contains("keys_zone")), "{w2:?}");
+
+        // 坏的单位值：回到默认并点名，不能静悄悄按别的意思跑
+        let mut w3 = Vec::new();
+        let d3 = Router::parse_cache_disk(
+            &cfg("proxy_cache_path cache/a keys_zone=pages:1m disk=on max_size=lots inactive=soon levels=9:9 spill_after=hot max_value=big;"),
+            &PathBuf::from("."),
+            &mut w3,
+        )
+        .unwrap()
+        .remove("pages")
+        .expect("坏值只让单项退回默认，冷层本身仍应启用");
+        assert_eq!(d3.max_bytes, crate::disk_cache::DEFAULT_MAX_DISK);
+        assert_eq!(d3.levels, vec![1, 2]);
+        assert_eq!(d3.inactive, std::time::Duration::ZERO);
+        assert_eq!(d3.spill_after, 1.0);
+        assert_eq!(d3.max_value, 4 * 1024 * 1024);
+        for frag in ["max_size", "inactive", "levels", "spill_after", "max_value"] {
+            assert!(
+                w3.iter().any(|x| x.contains(frag)),
+                "{frag} 的坏值要被点名：{w3:?}"
+            );
+        }
+
+        // nginx 认识但我们还没实现的两个键：明说"暂未实现"，但冷层照常开
+        let mut w4 = Vec::new();
+        let d4 = Router::parse_cache_disk(
+            &cfg("proxy_cache_path cache/a keys_zone=pages:1m disk=on min_free_size=1g use_temp_path=off;"),
+            &PathBuf::from("."),
+            &mut w4,
+        )
+        .unwrap();
+        assert!(d4.contains_key("pages"));
+        assert_eq!(
+            w4.iter().filter(|x| x.contains("暂未实现")).count(),
+            2,
+            "{w4:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_cache_disk_two_zones_one_directory_hard_fails() {
+        // 同一目录两套索引会互相踩（同 key 同哈希），与 lua_shared_dict 同一先例：-t 就拦
+        let conf = cfg(
+            "proxy_cache_path cache/same keys_zone=a:1m disk=on;
+             proxy_cache_path cache/same keys_zone=b:1m disk=on;",
+        );
+        let mut w = Vec::new();
+        let r = Router::parse_cache_disk(&conf, &PathBuf::from("."), &mut w);
+        let Err(e) = r else {
+            panic!("两个区共用一个目录必须硬失败，得到 Ok");
+        };
+        assert!(e.to_string().contains("重复"), "{e}");
+    }
+
+    #[test]
+    fn proxy_cache_disk_zone_names_survive_build() {
+        // 走完整 build：disk 配置要真的挂到 Router 上，keys_zone 容量照常换算
+        let r = build(
+            r#"
+            worker_processes 1;
+            proxy_cache_path cache/pages keys_zone=pages:16m disk=on max_size=32m;
+            server {
+                listen 18199;
+                location / { proxy_pass http://127.0.0.1:18198; proxy_cache pages; }
+            }
+            "#,
+        );
+        assert_eq!(r.cache_zones.get("pages"), Some(&131072));
+        let d = r.cache_disk.get("pages").expect("build 后仍要有冷层配置");
+        assert_eq!(d.max_bytes, 32 * 1024 * 1024);
     }
 
     #[test]
