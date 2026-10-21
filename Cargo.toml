@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 
@@ -23,6 +23,10 @@ chrono = "0.4"
 # 响应 gzip 压缩（默认 rust/miniz_oxide 后端，纯 Rust，交叉编译友好，无 libz 依赖）
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 mlua = { version = "0.10", features = ["lua54", "vendored", "async", "send"] }
+# WASM 网关插件宿主：纯 Rust 解释器（无 JIT），带 fuel 计量与内存上限。
+wasmi = "0.31"
+# 文本格式 (.wat) 编译：测试与示例直接写可读的模块，生产加载 .wasm 字节。
+wat = "1"
 thiserror = "2"
 # 有界日志通道（std 的 SyncSender 不是 Sync，无法放进全局单例）
 crossbeam-channel = "0.5"

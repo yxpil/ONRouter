@@ -1753,6 +1753,7 @@ mod tests {
                 .collect(),
             star: None,
             stats: crate::engine::register_split_route(dest, &targets),
+            summary: None,
         }
     }
 

@@ -50,6 +50,39 @@ pub enum LeastTime {
     On,
 }
 
+/// 熔断器的三态（与 passive `max_fails` 并行，不是替代关系）：
+/// * `Closed`：正常放行，失败按窗口计数；
+/// * `Open`：窗口内失败达到阈值，全部请求立刻绕开该节点（不再浪费连接超时）；
+/// * `HalfOpen`：`open_for` 到期后放行**一个**探针请求，成功即闭合，失败重新打开。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+/// `circuit_breaker errors=… window=… open=…;`：可选的每节点熔断。
+/// 与 `max_fails`/`fail_timeout` 的区别：被动健康检查按**连续**失败降权，
+/// 熔断按**时间窗口内的失败数**打开，并且打开的节点连"试探流量"都收不到，
+/// 直到半开探针放行——这样一台已经宕机的后端不会在每个 `fail_timeout` 周期
+/// 都吃掉一批用户的连接超时。默认不配置 = 不启用，行为与旧版逐字节一致。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircuitBreaker {
+    pub errors: usize,
+    pub window: Duration,
+    pub open_for: Duration,
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        CircuitBreaker {
+            errors: 5,
+            window: Duration::from_secs(10),
+            open_for: Duration::from_secs(30),
+        }
+    }
+}
+
 /// EWMA 的样本上限：再慢的响应也不该把某个节点的记忆拉爆（超时/失败根本不入账，见 `note_latency`）。
 const MAX_SAMPLE_SECONDS: f64 = 30.0;
 /// 打分里的时延下限，防止"极快后端"把乘积压成 0 从而永远赢。
@@ -59,7 +92,7 @@ const MIN_LATENCY_SECONDS: f64 = 1e-6;
 /// 把它永久饿死。超过这个时长没样本，就当作"不知道它现在多快"，重新纳入探索（见 `known_ewma`）。
 const LT_EXPIRE_MULT: f64 = 4.0;
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -138,6 +171,15 @@ pub struct UpstreamServer {
     /// 第一个新样本几乎完全改写旧值——于是一次长暂停之后的旧记忆自然淡出，
     /// 不会让十分钟前的慢样本永远压着现在很快的节点。
     ewma_last_ms: AtomicU64,
+    /// 熔断：窗口内失败数、窗口起点、打开截止时间、半开探针占用、累计打开次数
+    cb_fails: AtomicUsize,
+    cb_first_fail_ms: AtomicU64,
+    cb_open_until_ms: AtomicU64,
+    cb_trial: AtomicBool,
+    cb_trips: AtomicU64,
+    /// 惰性重加入：上一次被"用户请求顺带探测"的时间与次数
+    lazy_last_ms: AtomicU64,
+    lazy_probes: AtomicU64,
 }
 
 impl UpstreamServer {
@@ -162,7 +204,119 @@ impl UpstreamServer {
             effective_weight: AtomicIsize::new(weight as isize),
             ewma_bits: AtomicU64::new(0),
             ewma_last_ms: AtomicU64::new(0),
+            cb_fails: AtomicUsize::new(0),
+            cb_first_fail_ms: AtomicU64::new(0),
+            cb_open_until_ms: AtomicU64::new(0),
+            cb_trial: AtomicBool::new(false),
+            cb_trips: AtomicU64::new(0),
+            lazy_last_ms: AtomicU64::new(0),
+            lazy_probes: AtomicU64::new(0),
         }
+    }
+
+    /// 当前熔断状态。`now >= open_until` 时必须由调用方把 Open 解读为 HalfOpen；
+    /// 这里直接返回 HalfOpen，让选点路径不必再记一个状态机变量。
+    pub fn circuit_state(&self, now: u64) -> CircuitState {
+        let until = self.cb_open_until_ms.load(Ordering::Relaxed);
+        if until == 0 {
+            CircuitState::Closed
+        } else if now < until {
+            CircuitState::Open
+        } else {
+            CircuitState::HalfOpen
+        }
+    }
+
+    /// 半开时只放行一个探针：CAS 抢到才算被选中。抢不到说明已有在途探针，
+    /// 这个节点本轮不可用（调用方把它从候选里摘掉再选）。
+    fn try_circuit_trial(&self) -> bool {
+        self.cb_trial
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn release_circuit_trial(&self) {
+        self.cb_trial.store(false, Ordering::Release);
+    }
+
+    fn circuit_success(&self, now: u64) {
+        let was = self.circuit_state(now);
+        self.cb_fails.store(0, Ordering::Relaxed);
+        self.cb_first_fail_ms.store(0, Ordering::Relaxed);
+        self.cb_open_until_ms.store(0, Ordering::Relaxed);
+        self.release_circuit_trial();
+        if was != CircuitState::Closed {
+            log_info!("熔断器：{} 探针成功，闭合", self.addr);
+        }
+    }
+
+    fn circuit_failure(&self, cb: &CircuitBreaker, now: u64) {
+        // 半开探针失败，或已经打开的节点再次失败：直接重新计时，不再数窗口。
+        let state = self.circuit_state(now);
+        if state != CircuitState::Closed {
+            self.cb_open_until_ms
+                .store(now + cb.open_for.as_millis() as u64, Ordering::Relaxed);
+            self.cb_fails.store(0, Ordering::Relaxed);
+            self.cb_first_fail_ms.store(0, Ordering::Relaxed);
+            self.release_circuit_trial();
+            log_warn!(
+                "熔断器：{} 探针失败，继续保持打开 {:.0}s",
+                self.addr,
+                cb.open_for.as_secs_f64()
+            );
+            return;
+        }
+        let window_ms = cb.window.as_millis() as u64;
+        let first = self.cb_first_fail_ms.load(Ordering::Relaxed);
+        if first == 0 || now.saturating_sub(first) > window_ms {
+            self.cb_first_fail_ms.store(now, Ordering::Relaxed);
+            self.cb_fails.store(1, Ordering::Relaxed);
+        } else {
+            self.cb_fails.fetch_add(1, Ordering::Relaxed);
+        }
+        let fails = self.cb_fails.load(Ordering::Relaxed);
+        if fails >= cb.errors.max(1) {
+            self.cb_open_until_ms
+                .store(now + cb.open_for.as_millis() as u64, Ordering::Relaxed);
+            self.cb_fails.store(0, Ordering::Relaxed);
+            self.cb_first_fail_ms.store(0, Ordering::Relaxed);
+            self.cb_trips.fetch_add(1, Ordering::Relaxed);
+            log_warn!(
+                "熔断器：{} 在 {:.0}s 内失败 {} 次，打开 {:.0}s（期间不接新请求）",
+                self.addr,
+                cb.window.as_secs_f64(),
+                fails,
+                cb.open_for.as_secs_f64()
+            );
+        }
+    }
+
+    pub fn circuit_trips(&self) -> u64 {
+        self.cb_trips.load(Ordering::Relaxed)
+    }
+
+    pub fn lazy_probes(&self) -> u64 {
+        self.lazy_probes.load(Ordering::Relaxed)
+    }
+
+    /// 被动摘除期内的节点（权重被降为 0，或仍在 fail_timeout 内）。
+    pub(crate) fn passively_down(&self, now: u64) -> bool {
+        self.down_until.load(Ordering::Relaxed) > now || self.effective() == 0
+    }
+
+    /// 调度器当前是否会考虑这个节点（不含并发额度）。指标与选点共用同一判定，
+    /// 避免“面板显示可选、实际选不到”。惰性恢复在这里先走一遍，到期节点不会因为
+    /// 恰好没有流量而在指标里一直显示为不可用。
+    pub(crate) fn available_for_schedule(
+        &self,
+        now: u64,
+        circuit: Option<&CircuitBreaker>,
+    ) -> bool {
+        self.restore_if_expired(now);
+        !self.manually_down
+            && self.healthy.load(Ordering::Relaxed)
+            && !self.passively_down(now)
+            && !circuit.is_some_and(|_| self.circuit_state(now) == CircuitState::Open)
     }
 
     /// 当前 EWMA 估计（秒）。`0.0` = 还没有样本（哨兵，见 `ewma_bits`）。
@@ -196,9 +350,14 @@ impl UpstreamServer {
         self.max_conns == 0 || self.conns.load(Ordering::Relaxed) < self.max_conns
     }
 
-    /// 可选节点：没被标死、主动探测通过、并发额度未满
-    fn selectable(&self) -> bool {
-        !self.manually_down && self.healthy.load(Ordering::Relaxed) && self.conns_available()
+    /// 可选节点：没被标死、主动探测通过、并发额度未满，且熔断器没有完全打开。
+    /// 注意这里**不**排除被动摘除的节点：全池都在摘除期时要留一台做兜底试探，
+    /// 否则池永远回不来（指标里的 `server_available` 是另一个更严格的判定）。
+    fn selectable(&self, circuit: Option<&CircuitBreaker>, now: u64) -> bool {
+        !self.manually_down
+            && self.healthy.load(Ordering::Relaxed)
+            && self.conns_available()
+            && !circuit.is_some_and(|_| self.circuit_state(now) == CircuitState::Open)
     }
 
     /// 满 max_fails 次：有效权重降一档（最低 0）并进入摘除期。
@@ -212,8 +371,12 @@ impl UpstreamServer {
         self.fails.store(0, Ordering::Relaxed);
         let next = (self.effective() - self.weight as isize).max(0);
         self.effective_weight.store(next, Ordering::Relaxed);
+        let now = now_millis();
         self.down_until
-            .store(now_millis() + (self.fail_timeout * 1000.0) as u64, Ordering::Relaxed);
+            .store(now + (self.fail_timeout * 1000.0) as u64, Ordering::Relaxed);
+        // 惰性重加入的时钟从"这次失败"开始算：刚摘除就立刻再试探没有意义，
+        // 会让一台宕机后端持续吃掉本已分给健康节点的请求。
+        self.lazy_last_ms.store(now, Ordering::Relaxed);
         log_warn!(
             "upstream 节点 {} 连续失败 {n} 次，降权至 {next}，摘除 {:.0}s",
             self.addr,
@@ -272,6 +435,11 @@ pub struct Upstream {
     pub least_time: LeastTime,
     /// EWMA 的时间窗口（秒）：`least_time_window`，默认 5s
     pub lt_window: f64,
+    /// `circuit_breaker …;`：None = 不启用（默认）
+    pub circuit: Option<CircuitBreaker>,
+    /// `lazy_rejoin <interval>;`：被动摘除的节点每隔 interval 由一次真实用户请求
+    /// 顺带探测；成功后自动恢复权重。None = 只靠 fail_timeout（旧行为）。
+    pub lazy_rejoin: Option<Duration>,
     /// P2C 的两个候选从这个非加密 PRNG 抽（splitmix64）。选点不需要密码学随机，
     /// 但需要**便宜**：一个原子 fetch_add 就够，不能每请求分配。
     rng: AtomicU64,
@@ -296,53 +464,123 @@ impl Upstream {
             s.restore_if_expired(now);
         }
 
-        let mut group = self.candidates(false, tried);
-        if group.is_empty() {
-            group = self.candidates(true, tried);
-        }
-        if group.is_empty() {
-            return None;
-        }
-        // 摘除期内的节点权重已归零：只要还有正权重节点就不给它流量；
-        // 全组都是零时保留原组，让流量去试探最早失败的节点（否则一旦全摘除就再也起不来）。
-        // 原地 retain 而不是再 collect 一个 Vec：取节点在每请求热路径上，省一次分配。
-        if group.iter().any(|i| self.servers[*i].effective() > 0) {
-            group.retain(|i| self.servers[*i].effective() > 0);
+        // 惰性重加入优先于常规选点：每 interval 只让**一个**真实请求去碰被动摘除的节点。
+        // 这与"全组都摘除时留一台试探"是两件事：那个兜底只在没人可用时发生，
+        // 而这里在其他节点健康时也会定期给宕机节点一次证明自己恢复的机会。
+        if let Some(interval) = self.lazy_rejoin {
+            if let Some(idx) = self.pick_lazy_probe(now, tried, interval) {
+                self.servers[idx].lazy_last_ms.store(now, Ordering::Relaxed);
+                self.servers[idx].lazy_probes.fetch_add(1, Ordering::Relaxed);
+                self.servers[idx].conns.fetch_add(1, Ordering::Relaxed);
+                return Some(UpstreamGuard {
+                    upstream: Arc::clone(self),
+                    idx,
+                    trial: false,
+                    reported: AtomicBool::new(false),
+                });
+            }
         }
 
-        let mut idx = match self.lb {
-            LoadBalance::RoundRobin => self.pick_swrr(&group),
-            LoadBalance::LeastConn => self.pick_least_conn(&group),
-            LoadBalance::IpHash => self.pick_ip_hash(client_ip, &group),
-        };
-        match self.least_time {
-            LeastTime::Off => {}
-            // 证据期：选点结果**必须**与 off 一致，只多算一次假想打分并记差分。
-            // 假想打分是纯读的（不碰 current_weight），所以不会污染上面已经走完了的 SWRR 轨迹。
-            LeastTime::Observe => {
-                if self.pick_least_time(&group) != idx {
-                    self.lt_would_differ.fetch_add(1, Ordering::Relaxed);
-                }
+        // 主组优先；主组因"半开探针已被占用"而选不出来时，也允许落到 backup 组。
+        for backup_group in [false, true] {
+            let mut group = self.candidates(backup_group, tried, now);
+            if group.is_empty() {
+                continue;
             }
-            LeastTime::On => {
-                if group.len() > 1 {
-                    self.lt_picked.fetch_add(1, Ordering::Relaxed);
-                    idx = self.pick_least_time(&group);
+            // 摘除期内的节点权重已归零：只要还有正权重节点就不给它流量；
+            // 全组都是零时保留原组，让流量去试探最早失败的节点（否则一旦全摘除就再也起不来）。
+            // 原地 retain 而不是再 collect 一个 Vec：取节点在每请求热路径上，省一次分配。
+            if group.iter().any(|i| self.servers[*i].effective() > 0) {
+                group.retain(|i| self.servers[*i].effective() > 0);
+            }
+            loop {
+                if group.is_empty() {
+                    break;
                 }
+                let mut idx = match self.lb {
+                    LoadBalance::RoundRobin => self.pick_swrr(&group),
+                    LoadBalance::LeastConn => self.pick_least_conn(&group),
+                    LoadBalance::IpHash => self.pick_ip_hash(client_ip, &group),
+                };
+                match self.least_time {
+                    LeastTime::Off => {}
+                    // 证据期：选点结果**必须**与 off 一致，只多算一次假想打分并记差分。
+                    // 假想打分是纯读的（不碰 current_weight），所以不会污染上面已经走完了的 SWRR 轨迹。
+                    LeastTime::Observe => {
+                        if self.pick_least_time(&group) != idx {
+                            self.lt_would_differ.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    LeastTime::On => {
+                        if group.len() > 1 {
+                            self.lt_picked.fetch_add(1, Ordering::Relaxed);
+                            idx = self.pick_least_time(&group);
+                        }
+                    }
+                }
+                // 半开状态只放行一个探针：抢不到就换下一个候选，绝不在同一节点上叠加试探。
+                let trial = if self.circuit.is_some()
+                    && self.servers[idx].circuit_state(now) == CircuitState::HalfOpen
+                {
+                    if !self.servers[idx].try_circuit_trial() {
+                        group.retain(|i| *i != idx);
+                        continue;
+                    }
+                    true
+                } else {
+                    false
+                };
+                self.servers[idx].conns.fetch_add(1, Ordering::Relaxed);
+                return Some(UpstreamGuard {
+                    upstream: Arc::clone(self),
+                    idx,
+                    trial,
+                    reported: AtomicBool::new(false),
+                });
             }
         }
-        self.servers[idx].conns.fetch_add(1, Ordering::Relaxed);
-        Some(UpstreamGuard {
-            upstream: Arc::clone(self),
-            idx,
-        })
+        None
     }
 
-    fn candidates(&self, backup_group: bool, tried: &[usize]) -> Vec<usize> {
+    /// 挑一个"该被顺带探测"的被动摘除节点：健康、未标死、并发额度未满、
+    /// 熔断器没有完全打开，且距上次探测已超过 `interval`。多个候选时选最久没探的。
+    fn pick_lazy_probe(&self, now: u64, tried: &[usize], interval: Duration) -> Option<usize> {
+        let interval_ms = interval.as_millis().max(1) as u64;
+        let mut best: Option<(u64, usize)> = None;
+        for (i, s) in self.servers.iter().enumerate() {
+            if tried.contains(&i)
+                || s.manually_down
+                || !s.healthy.load(Ordering::Relaxed)
+                || !s.conns_available()
+                || !s.passively_down(now)
+            {
+                continue;
+            }
+            if self
+                .circuit
+                .as_ref()
+                .is_some_and(|_| s.circuit_state(now) == CircuitState::Open)
+            {
+                continue;
+            }
+            let last = s.lazy_last_ms.load(Ordering::Relaxed);
+            if last != 0 && now.saturating_sub(last) < interval_ms {
+                continue;
+            }
+            if best.is_none_or(|(t, _)| last < t) {
+                best = Some((last, i));
+            }
+        }
+        best.map(|(_, i)| i)
+    }
+
+    fn candidates(&self, backup_group: bool, tried: &[usize], now: u64) -> Vec<usize> {
         (0..self.servers.len())
             .filter(|i| self.servers[*i].backup == backup_group)
             .filter(|i| !tried.contains(i))
-            .filter(|i| self.servers[*i].selectable())
+            .filter(|i| {
+                self.servers[*i].selectable(self.circuit.as_ref(), now)
+            })
             .collect()
     }
 
@@ -362,7 +600,7 @@ impl Upstream {
         let live = |backup: bool| {
             (0..self.servers.len())
                 .filter(|i| self.servers[*i].backup == backup)
-                .filter(|i| self.servers[*i].selectable())
+                .filter(|i| self.servers[*i].selectable(self.circuit.as_ref(), now))
                 .any(|i| self.servers[i].effective() > 0)
         };
         // 与 acquire 同两级：主组没人可服务时 backup 组仍然算"有人"
@@ -561,6 +799,32 @@ impl Upstream {
         )
     }
 
+    /// 熔断/惰性重加入的一行描述，`-t` 与启动日志共用；都没配置时返回 None。
+    pub fn resilience_desc(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(cb) = &self.circuit {
+            parts.push(format!(
+                "circuit_breaker errors={} window={:.0}s open={:.0}s",
+                cb.errors,
+                cb.window.as_secs_f64(),
+                cb.open_for.as_secs_f64()
+            ));
+        }
+        if let Some(lr) = &self.lazy_rejoin {
+            parts.push(format!("lazy_rejoin {:.0}s", lr.as_secs_f64()));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "upstream '{}'：{}；{} 个节点",
+                self.name,
+                parts.join("，"),
+                self.servers.len()
+            ))
+        }
+    }
+
     /// `-t` 与启动/重载日志用的一行描述；关闭时返回 None（不打扰）。
     pub fn least_time_desc(&self) -> Option<String> {
         match self.least_time {
@@ -602,6 +866,14 @@ impl Upstream {
         let Some(s) = self.servers.get(idx) else {
             return;
         };
+        let now = now_millis();
+        if let Some(cb) = &self.circuit {
+            if ok {
+                s.circuit_success(now);
+            } else {
+                s.circuit_failure(cb, now);
+            }
+        }
         if ok {
             s.note_success();
         } else {
@@ -690,14 +962,20 @@ async fn http_probe(mut stream: tokio::net::TcpStream, addr: &str, uri: &str) ->
 pub struct UpstreamGuard {
     upstream: Arc<Upstream>,
     idx: usize,
+    /// 这次请求是否是半开熔断的探针（决定 Drop 时要不要归还探针名额）
+    trial: bool,
+    /// 是否已经有成功/失败结论；没有结论的 Drop（客户端断开）只归还名额、不改状态
+    reported: AtomicBool,
 }
 
 impl UpstreamGuard {
     pub fn note_success(&self) {
+        self.reported.store(true, Ordering::Release);
         self.upstream.report(self.idx, true);
     }
 
     pub fn note_failure(&self) {
+        self.reported.store(true, Ordering::Release);
         self.upstream.report(self.idx, false);
     }
 
@@ -724,6 +1002,11 @@ impl Drop for UpstreamGuard {
         self.upstream.servers[self.idx]
             .conns
             .fetch_sub(1, Ordering::Relaxed);
+        // 探针请求如果连结论都没产生（客户端中途断开、任务被取消），不能把半开名额
+        // 永久占死；归还后下一个请求可以继续试探。
+        if self.trial && !self.reported.load(Ordering::Acquire) {
+            self.upstream.servers[self.idx].release_circuit_trial();
+        }
     }
 }
 
@@ -786,6 +1069,8 @@ impl UpstreamPool {
         let mut keepalive = KeepaliveOpts::default();
         let mut least_time = LeastTime::Off;
         let mut lt_window = 5.0f64;
+        let mut circuit = None;
+        let mut lazy_rejoin = None;
         for child in &d.block {
             match child.name.as_str() {
                 "keepalive" => {
@@ -896,6 +1181,23 @@ impl UpstreamPool {
                     lt_window = secs;
                 }
                 "health_check" => health_check = Some(parse_health_check(child, &name)?),
+                "circuit_breaker" => circuit = parse_circuit_breaker(child, &name)?,
+                "lazy_rejoin" => {
+                    let v = child.arg(0).ok_or_else(|| {
+                        AppError::Other(format!(
+                            "upstream {name}: lazy_rejoin 需要 off 或一个探测间隔（如 5s）"
+                        ))
+                    })?;
+                    lazy_rejoin = if v.eq_ignore_ascii_case("off") {
+                        None
+                    } else {
+                        Some(parse_duration(v).ok_or_else(|| {
+                            AppError::Other(format!(
+                                "upstream {name}: lazy_rejoin {v} 非法（需 off 或正时长）"
+                            ))
+                        })?)
+                    };
+                }
                 _ => {
                     return Err(AppError::Other(format!(
                         "upstream {name} 里有不支持的指令 {}",
@@ -942,6 +1244,8 @@ impl UpstreamPool {
             keepalive,
             least_time,
             lt_window,
+            circuit,
+            lazy_rejoin,
             rng: AtomicU64::new(seed),
             lt_sampled: AtomicU64::new(0),
             lt_picked: AtomicU64::new(0),
@@ -991,6 +1295,63 @@ fn parse_duration(s: &str) -> Option<Duration> {
     parse_seconds(s)
         .filter(|v| *v > 0.0)
         .map(Duration::from_secs_f64)
+}
+
+fn parse_circuit_breaker(
+    d: &Directive,
+    up_name: &str,
+) -> Result<Option<CircuitBreaker>, AppError> {
+    match (d.args.len(), d.arg(0)) {
+        (1, Some(v)) if v.eq_ignore_ascii_case("off") => return Ok(None),
+        (0, _) => return Ok(Some(CircuitBreaker::default())),
+        _ => {}
+    }
+    let mut cb = CircuitBreaker::default();
+    for a in &d.args {
+        let (k, v) = a.split_once('=').ok_or_else(|| {
+            AppError::Other(format!(
+                "upstream {up_name}: circuit_breaker 参数 {a} 不是 key=value（或写 circuit_breaker off）"
+            ))
+        })?;
+        match k {
+            "errors" => {
+                cb.errors = v
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        AppError::Other(format!(
+                            "upstream {up_name}: circuit_breaker errors={v} 必须是正整数"
+                        ))
+                    })?
+            }
+            "window" => {
+                cb.window = parse_duration(v)
+                    .filter(|d| *d <= Duration::from_secs(3600))
+                    .ok_or_else(|| {
+                        AppError::Other(format!(
+                            "upstream {up_name}: circuit_breaker window={v} 非法（需 0..=3600s）"
+                        ))
+                    })?
+            }
+            "open" | "open_for" => {
+                cb.open_for = parse_duration(v)
+                    .filter(|d| *d <= Duration::from_secs(86_400))
+                    .ok_or_else(|| {
+                        AppError::Other(format!(
+                            "upstream {up_name}: circuit_breaker open={v} 非法（需 0..=86400s）"
+                        ))
+                    })?
+            }
+            _ => {
+                return Err(AppError::Other(format!(
+                    "upstream {up_name}: circuit_breaker 不支持的参数 {k}={v}"
+                )))
+            }
+        }
+    }
+    Ok(Some(cb))
 }
 
 fn parse_health_check(d: &Directive, up_name: &str) -> Result<HealthCheck, AppError> {
@@ -1142,6 +1503,137 @@ mod tests {
         assert_eq!(up.servers[0].effective(), 1);
         let seen: Vec<String> = (0..4).map(|_| pick_release(&up)).collect();
         assert!(seen.contains(&"a".to_string()), "成功后应立刻恢复: {seen:?}");
+    }
+
+    // ---- circuit_breaker / lazy_rejoin ----
+
+    #[test]
+    fn circuit_opens_after_threshold_then_half_open_admits_one_probe() {
+        let up = upstream(
+            "server a max_fails=100 fail_timeout=60s; \
+             circuit_breaker errors=2 window=60s open=0.05s; ",
+        );
+        fail_on(&up, 0);
+        assert_eq!(
+            up.servers[0].circuit_state(now_millis()),
+            CircuitState::Closed,
+            "第一次失败未到阈值"
+        );
+        fail_on(&up, 0);
+        assert_eq!(up.servers[0].circuit_state(now_millis()), CircuitState::Open);
+        assert_eq!(up.servers[0].circuit_trips(), 1);
+        assert!(
+            up.acquire("10.0.0.1", &[]).is_none(),
+            "打开的熔断器必须让请求立刻绕开，而不是继续吃连接超时"
+        );
+
+        std::thread::sleep(Duration::from_millis(70));
+        // 到期 = 半开：只放行一个探针，在它出结论前第二个请求仍被挡住
+        let probe = up.acquire("10.0.0.1", &[]).expect("半开应放行一个探针");
+        assert!(
+            up.acquire("10.0.0.1", &[]).is_none(),
+            "半开只允许一个在途探针"
+        );
+        probe.note_success();
+        drop(probe);
+        assert_eq!(
+            up.servers[0].circuit_state(now_millis()),
+            CircuitState::Closed,
+            "探针成功应闭合"
+        );
+        assert!(up.acquire("10.0.0.1", &[]).is_some(), "闭合后应恢复正常放行");
+    }
+
+    #[test]
+    fn half_open_probe_failure_reopens_for_another_period() {
+        let up = upstream(
+            "server a max_fails=100 fail_timeout=60s; \
+             circuit_breaker errors=1 window=60s open=0.05s; ",
+        );
+        fail_on(&up, 0);
+        assert_eq!(up.servers[0].circuit_state(now_millis()), CircuitState::Open);
+        std::thread::sleep(Duration::from_millis(70));
+        let probe = up.acquire("10.0.0.1", &[]).expect("半开应放行探针");
+        probe.note_failure();
+        drop(probe);
+        assert_eq!(
+            up.servers[0].circuit_state(now_millis()),
+            CircuitState::Open,
+            "探针失败应重新打开"
+        );
+        assert!(up.acquire("10.0.0.1", &[]).is_none());
+        assert_eq!(
+            up.servers[0].circuit_trips(),
+            1,
+            "半开探针失败是同一个故障期的延续，不该重复计 trip"
+        );
+    }
+
+    #[test]
+    fn lazy_rejoin_probes_a_down_node_and_restores_it_on_success() {
+        let up = upstream(
+            "server a max_fails=1 fail_timeout=60s; server b max_fails=1 fail_timeout=60s; \
+             lazy_rejoin 200ms; ",
+        );
+        fail_on(&up, 0);
+        assert_eq!(up.servers[0].effective(), 0, "a 应被被动摘除");
+        for _ in 0..4 {
+            assert_eq!(pick_release(&up), "b", "摘除期内常规流量应由 b 承担");
+        }
+        assert_eq!(up.servers[0].lazy_probes(), 0, "间隔没到不该探测");
+
+        std::thread::sleep(Duration::from_millis(250));
+        // 间隔到了：下一个真实用户请求被顺带派给 a，而不是另起后台线程
+        let probe = up.acquire("10.0.0.1", &[]).expect("应有节点");
+        assert_eq!(&*probe, "a", "lazy_rejoin 应把用户请求顺带派给摘除节点");
+        assert_eq!(up.servers[0].lazy_probes(), 1);
+        probe.note_success();
+        drop(probe);
+        assert_eq!(up.servers[0].effective(), 1, "探测成功应立刻恢复权重");
+        assert!(up.split_has_live_server());
+        let seen: Vec<String> = (0..6).map(|_| pick_release(&up)).collect();
+        assert!(
+            seen.contains(&"a".to_string()),
+            "恢复后 a 应重新参与: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn config_parses_circuit_breaker_and_lazy_rejoin() {
+        let up = upstream(
+            "server a; circuit_breaker errors=3 window=5s open=7s; lazy_rejoin 5s; ",
+        );
+        let cb = up.circuit.clone().expect("应解析出熔断配置");
+        assert_eq!(cb.errors, 3);
+        assert_eq!(cb.window, Duration::from_secs(5));
+        assert_eq!(cb.open_for, Duration::from_secs(7));
+        assert_eq!(up.lazy_rejoin, Some(Duration::from_secs(5)));
+        let desc = up.resilience_desc().expect("配置了就该出现在 -t 输出里");
+        assert!(
+            desc.contains("errors=3") && desc.contains("lazy_rejoin 5s"),
+            "{desc}"
+        );
+
+        // 无参 = 默认阈值；off = 关闭；不写 = 不启用
+        let up = upstream("server a; circuit_breaker; ");
+        assert_eq!(up.circuit.clone().unwrap(), CircuitBreaker::default());
+        assert!(up.lazy_rejoin.is_none());
+        assert!(upstream("server a; circuit_breaker off; ").circuit.is_none());
+        assert!(upstream("server a; lazy_rejoin off; ").lazy_rejoin.is_none());
+        assert!(upstream("server a; ").resilience_desc().is_none());
+
+        for conf in [
+            "server a; circuit_breaker errors=0; ",
+            "server a; circuit_breaker window=0s; ",
+            "server a; circuit_breaker open=abc; ",
+            "server a; circuit_breaker trips=3; ",
+            "server a; circuit_breaker errors; ",
+            "server a; lazy_rejoin; ",
+            "server a; lazy_rejoin 0s; ",
+            "server a; lazy_rejoin abc; ",
+        ] {
+            assert!(pool(conf).is_err(), "应当拒绝这份配置: {conf}");
+        }
     }
 
     #[test]

@@ -41,6 +41,8 @@ regex.workspace = true
 chrono.workspace = true
 flate2.workspace = true
 mlua.workspace = true
+wasmi.workspace = true
+wat.workspace = true
 thiserror.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
@@ -59,3 +61,8 @@ h3 = "0.0.8"
 h3-quinn = "0.0.10"
 native-tls = { version = "0.2", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
+
+# Linux 线程 CPU 亲和性（sched_setaffinity）。libc 本来就在 tokio 的依赖图里，
+# 这里只是把它提升为直接依赖，不引入新的外部栈。
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

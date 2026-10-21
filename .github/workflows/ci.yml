@@ -1,0 +1,122 @@
+name: CI
+
+# 单元测试 + 关键特性 E2E。release.yml 只负责打各类平台的包，不跑测试；
+# 这里把"能编译"和"行为正确"分开守住：
+#   unit  全量 Rust 单元测试（配置解析、路由、WASM、熔断、缓存、Lua…）
+#   e2e   灰度 / WASM / 熔断懒重连 / CPU 亲和性 / 业务分流，全部走真实端口和真实后端
+#   soak  手动触发，20 分钟混合流量并分析进程私有内存趋势（不在每次 push 上烧 20 分钟）
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+    inputs:
+      soak_minutes:
+        description: '额外跑多少分钟稳定性压测（0 = 不跑）'
+        required: false
+        default: '0'
+        type: string
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  unit:
+    name: Rust unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests
+        run: cargo test --workspace
+
+      # 仓库里还有历史代码未统一 rustfmt，暂不做 --check 门禁（避免无关的大 diff）；
+      # clippy 以默认配置运行：有 error 才失败，warning 作为诊断信息保留。
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+  e2e:
+    name: Feature E2E
+    runs-on: ubuntu-latest
+    needs: unit
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release gateway
+        run: cargo build --release -p onrouter-server --bin onrouter
+
+      - name: Run feature E2E
+        run: |
+          mkdir -p conf/logs
+          for suite in canary wasm resilience affinity proxy_split; do
+            echo "::group::${suite}_e2e"
+            python3 "tools/${suite}_e2e.py"
+            echo "::endgroup::"
+          done
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: conf/logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  soak:
+    name: Stability soak
+    if: github.event_name == 'workflow_dispatch' && inputs.soak_minutes != '0'
+    runs-on: ubuntu-latest
+    needs: unit
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release gateway
+        run: cargo build --release -p onrouter-server --bin onrouter
+
+      - name: Soak test
+        env:
+          SOAK_MINUTES: ${{ inputs.soak_minutes }}
+        run: |
+          mkdir -p conf/logs
+          python3 tools/soak_test.py --minutes "$SOAK_MINUTES" | tee soak_console.log
+
+      - name: Upload soak report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-report
+          path: |
+            target/soak_report.json
+            target/soak_samples.csv
+            target/soak_metrics_*.txt
+            soak_console.log
+            conf/logs/soak_*
+          if-no-files-found: ignore
+          retention-days: 14

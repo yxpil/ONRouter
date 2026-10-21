@@ -623,6 +623,20 @@ impl Metrics {
                     ));
                 }
             }
+            s.push_str("# HELP onrouter_upstream_server_available Whether normal selection may pick this node now (manual down, passive removal and open circuit considered; all-down fallback trial and in-flight limits excluded).\n");
+            s.push_str("# TYPE onrouter_upstream_server_available gauge\n");
+            let now = crate::upstream::now_millis();
+            for up in ups {
+                for srv in &up.servers {
+                    let available = srv.available_for_schedule(now, up.circuit.as_ref());
+                    s.push_str(&format!(
+                        "onrouter_upstream_server_available{{upstream=\"{}\",server=\"{}\"}} {}\n",
+                        label(&up.name),
+                        label(&srv.addr),
+                        u8::from(available)
+                    ));
+                }
+            }
             s.push_str("# HELP onrouter_upstream_requests_total Upstream request outcomes reported by the proxy.\n");
             s.push_str("# TYPE onrouter_upstream_requests_total counter\n");
             for up in ups {
@@ -686,6 +700,50 @@ impl Metrics {
                     }
                 }
             }
+            // 熔断/惰性重加入：只有真的配置了才出指标行，默认配置一行都不多。
+            let cb_on: Vec<_> = ups.iter().filter(|u| u.circuit.is_some()).collect();
+            if !cb_on.is_empty() {
+                s.push_str("# HELP onrouter_upstream_circuit_state Per-server circuit breaker state (0=closed 1=half-open 2=open).\n");
+                s.push_str("# TYPE onrouter_upstream_circuit_state gauge\n");
+                s.push_str("# HELP onrouter_upstream_circuit_trips_total Times a server's breaker opened.\n");
+                s.push_str("# TYPE onrouter_upstream_circuit_trips_total counter\n");
+                let now = crate::upstream::now_millis();
+                for up in cb_on {
+                    for srv in &up.servers {
+                        let state = match srv.circuit_state(now) {
+                            crate::upstream::CircuitState::Closed => 0,
+                            crate::upstream::CircuitState::HalfOpen => 1,
+                            crate::upstream::CircuitState::Open => 2,
+                        };
+                        s.push_str(&format!(
+                            "onrouter_upstream_circuit_state{{upstream=\"{}\",server=\"{}\"}} {state}\n",
+                            label(&up.name),
+                            label(&srv.addr)
+                        ));
+                        s.push_str(&format!(
+                            "onrouter_upstream_circuit_trips_total{{upstream=\"{}\",server=\"{}\"}} {}\n",
+                            label(&up.name),
+                            label(&srv.addr),
+                            srv.circuit_trips()
+                        ));
+                    }
+                }
+            }
+            let lr_on: Vec<_> = ups.iter().filter(|u| u.lazy_rejoin.is_some()).collect();
+            if !lr_on.is_empty() {
+                s.push_str("# HELP onrouter_upstream_lazy_probes_total Real user requests diverted to a passively removed server as a recovery probe (lazy_rejoin).\n");
+                s.push_str("# TYPE onrouter_upstream_lazy_probes_total counter\n");
+                for up in lr_on {
+                    for srv in &up.servers {
+                        s.push_str(&format!(
+                            "onrouter_upstream_lazy_probes_total{{upstream=\"{}\",server=\"{}\"}} {}\n",
+                            label(&up.name),
+                            label(&srv.addr),
+                            srv.lazy_probes()
+                        ));
+                    }
+                }
+            }
         }
         // 业务分流（proxy_pass http://$变量）：targets 是"这一路实际服务了多少请求"，
         // 拿它除以总数就是运维要核对的那张比例表；total 的 role 说明每一路是怎么被处置的。
@@ -713,6 +771,43 @@ impl Metrics {
                         st.role(role)
                     ));
                 }
+            }
+        }
+        // WASM 插件：每个插件、每个阶段各一组。invocations 是"进来多少次"，
+        // errors 是"其中失败多少"（fail-closed 时请求已按 5xx 收口），fuel 单独计数，
+        // 便于把"写了个死循环"与"trap"分开查；denied 是 access 插件直接生成了响应。
+        let wasm = crate::wasm::stats_snapshot();
+        if !wasm.is_empty() {
+            use crate::wasm::WasmPhase;
+            s.push_str("# HELP onrouter_wasm_invocations_total WASM plugin invocations by phase.\n");
+            s.push_str("# TYPE onrouter_wasm_invocations_total counter\n");
+            s.push_str("# HELP onrouter_wasm_errors_total WASM plugin invocations that trapped or hit the fuel limit (the request is failed closed).\n");
+            s.push_str("# TYPE onrouter_wasm_errors_total counter\n");
+            s.push_str("# HELP onrouter_wasm_fuel_exhausted_total WASM plugin invocations aborted because the instruction budget ran out.\n");
+            s.push_str("# TYPE onrouter_wasm_fuel_exhausted_total counter\n");
+            s.push_str("# HELP onrouter_wasm_denied_total Requests answered directly by an access-phase WASM plugin.\n");
+            s.push_str("# TYPE onrouter_wasm_denied_total counter\n");
+            for (name, st) in &wasm {
+                let plugin = label(name);
+                for phase in [WasmPhase::Access, WasmPhase::HeaderFilter, WasmPhase::BodyFilter] {
+                    let p = phase.label();
+                    s.push_str(&format!(
+                        "onrouter_wasm_invocations_total{{plugin=\"{plugin}\",phase=\"{p}\"}} {}\n",
+                        st.invocation(phase)
+                    ));
+                    s.push_str(&format!(
+                        "onrouter_wasm_errors_total{{plugin=\"{plugin}\",phase=\"{p}\"}} {}\n",
+                        st.error(phase)
+                    ));
+                    s.push_str(&format!(
+                        "onrouter_wasm_fuel_exhausted_total{{plugin=\"{plugin}\",phase=\"{p}\"}} {}\n",
+                        st.fuel_exhausted(phase)
+                    ));
+                }
+                s.push_str(&format!(
+                    "onrouter_wasm_denied_total{{plugin=\"{plugin}\"}} {}\n",
+                    st.denied()
+                ));
             }
         }
         s.push_str("# HELP onrouter_lua_phase_inline_total Lua phases that ran their first segment inline in the request task.\n");
@@ -911,6 +1006,8 @@ mod tests {
         for needle in [
             "onrouter_upstream_server_connections{upstream=\"metrics_u\",server=\"127.0.0.1:9001\"} 0",
             "onrouter_upstream_server_healthy{upstream=\"metrics_u\",server=\"127.0.0.1:9001\"} 1",
+            "onrouter_upstream_server_available{upstream=\"metrics_u\",server=\"127.0.0.1:9001\"} 1",
+            "onrouter_upstream_server_available{upstream=\"metrics_u\",server=\"127.0.0.1:9002\"} 0",
             "onrouter_upstream_requests_total{upstream=\"metrics_u\",server=\"127.0.0.1:9001\",result=\"success\"} 0",
             "onrouter_upstream_requests_total{upstream=\"metrics_u\",server=\"127.0.0.1:9001\",result=\"failure\"} 0",
         ] {

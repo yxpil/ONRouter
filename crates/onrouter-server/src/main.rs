@@ -20,6 +20,7 @@
 
 mod access_log;
 mod access;
+mod affinity;
 mod certs;
 mod compress;
 mod dns;
@@ -49,6 +50,7 @@ mod stream;
 mod tls;
 mod upstream;
 mod vip;
+mod wasm;
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -246,6 +248,22 @@ fn main() {
         log_warn!("{w}");
         startup_warnings.push(w);
     }
+
+    // worker 线程数与 CPU 亲和性计划在 `-t` 之前算好：掩码越界这类告警必须在配置
+    // 测试阶段就能看到，而不是等进程真的起来才出现在 error_log 里。
+    let workers = settings
+        .worker_threads
+        .unwrap_or_else(affinity::cpu_count)
+        .max(1);
+    let affinity_plan = settings.worker_cpu_affinity.as_ref().map(|spec| {
+        let (plan, warnings) = affinity::AffinityPlan::build(spec, workers);
+        for w in warnings {
+            log_warn!("{w}");
+            startup_warnings.push(w);
+        }
+        log_info!("{}", plan.describe());
+        plan
+    });
     let limits = Arc::new(limit::Limits::parse_all(&config));
     for w in &limits.warnings {
         log_warn!("{w}");
@@ -339,15 +357,15 @@ fn main() {
         );
     }
 
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder
         .worker_threads(workers)
         .thread_name("onrouter-worker")
-        .enable_all()
-        .build()
-        .expect("tokio 运行时创建失败");
+        .enable_all();
+    if let Some(plan) = affinity_plan {
+        runtime_builder.on_thread_start(plan.into_thread_start_hook());
+    }
+    let runtime = runtime_builder.build().expect("tokio 运行时创建失败");
 
     if let Err(e) = runtime.block_on(run(
         config,
@@ -404,6 +422,25 @@ fn check(
     println!(
         "  worker_connections={} keepalive_requests={} shutdown_grace={:?}",
         settings.worker_connections, settings.keepalive_requests, settings.shutdown_grace
+    );
+    let workers = settings
+        .worker_threads
+        .unwrap_or_else(affinity::cpu_count)
+        .max(1);
+    let plan_line = settings.worker_cpu_affinity.as_ref().map(|spec| {
+        let (plan, _) = affinity::AffinityPlan::build(spec, workers);
+        format!("；亲和性：{}", plan.per_thread())
+    });
+    println!(
+        "  worker_threads={}（逻辑核 {}）worker_cpu_affinity={}{}",
+        workers,
+        affinity::cpu_count(),
+        settings
+            .worker_cpu_affinity
+            .as_ref()
+            .map(|a| a.describe())
+            .unwrap_or_else(|| "off".to_string()),
+        plan_line.unwrap_or_default()
     );
     if !router.still_zones.is_empty() {
         let mut items: Vec<_> = router.still_zones.iter().collect();
@@ -476,11 +513,19 @@ fn check(
             if let Some(line) = up.least_time_desc() {
                 println!("  {line}");
             }
+            if let Some(line) = up.resilience_desc() {
+                println!("  {line}");
+            }
         }
     }
     // 业务分流（proxy_pass http://$变量）逐条自述：声明的比例、粘性键、改投策略。
     // 这行是"-t 通过不代表比例按你想的走"的那道补票：把网关读出来的那张表打出来。
     for line in &router.split_routes {
+        println!("  {line}");
+    }
+    // WASM 插件：-t 把编译成功的模块、指令预算、内存上限和导出函数列出来。模块在构建路由时
+    // 就已完成校验与编译，这里看到的就是线上将要执行的那一份。
+    for line in crate::wasm::describe() {
         println!("  {line}");
     }
     if !warnings.is_empty() {
@@ -737,6 +782,9 @@ async fn run(
                 if let Some(line) = up.least_time_desc() {
                     log_info!("{line}；账目见 /metrics 的 onrouter_upstream_least_time_total 与 onrouter_upstream_server_ewma_seconds");
                 }
+                if let Some(line) = up.resilience_desc() {
+                    log_info!("{line}；状态见 /metrics 的 onrouter_upstream_circuit_state / onrouter_upstream_lazy_probes_total");
+                }
             }
         }
     }
@@ -746,6 +794,12 @@ async fn run(
         log_info!(
             "{line}；落点比例见 /metrics 的 onrouter_proxy_split_targets_total，\
              结局计数见 onrouter_proxy_split_total"
+        );
+    }
+    for line in crate::wasm::describe() {
+        log_info!(
+            "{line}；调用/错误/fuel 见 /metrics 的 onrouter_wasm_invocations_total、\
+             onrouter_wasm_errors_total、onrouter_wasm_fuel_exhausted_total"
         );
     }
     let so_rows = still_online.zone_rows();
@@ -1167,6 +1221,9 @@ fn do_reload(
                     for up in p.map.values() {
                         if let Some(line) = up.least_time_desc() {
                             log_info!("热重载 {line}（upstream 池不热替换，档位改动要重启才生效）");
+                        }
+                        if let Some(line) = up.resilience_desc() {
+                            log_info!("热重载 {line}（upstream 池不热替换，熔断/惰性重加入改动要重启才生效）");
                         }
                     }
                 }

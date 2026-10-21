@@ -133,6 +133,9 @@ pub struct RouteSplit {
     pub star: Option<String>,
     /// 进程级落点账本；`None` 表示超出登记上限，分流照走但不统计
     pub stats: Option<std::sync::Arc<crate::engine::SplitRouteStats>>,
+    /// 灰度变量（`canary`）的规则自述，用于 `-t` / 启动横幅。
+    /// None = 普通 `split_clients` 比例分流，desc 按权重表打印。
+    pub summary: Option<String>,
 }
 
 impl RouteSplit {
@@ -159,23 +162,25 @@ impl RouteSplit {
 
     /// `-t` 与启动横幅的一行描述（沿用 least_time_desc / front_proxy 的做法）
     pub fn desc(&self, failover: &SplitFailover, location: &str) -> String {
-        let parts: Vec<String> = self
-            .branches
-            .iter()
-            .map(|(p, t)| format!("{p}%->{t}"))
-            .chain(self.star.iter().map(|s| format!("*->{s}")))
-            .collect();
         let policy = match failover {
             SplitFailover::On => "改投下一路".to_string(),
             SplitFailover::Off => "不串台（原样失败）".to_string(),
             SplitFailover::Target(t) => format!("只改投 {t}"),
         };
         let key = &self.key;
-        format!(
-            "location '{location}'：按 ${} 分流 [{}]，粘性键 {key}，选中路全挂时{policy}",
-            self.dest,
-            parts.join(" ")
-        )
+        let what = match &self.summary {
+            Some(summary) => format!("按 ${} 灰度分流 {summary}", self.dest),
+            None => {
+                let parts: Vec<String> = self
+                    .branches
+                    .iter()
+                    .map(|(p, t)| format!("{p}%->{t}"))
+                    .chain(self.star.iter().map(|s| format!("*->{s}")))
+                    .collect();
+                format!("按 ${} 分流 [{}]", self.dest, parts.join(" "))
+            }
+        };
+        format!("location '{location}'：{what}，粘性键 {key}，选中路全挂时{policy}")
     }
 }
 
@@ -213,6 +218,9 @@ pub struct Location {
     pub proxy_request_buffering: bool,
     pub rust_phases: Vec<(Phase, HandlerSpec)>,
     pub lua_phases: Vec<(Phase, String, LuaSource)>,
+    /// `access_by_wasm` / `header_filter_by_wasm` / `body_filter_by_wasm`：
+    /// 预编译的 WASM 模块（模块在构建期加载一次，请求期只实例化）。
+    pub wasm_phases: Vec<(crate::wasm::WasmPhase, Arc<crate::wasm::WasmPlugin>)>,
     pub root: Option<PathBuf>,
     pub alias: Option<PathBuf>,
     pub index: Option<Vec<String>>,
@@ -385,6 +393,60 @@ impl Default for StreamServer {
 #[derive(Debug)]
 pub struct AddrGroup {
     pub servers: Vec<Arc<Server>>,
+}
+
+/// 本次构建解析出的派生变量定义，只服务路由表构建。
+///
+/// 构建期不读 `engine` 的进程级全局表：任何一次 `Router::build`（含并发单测、热重载时
+/// 新旧配置交叠）都会 `install_*` 整份替换全局表，构建中途去读会看到别的配置装进去的
+/// 定义。全局表只服务请求期的变量展开。
+struct DerivedDefs {
+    splits: HashMap<String, Arc<crate::engine::SplitDef>>,
+    canaries: HashMap<String, Arc<crate::engine::CanaryDef>>,
+    wasm: HashMap<String, Arc<crate::wasm::WasmPlugin>>,
+    split_values: Vec<String>,
+    canary_values: Vec<String>,
+}
+
+impl DerivedDefs {
+    fn new(
+        splits: &[crate::engine::SplitDef],
+        canaries: &[crate::engine::CanaryDef],
+        wasm: Vec<Arc<crate::wasm::WasmPlugin>>,
+    ) -> Self {
+        let split_values = splits
+            .iter()
+            .flat_map(|d| {
+                d.buckets
+                    .iter()
+                    .map(|b| b.result.clone())
+                    .chain(d.star.clone())
+            })
+            .collect();
+        let canary_values = canaries
+            .iter()
+            .flat_map(|d| {
+                d.rules
+                    .iter()
+                    .map(|r| r.target.clone())
+                    .chain(d.buckets.iter().map(|b| b.result.clone()))
+                    .chain(std::iter::once(d.default.clone()))
+            })
+            .collect();
+        Self {
+            splits: splits
+                .iter()
+                .map(|d| (d.dest.clone(), Arc::new(d.clone())))
+                .collect(),
+            canaries: canaries
+                .iter()
+                .map(|d| (d.dest.clone(), Arc::new(d.clone())))
+                .collect(),
+            wasm: wasm.into_iter().map(|p| (p.name.clone(), p)).collect(),
+            split_values,
+            canary_values,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1627,6 +1689,364 @@ impl Router {
         Ok(defs)
     }
 
+    /// 解析顶层 `canary $dest [key] { ... }` 块为灰度定义表。
+    ///
+    /// 规则按声明顺序第一条命中生效；都没命中时按 `percent` 对粘性键哈希分桶，
+    /// 最后落到必填的 `default`。条件全部来自请求本身（cookie/header/arg/ua/os），
+    /// 不做任何回源探测——灰度选的是"这个人这次该看哪个版本"，不是后端健康。
+    fn parse_canaries(
+        config: &Config,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<crate::engine::CanaryDef>, AppError> {
+        use crate::engine::{CanaryDef, CanaryOs, CanaryRule, CanaryWhen, SplitBucket};
+
+        // 同名派生变量只允许一个来源：map/geo 在 resolve_var 里排在 canary 前面，
+        // 撞名会让 canary 静默失效，属于最不该留给线上才发现的一类配置错误。
+        fn other_dests(config: &Config) -> std::collections::HashSet<String> {
+            let mut out = std::collections::HashSet::new();
+            for d in &config.root.block {
+                match d.name.as_str() {
+                    "map" => {
+                        if let Some(dest) = d.arg(1) {
+                            out.insert(dest.trim_start_matches('$').to_string());
+                        }
+                    }
+                    "geo" => {
+                        if let Some(dest) = d.args.last() {
+                            out.insert(dest.trim_start_matches('$').to_string());
+                        }
+                    }
+                    "split_clients" => {
+                        if let Some(dest) = d.arg(1) {
+                            out.insert(dest.trim_start_matches('$').to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+        let taken = other_dests(config);
+        let mut defs: Vec<CanaryDef> = Vec::new();
+        for d in config.root.block.iter().filter(|d| d.name == "canary") {
+            let dest_raw = d.arg(0).ok_or_else(|| {
+                AppError::Other(format!(
+                    "canary（第 {} 行）缺少目标变量，写法：canary $版本变量 [粘性键] {{ ... }}",
+                    d.line
+                ))
+            })?;
+            let dest = dest_raw.trim_start_matches('$').to_string();
+            if dest.is_empty() {
+                return Err(AppError::Other(format!(
+                    "canary 目标变量为空（第 {} 行）",
+                    d.line
+                )));
+            }
+            if crate::engine::is_static_var_name(&dest)
+                || crate::engine::is_derived_var_name(&dest)
+            {
+                return Err(AppError::Other(format!(
+                    "canary 目标变量 ${dest}（第 {} 行）与 nginx 内置变量同名，会把内置变量遮蔽掉；\
+                     请换一个名字（如 $release）",
+                    d.line
+                )));
+            }
+            if taken.contains(&dest) || defs.iter().any(|x| x.dest == dest) {
+                return Err(AppError::Other(format!(
+                    "变量 ${dest}（第 {} 行）已经由 map/geo/split_clients/另一条 canary 声明；\
+                     同一个变量只能有一个来源",
+                    d.line
+                )));
+            }
+            let key = d
+                .arg(1)
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "${remote_addr}".to_string());
+
+            let mut rules: Vec<CanaryRule> = Vec::new();
+            let mut buckets: Vec<SplitBucket> = Vec::new();
+            let mut default: Option<String> = None;
+            let mut sum = 0.0;
+
+            for c in &d.block {
+                let bad = |msg: String| AppError::Other(msg);
+                match c.name.as_str() {
+                    "default" => {
+                        if default.is_some() {
+                            return Err(bad(format!(
+                                "canary {dest}（第 {} 行）重复写了 default",
+                                c.line
+                            )));
+                        }
+                        let t = c.args.first().map(|s| s.as_str()).unwrap_or("");
+                        if t.is_empty() {
+                            return Err(bad(format!(
+                                "canary {dest} 的 default 缺少目标版本（第 {} 行）",
+                                c.line
+                            )));
+                        }
+                        default = Some(t.to_string());
+                    }
+                    "cookie" | "header" | "arg" => {
+                        if c.args.len() != 2 {
+                            return Err(bad(format!(
+                                "canary {dest}（第 {} 行）的 {} 需要 2 个参数：\
+                                 {} <名字或名字=值> <目标版本>",
+                                c.line, c.name, c.name
+                            )));
+                        }
+                        let (name, value) = match c.args[0].split_once('=') {
+                            Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                            None => (c.args[0].clone(), None),
+                        };
+                        if name.is_empty() {
+                            return Err(bad(format!(
+                                "canary {dest}（第 {} 行）的 {} 条件名字为空",
+                                c.line, c.name
+                            )));
+                        }
+                        let when = match c.name.as_str() {
+                            "cookie" => CanaryWhen::Cookie { name, value },
+                            "header" => CanaryWhen::Header { name, value },
+                            _ => CanaryWhen::Arg { name, value },
+                        };
+                        rules.push(CanaryRule {
+                            when,
+                            target: c.args[1].clone(),
+                        });
+                    }
+                    "ua" => {
+                        if c.args.len() != 3 || !matches!(c.args[0].as_str(), "~" | "~*") {
+                            return Err(bad(format!(
+                                "canary {dest}（第 {} 行）的 ua 条件需要 3 个参数：\
+                                 ua ~|~* <正则> <目标版本>",
+                                c.line
+                            )));
+                        }
+                        let ci = c.args[0] == "~*";
+                        let regex = regex::RegexBuilder::new(&c.args[1])
+                            .case_insensitive(ci)
+                            .build()
+                            .map_err(|e| {
+                                AppError::Other(format!(
+                                    "canary {dest}（第 {} 行）的 ua 正则 '{}' 无法编译: {e}",
+                                    c.line, c.args[1]
+                                ))
+                            })?;
+                        rules.push(CanaryRule {
+                            when: CanaryWhen::UserAgent {
+                                regex,
+                                pattern: c.args[1].clone(),
+                                case_insensitive: ci,
+                            },
+                            target: c.args[2].clone(),
+                        });
+                    }
+                    "os" => {
+                        if c.args.len() != 2 {
+                            return Err(bad(format!(
+                                "canary {dest}（第 {} 行）的 os 条件需要 2 个参数：\
+                                 os <windows|macos|linux|android|ios|other> <目标版本>",
+                                c.line
+                            )));
+                        }
+                        let os = CanaryOs::parse(&c.args[0]).ok_or_else(|| {
+                            AppError::Other(format!(
+                                "canary {dest}（第 {} 行）不认识的操作系统 '{}'\
+                                 （可用 windows/macos/linux/android/ios/other）",
+                                c.line, c.args[0]
+                            ))
+                        })?;
+                        rules.push(CanaryRule {
+                            when: CanaryWhen::Os(os),
+                            target: c.args[1].clone(),
+                        });
+                    }
+                    "percent" => {
+                        if c.args.len() != 2 {
+                            return Err(bad(format!(
+                                "canary {dest}（第 {} 行）的 percent 需要 2 个参数：\
+                                 percent <百分比> <目标版本>",
+                                c.line
+                            )));
+                        }
+                        let pct: f64 = c.args[0]
+                            .trim_end_matches('%')
+                            .trim()
+                            .parse()
+                            .map_err(|_| {
+                                AppError::Other(format!(
+                                    "canary {dest}（第 {} 行）非法百分比 '{}'",
+                                    c.line, c.args[0]
+                                ))
+                            })?;
+                        if !pct.is_finite() || pct < 0.0 {
+                            return Err(bad(format!(
+                                "canary {dest}（第 {} 行）的百分比不能为负数：{}",
+                                c.line, c.args[0]
+                            )));
+                        }
+                        sum += pct;
+                        buckets.push(SplitBucket {
+                            percent: pct,
+                            result: c.args[1].clone(),
+                        });
+                    }
+                    other => {
+                        return Err(bad(format!(
+                            "canary {dest}（第 {} 行）不支持的条件 '{other}'\
+                             （可用 cookie/header/arg/ua/os/percent/default）",
+                            c.line
+                        )))
+                    }
+                }
+            }
+
+            let default = default.ok_or_else(|| {
+                AppError::Other(format!(
+                    "canary {dest}（第 {} 行）缺少 default：灰度必须有默认版本，\
+                     否则未命中任何条件的请求没有版本可去",
+                    d.line
+                ))
+            })?;
+            if rules.is_empty() && buckets.is_empty() {
+                return Err(AppError::Other(format!(
+                    "canary {dest}（第 {} 行）没有任何条件或百分比规则，永远只会走 default；\
+                     至少写一条 cookie/header/arg/ua/os/percent 规则",
+                    d.line
+                )));
+            }
+            if sum > 100.0001 {
+                warnings.push(format!(
+                    "canary {dest}（第 {} 行）的百分比合计 {sum:.2}% 超过 100%，超出部分永不命中",
+                    d.line
+                ));
+            }
+
+            // 每个落点都要能放在 proxy_pass 的主机位上：带 /、空格、$ 的值列不出候选。
+            let all_targets = rules
+                .iter()
+                .map(|r| r.target.as_str())
+                .chain(buckets.iter().map(|b| b.result.as_str()))
+                .chain(std::iter::once(default.as_str()));
+            for t in all_targets {
+                if t.is_empty()
+                    || t.contains('/')
+                    || t.contains(' ')
+                    || t.contains('\t')
+                    || t.contains('$')
+                {
+                    return Err(AppError::Other(format!(
+                        "canary {dest}（第 {} 行）的目标版本 '{t}' 不能放在主机位：\
+                         每个版本必须是 upstream 池名或 host:port，不能为空、不能含 / 、空格或变量",
+                        d.line
+                    )));
+                }
+            }
+
+            defs.push(CanaryDef {
+                dest,
+                rules,
+                buckets,
+                key,
+                default,
+            });
+        }
+        Ok(defs)
+    }
+
+    /// 顶层 `wasm_plugin <名字> <文件> [fuel=N] [memory=16m];`：构建期加载并编译一次。
+    /// 请求期只做实例化，配置错误（文件缺失、模块非法、缺 memory 导出）在 -t 就暴露。
+    fn parse_wasm_plugins(
+        config: &Config,
+        base_dir: &PathBuf,
+    ) -> Result<Vec<Arc<crate::wasm::WasmPlugin>>, AppError> {
+        fn parse_size(s: &str) -> Option<usize> {
+            let lower = s.trim().to_ascii_lowercase();
+            let (num, mult) = if let Some(x) = lower.strip_suffix('m') {
+                (x, 1024 * 1024)
+            } else if let Some(x) = lower.strip_suffix('k') {
+                (x, 1024)
+            } else if let Some(x) = lower.strip_suffix('g') {
+                (x, 1024 * 1024 * 1024)
+            } else {
+                (lower.as_str(), 1)
+            };
+            num.trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_mul(mult))
+        }
+
+        let mut out: Vec<Arc<crate::wasm::WasmPlugin>> = Vec::new();
+        for d in config.root.block.iter().filter(|d| d.name == "wasm_plugin") {
+            let name = d
+                .arg(0)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::Other(format!(
+                        "wasm_plugin（第 {} 行）缺少插件名，写法：wasm_plugin <名字> <path.wasm> [fuel=N] [memory=16m]",
+                        d.line
+                    ))
+                })?;
+            let file = d.arg(1).filter(|s| !s.is_empty()).ok_or_else(|| {
+                AppError::Other(format!(
+                    "wasm_plugin {name}（第 {} 行）缺少模块路径",
+                    d.line
+                ))
+            })?;
+            if out.len() >= crate::wasm::MAX_PLUGINS {
+                return Err(AppError::Other(format!(
+                    "wasm_plugin 数量超过上限 {}（第 {} 行）；指标标签的基数必须有上界",
+                    crate::wasm::MAX_PLUGINS,
+                    d.line
+                )));
+            }
+            if out.iter().any(|p| p.name == name) {
+                return Err(AppError::Other(format!(
+                    "wasm_plugin {name}（第 {} 行）重复声明；同一个名字只能指向一个模块",
+                    d.line
+                )));
+            }
+            let mut fuel = crate::wasm::DEFAULT_FUEL;
+            let mut memory = crate::wasm::DEFAULT_MEMORY;
+            for opt in &d.args[2..] {
+                if let Some(v) = opt.strip_prefix("fuel=") {
+                    fuel = v.trim().parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                        AppError::Other(format!(
+                            "wasm_plugin {name}（第 {} 行）的 fuel='{v}' 不是正整数",
+                            d.line
+                        ))
+                    })?;
+                } else if let Some(v) = opt.strip_prefix("memory=") {
+                    memory = parse_size(v).filter(|n| *n >= 64 * 1024).ok_or_else(|| {
+                        AppError::Other(format!(
+                            "wasm_plugin {name}（第 {} 行）的 memory='{v}' 无法解析（支持字节或 k/m/g 后缀，最小 64k）",
+                            d.line
+                        ))
+                    })?;
+                } else {
+                    return Err(AppError::Other(format!(
+                        "wasm_plugin {name}（第 {} 行）不认识选项 '{opt}'（可用 fuel=N / memory=16m）",
+                        d.line
+                    )));
+                }
+            }
+            let path = crate::resolve_path(file, base_dir);
+            let plugin = crate::wasm::WasmPlugin::load(
+                name,
+                &path,
+                fuel,
+                memory,
+                crate::wasm::stats_for(name),
+            )
+            .map_err(|e| AppError::Other(format!("第 {} 行：{e}", d.line)))?;
+            out.push(Arc::new(plugin));
+        }
+        Ok(out)
+    }
+
     /// `proxy_pass http://$split_var/path` 里主机位的形状：写死、整段是一个变量、还是混着写。
     ///
     /// 刻意只认"一个完整变量"这一种：`http://a$x.example.com` 这种拼出来的主机名
@@ -1701,6 +2121,19 @@ impl Router {
     /// 所依赖的前提。拦的是"连到配置里没出现过的地址"，不是"跟着请求换池"：
     /// `map $http_x_env $backend` 指向已声明的池仍是合法写法，照旧放行。
     fn declared_targets(config: &Config) -> HashSet<String> {
+        // 诊断/单测用：读进程级全局表（请求期的那一份）。
+        Self::declared_targets_with(
+            config,
+            &crate::engine::split_branch_values(),
+            &crate::engine::canary_target_values(),
+        )
+    }
+
+    fn declared_targets_with(
+        config: &Config,
+        split_values: &[String],
+        canary_values: &[String],
+    ) -> HashSet<String> {
         fn literal_host(v: &str) -> Option<String> {
             if v.is_empty() || v.contains('$') {
                 return None;
@@ -1740,9 +2173,16 @@ impl Router {
         for d in &config.root.block {
             walk(d, &mut out);
         }
-        // 必须在 install_splits 之后调用：分支值也是操作者写死在配置里的落点
-        for v in crate::engine::split_branch_values() {
-            if let Some(h) = literal_host(&v) {
+        // 分支值也是操作者写死在配置里的落点
+        for v in split_values {
+            if let Some(h) = literal_host(v) {
+                out.insert(h);
+            }
+        }
+        // canary 的每个版本同样是配置里写死的落点：灰度变量用在 proxy_pass 主机位时，
+        // 只有这里列得出来的版本才允许真正去连。
+        for v in canary_values {
+            if let Some(h) = literal_host(v) {
                 out.insert(h);
             }
         }
@@ -1796,11 +2236,23 @@ impl Router {
 
         // 顶层 `split_clients` 指令：按键模板哈希加权分流的派生变量表
         let splits = Self::parse_splits(config, &mut warnings)?;
+        // 顶层 `canary` 指令：按请求特征（cookie/header/arg/ua/os + 百分比）选版本的灰度表
+        let canaries = Self::parse_canaries(config, &mut warnings)?;
+        // 顶层 `wasm_plugin`：构建期编译一次，location 里按名字引用
+        let wasm_plugins = Self::parse_wasm_plugins(config, base_dir)?;
+        // 路由表构建用本地这一份（请求期才读全局表），避免与别的构建互相看见
+        let derived = DerivedDefs::new(&splits, &canaries, wasm_plugins);
         crate::engine::install_splits(splits);
+        crate::engine::install_canaries(canaries);
+        crate::wasm::install(derived.wasm.values().cloned().collect());
 
         // 主机位是**非分流**变量时的运行期落点白名单（见 declared_targets）。整份配置算一次，
         // 所有 location 共享同一个 Arc；目标写死或走分流的 location 拿到的是 None，不多查一次表。
-        let var_targets = Arc::new(Self::declared_targets(config));
+        let var_targets = Arc::new(Self::declared_targets_with(
+            config,
+            &derived.split_values,
+            &derived.canary_values,
+        ));
 
         let limits_declared: Vec<String> = config
             .root
@@ -1875,6 +2327,7 @@ impl Router {
                    "access_by_lua_file", "rewrite_by_lua", "rewrite_by_lua_file",
                    "header_filter_by_lua", "header_filter_by_lua_file",
                    "body_filter_by_lua", "body_filter_by_lua_file",
+                   "access_by_wasm", "header_filter_by_wasm", "body_filter_by_wasm",
                    "log_by_lua", "log_by_lua_file",
                    "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
                    "allow", "deny", "auth_basic", "auth_basic_user_file",
@@ -1905,6 +2358,7 @@ impl Router {
                 &schedule_declared,
                 &var_targets,
                 &front_profiles,
+                &derived,
                 &mut warnings,
             )?;
             if tmpl.front_proxy.enabled() {
@@ -2445,7 +2899,7 @@ impl Router {
     fn warn_unknown_top_level(config: &Config, warnings: &mut Vec<String>) {
         const KNOWN: &[&str] = &[
             "server", "stream", "upstream",
-            "map", "geo", "split_clients",
+            "map", "geo", "split_clients", "canary",
             "limit_req_zone", "limit_conn_zone", "limit_req_status", "limit_conn_status",
             "lua_shared_dict", "init_by_lua", "init_by_lua_file",
             "init_worker_by_lua", "init_worker_by_lua_file", "lua_package_path",
@@ -2453,7 +2907,8 @@ impl Router {
             "error_log", "error_log_max_size", "error_log_keep",
             "access_log", "access_log_max_size", "access_log_keep",
             "resolver", "resolver_timeout", "pid",
-            "worker_connections", "client_header_timeout", "client_body_timeout",
+            "worker_connections", "worker_threads", "worker_cpu_affinity",
+            "client_header_timeout", "client_body_timeout",
             "keepalive_timeout", "tls_handshake_timeout", "shutdown_grace",
             "keepalive_requests", "server_tokens", "tcp_nodelay", "accept_backlog",
             "gzip", "gzip_min_length", "gzip_comp_level", "gzip_types", "reload",
@@ -2461,7 +2916,7 @@ impl Router {
             "still_online_zone",
             "learning", "learning_memory_budget", "proxy_cache_learning",
             "limit_req_queue", "limit_req_learning", "vip_learning",
-            "front_proxy",
+            "front_proxy", "wasm_plugin",
             "schedule_window",
             "cache_governor", "cache_governor_low", "cache_governor_high",
             "cache_governor_hold", "cache_governor_tier", "cache_governor_learn",
@@ -2471,7 +2926,7 @@ impl Router {
             match d.name.as_str() {
                 "worker_processes" => warnings.push(format!(
                     "顶层第 {} 行：worker_processes 已忽略（ONRouter 为单进程多线程模型，\
-                     工作线程数固定为 CPU 核数）",
+                     线程数请用 worker_threads N 设置）",
                     d.line
                 )),
                 "log_format" => warnings.push(format!(
@@ -2495,6 +2950,7 @@ impl Router {
         windows: &[String],
         var_targets: &Arc<HashSet<String>>,
         front_profiles: &std::sync::Arc<Vec<std::sync::Arc<crate::front_proxy::FrontProfile>>>,
+        derived: &DerivedDefs,
         warnings: &mut Vec<String>,
     ) -> Result<ServerTemplate, AppError> {
         let mut tmpl = ServerTemplate {
@@ -2894,7 +3350,7 @@ impl Router {
         for loc in d.block.iter().filter(|x| x.name == "location") {
             tmpl.locations
                 .push(Self::build_location(
-                    loc, base_dir, &tmpl, limits, windows, var_targets, warnings,
+                    loc, base_dir, &tmpl, limits, windows, var_targets, derived, warnings,
                 )?);
         }
         Ok(tmpl)
@@ -2907,6 +3363,7 @@ impl Router {
         limits: &[String],
         windows: &[String],
         var_targets: &Arc<HashSet<String>>,
+        derived: &DerivedDefs,
         warnings: &mut Vec<String>,
     ) -> Result<Location, AppError> {
         let (modifier, pattern) = match (d.arg(0), d.arg(1)) {
@@ -2952,6 +3409,7 @@ impl Router {
             proxy_tls: tmpl.proxy_tls.clone(),
             rust_phases: Vec::new(),
             lua_phases: Vec::new(),
+            wasm_phases: Vec::new(),
             root: None,
             alias: None,
             index: None,
@@ -2991,6 +3449,7 @@ impl Router {
                "content_by_lua_file", "access_by_lua", "access_by_lua_file", "rewrite_by_lua",
                "rewrite_by_lua_file", "header_filter_by_lua", "header_filter_by_lua_file",
                "body_filter_by_lua", "body_filter_by_lua_file",
+               "access_by_wasm", "header_filter_by_wasm", "body_filter_by_wasm",
                "log_by_lua", "log_by_lua_file",
                "balancer_by_lua", "balancer_by_lua_file",
                "content_by_rust", "access_by_rust", "rewrite_by_rust", "log_by_rust",
@@ -3139,7 +3598,7 @@ impl Router {
                     )));
                 }
                 TargetVar::Var(name) => {
-                    match crate::engine::split_def(&name) {
+                    match derived.splits.get(&name) {
                         Some(def) => {
                             let branches: Vec<(f64, String)> = def
                                 .buckets
@@ -3178,6 +3637,7 @@ impl Router {
                                 branches,
                                 star: def.star.clone(),
                                 stats: crate::engine::register_split_route(&name, &targets),
+                                summary: None,
                             });
                             if d.block
                                 .iter()
@@ -3192,27 +3652,89 @@ impl Router {
                             }
                         }
                         None => {
-                            // 变量来自 set/map/geo/请求本身：目标照样跟着变量走，但没有声明好的分支列表可退。
-                            // 这里最危险的一面是"客户端决定网关连到哪里"（$http_x_target、$arg_host、
-                            // $cookie_route 都是请求可控的），所以挂上落点白名单：运行期解析出的目标
-                            // 必须是配置里列得出来的落点，否则不回源。
-                            loc.var_targets = Some(Arc::clone(var_targets));
-                            if split_failover_declared && loc.split_failover != SplitFailover::Off {
-                                return Err(AppError::Other(format!(
-                                    "location '{}'：proxy_pass http://${name}（第 {} 行）里的 ${name} 不是 \
-                                     split_clients 的目标，网关列不出候选分支，proxy_split_failover \
-                                     不可能生效。要么把 ${name} 改成某个 split_clients 的 $dest，\
-                                     要么写 proxy_split_failover off;",
+                            if let Some(canary) = derived.canaries.get(&name) {
+                                // 灰度变量：规则表本身就是一组可枚举的版本落点，
+                                // 因此复用 split_clients 的 RouteSplit —— 候选顺序、整池
+                                // 不可用时的改投、落点账本全部同一套，只是选版本的依据
+                                // 从哈希换成了请求特征（cookie/header/arg/ua/os）。
+                                let mut targets: Vec<String> = canary
+                                    .rules
+                                    .iter()
+                                    .map(|r| r.target.clone())
+                                    .chain(canary.buckets.iter().map(|b| b.result.clone()))
+                                    .chain(std::iter::once(canary.default.clone()))
+                                    .collect();
+                                targets.retain(|t| !t.is_empty());
+                                targets.dedup();
+                                Self::check_split_branch_targets(
+                                    &name,
+                                    &targets,
+                                    &loc.split_failover,
+                                    d.line,
+                                )
+                                .map_err(|e| {
+                                    AppError::Other(format!("location '{}'：{e}", loc.pattern))
+                                })?;
+                                // 条件命中的版本权重记 0：它们不参与百分比，但必须在
+                                // 候选顺序里（否则选中的版本整池挂掉时改投不到别的版本）。
+                                let mut branches: Vec<(f64, String)> = Vec::new();
+                                for r in &canary.rules {
+                                    if !branches.iter().any(|(_, t)| t == &r.target) {
+                                        branches.push((0.0, r.target.clone()));
+                                    }
+                                }
+                                for b in &canary.buckets {
+                                    if let Some(slot) =
+                                        branches.iter_mut().find(|(_, t)| t == &b.result)
+                                    {
+                                        slot.0 += b.percent;
+                                    } else {
+                                        branches.push((b.percent, b.result.clone()));
+                                    }
+                                }
+                                loc.route_split = Some(RouteSplit {
+                                    dest: name.clone(),
+                                    key: canary.key.clone(),
+                                    branches,
+                                    star: Some(canary.default.clone()),
+                                    stats: crate::engine::register_split_route(&name, &targets),
+                                    summary: Some(canary.summary()),
+                                });
+                                if d.block
+                                    .iter()
+                                    .filter(|x| x.name == "proxy_redirect")
+                                    .any(|x| x.arg(0) == Some("default"))
+                                {
+                                    warnings.push(format!(
+                                        "location '{}'：proxy_redirect default 无法从 http://${name} 推断改写规则\
+                                         （目标是灰度变量），请改成显式 proxy_redirect <原文> <替换>",
+                                        loc.pattern
+                                    ));
+                                }
+                            } else {
+                                // 变量来自 set/map/geo/请求本身：目标照样跟着变量走，但没有声明好的分支列表可退。
+                                // 这里最危险的一面是"客户端决定网关连到哪里"（$http_x_target、$arg_host、
+                                // $cookie_route 都是请求可控的），所以挂上落点白名单：运行期解析出的目标
+                                // 必须是配置里列得出来的落点，否则不回源。
+                                loc.var_targets = Some(Arc::clone(var_targets));
+                                if split_failover_declared && loc.split_failover != SplitFailover::Off {
+                                    return Err(AppError::Other(format!(
+                                        "location '{}'：proxy_pass http://${name}（第 {} 行）里的 ${name} 不是 \
+                                         split_clients/canary 的目标，网关列不出候选分支，proxy_split_failover \
+                                         不可能生效。要么把 ${name} 改成某个 split_clients 或 canary 的 $dest，\
+                                         要么写 proxy_split_failover off;",
+                                        loc.pattern, d.line
+                                    )));
+                                }
+                                warnings.push(format!(
+                                    "location '{}'：proxy_pass http://${name}（第 {} 行）的变量不是 split_clients \
+                                     产的，也不是 canary 产的，按比例/灰度分流不生效（目标随变量变，但选中的目标不可用时\
+                                     不会改投）；运行期只连配置里列得出来的落点（已声明的 upstream 池 / 写死的 \
+                                     proxy_pass 主机 / split_clients 分支 / canary 版本 / proxy_split_failover \
+                                     目标），其余 502 不回源",
                                     loc.pattern, d.line
-                                )));
+                                ));
                             }
-                            warnings.push(format!(
-                                "location '{}'：proxy_pass http://${name}（第 {} 行）的变量不是 split_clients \
-                                 产的，按比例分流不生效（目标随变量变，但选中的目标不可用时不会改投）；\
-                                 运行期只连配置里列得出来的落点（已声明的 upstream 池 / 写死的 proxy_pass \
-                                 主机 / split_clients 分支 / proxy_split_failover 目标），其余 502 不回源",
-                                loc.pattern, d.line
-                            ));
                         }
                     }
                 }
@@ -3473,6 +3995,48 @@ impl Router {
                 if let Some(src) = LuaSource::from_directive(dir, base_dir) {
                     loc.lua_phases.push((phase, name.to_string(), src));
                 }
+            }
+        }
+        // WASM 插件按阶段引用：名字必须已由顶层 wasm_plugin 声明，
+        // 模块必须导出对应阶段的函数 —— 两条都在 -t 拦下，别等线上第一个请求才 500。
+        for (dir_name, phase) in [
+            ("access_by_wasm", crate::wasm::WasmPhase::Access),
+            ("header_filter_by_wasm", crate::wasm::WasmPhase::HeaderFilter),
+            ("body_filter_by_wasm", crate::wasm::WasmPhase::BodyFilter),
+        ] {
+            for dir in d.block.iter().filter(|x| x.name == dir_name) {
+                let plugin_name = dir.arg(0).filter(|s| !s.is_empty()).ok_or_else(|| {
+                    AppError::Other(format!(
+                        "location '{}'（第 {} 行）的 {dir_name} 缺少插件名",
+                        loc.pattern, dir.line
+                    ))
+                })?;
+                let Some(plugin) = derived.wasm.get(plugin_name) else {
+                    let mut names: Vec<&str> =
+                        derived.wasm.keys().map(|s| s.as_str()).collect();
+                    names.sort_unstable();
+                    return Err(AppError::Other(format!(
+                        "location '{}'（第 {} 行）的 {dir_name} 引用了未声明的 WASM 插件 '{plugin_name}'\
+                         （已声明：{}）。先在顶层写 wasm_plugin {plugin_name} <path>;",
+                        loc.pattern,
+                        dir.line,
+                        if names.is_empty() {
+                            "无".to_string()
+                        } else {
+                            names.join(" / ")
+                        }
+                    )));
+                };
+                if !plugin.has_export(phase.export()) {
+                    return Err(AppError::Other(format!(
+                        "location '{}'（第 {} 行）：WASM 插件 '{plugin_name}' 没有导出 {}()，\
+                         {dir_name} 在运行时只会每次报错；请检查模块导出名",
+                        loc.pattern,
+                        dir.line,
+                        phase.export()
+                    )));
+                }
+                loc.wasm_phases.push((phase, Arc::clone(plugin)));
             }
         }
         Ok(loc)
@@ -3777,6 +4341,125 @@ mod tests {
             .clone()
             .expect("主机位是变量的 location 必须带落点白名单");
         assert!(set.contains("pool_a"), "{set:?}");
+    }
+
+    #[test]
+    fn parse_canary_conditions_percent_and_default() {
+        let c = cfg(
+            r#"canary $release "${cookie_sid}${remote_addr}" {
+                 cookie home_beta=1 beta;
+                 cookie early_access beta;
+                 header X-Client-Channel=CANARY beta;
+                 arg ver=beta beta;
+                 ua ~* Firefox|Edg beta;
+                 os ios beta;
+                 percent 10 beta;
+                 default stable;
+               }"#,
+        );
+        let mut w = Vec::new();
+        let defs = Router::parse_canaries(&c, &mut w).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(defs.len(), 1);
+        let d = &defs[0];
+        assert_eq!(d.dest, "release");
+        assert_eq!(d.key, "${cookie_sid}${remote_addr}");
+        assert_eq!(d.default, "stable");
+        assert_eq!(d.rules.len(), 6);
+        assert_eq!(d.buckets.len(), 1);
+        let s = d.summary();
+        for want in [
+            "cookie home_beta=1→beta",
+            "cookie early_access→beta",
+            "header X-Client-Channel=CANARY→beta",
+            "arg ver=beta→beta",
+            "ua ~* Firefox|Edg→beta",
+            "os ios→beta",
+            "10%→beta",
+            "default→stable",
+        ] {
+            assert!(s.contains(want), "缺少 {want}: {s}");
+        }
+    }
+
+    #[test]
+    fn parse_canary_rejects_config_that_cannot_work() {
+        for conf in [
+            // 没有 default：未命中的请求没有版本可去
+            "canary $rel { cookie beta beta2; }",
+            // 只有 default：永远不会有灰度
+            "canary $rel { default stable; }",
+            // 未知操作系统 / 无法编译的正则 / 条件参数不足 / 未知条件
+            "canary $rel { os plan9 beta; default stable; }",
+            "canary $rel { ua ~ a(b beta; default stable; }",
+            "canary $rel { cookie x; default stable; }",
+            "canary $rel { warp x beta; default stable; }",
+            // 目标不能放在主机位
+            "canary $rel { cookie x a/b; default stable; }",
+            "canary $rel { percent 10; default stable; }",
+            // 负百分比 / 重复 default
+            "canary $rel { percent -1 beta; default stable; }",
+            "canary $rel { default a; default b; cookie x a; }",
+            // 内置变量名 / 与 map 撞名 / 重复声明
+            "canary $host { cookie x a; default b; }",
+            "map $http_ua $rel { default a; } canary $rel { cookie x b; default c; }",
+            "canary $rel { cookie x a; default b; } canary $rel { cookie y a; default b; }",
+        ] {
+            let c = cfg(conf);
+            let mut w = Vec::new();
+            assert!(
+                Router::parse_canaries(&c, &mut w).is_err(),
+                "应当拒绝: {conf}"
+            );
+        }
+        // 百分比超过 100% 仍可用，但必须留痕（与 split_clients 同一条规则）
+        let c = cfg("canary $rel { percent 60 a; percent 50 b; default c; }");
+        let mut w = Vec::new();
+        assert_eq!(Router::parse_canaries(&c, &mut w).unwrap().len(), 1);
+        assert!(w.iter().any(|x| x.contains("超过 100%")), "{w:?}");
+    }
+
+    #[test]
+    fn canary_variable_becomes_an_enumerable_route_split() {
+        let c = cfg(
+            "canary $release {
+                 cookie beta=1 127.0.0.1:18141;
+                 os ios 127.0.0.1:18141;
+                 percent 10 127.0.0.1:18141;
+                 default 127.0.0.1:18142;
+             }
+             server { listen 127.0.0.1:18140;
+               location / { proxy_pass http://$release; }
+             }",
+        );
+        let r = Router::build(&c, &PathBuf::from(".")).unwrap();
+        let loc = loc_at(&r, 18140, 0);
+        let sp = loc.route_split.as_ref().expect("灰度变量应接上 RouteSplit");
+        assert_eq!(sp.dest, "release");
+        assert_eq!(sp.star.as_deref(), Some("127.0.0.1:18142"));
+        assert!(
+            sp.summary.as_ref().unwrap().contains("os ios→127.0.0.1:18141"),
+            "{:?}",
+            sp.summary
+        );
+        assert_eq!(
+            sp.all_targets(),
+            vec![
+                "127.0.0.1:18141".to_string(),
+                "127.0.0.1:18142".to_string()
+            ],
+            "条件/百分比目标要全部可枚举，default 在最后"
+        );
+        assert!(
+            loc.var_targets.is_none(),
+            "灰度变量与 split_clients 一样走枚举候选，不走运行期白名单"
+        );
+        // -t 描述：说明这是灰度而不是比例
+        let line = sp.desc(&loc.split_failover, &loc.pattern);
+        assert!(
+            line.contains("灰度分流") && line.contains("default→127.0.0.1:18142"),
+            "{line}"
+        );
     }
 
     /// S11：限流区的 key 写了运行期根本不展开的变量，配置"看着生效"、实际按 IP 限。

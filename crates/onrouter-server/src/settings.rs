@@ -48,6 +48,33 @@ pub struct Settings {
     /// `reload <interval>;`：配置热重载的轮询间隔（mtime 变化才真正重载）。
     /// None = 不自动重载（unix 仍可用 SIGHUP 触发），Some(d) = 每 d 检查一次配置。
     pub reload: Option<Duration>,
+    /// `worker_threads <n>;`：tokio worker 线程数。None = 逻辑 CPU 数。
+    /// （nginx 的 `worker_processes` 是进程数，这里单进程多线程，故用独立指令名。）
+    pub worker_threads: Option<usize>,
+    /// `worker_cpu_affinity auto|off|mask...;`：worker 线程的 CPU 亲和性。
+    /// None = 不绑定；Auto = 逐线程绑到不同逻辑核；Masks = 逐线程轮换使用给定掩码。
+    pub worker_cpu_affinity: Option<CpuAffinity>,
+}
+
+/// `worker_cpu_affinity` 的取值：自动均分或显式 CPU 掩码列表（十六进制，nginx 同款写法）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CpuAffinity {
+    Auto,
+    Masks(Vec<u64>),
+}
+
+impl CpuAffinity {
+    /// 人类可读描述，`-t` 与启动日志共用。
+    pub fn describe(&self) -> String {
+        match self {
+            CpuAffinity::Auto => "auto".to_string(),
+            CpuAffinity::Masks(masks) => masks
+                .iter()
+                .map(|m| format!("{m:016x}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
 }
 
 /// 响应体 gzip 压缩配置（对标 nginx ngx_http_gzip_module）
@@ -126,6 +153,8 @@ impl Default for Settings {
             accept_backlog: 512,
             gzip: GzipSettings::default(),
             reload: None,
+            worker_threads: None,
+            worker_cpu_affinity: None,
         }
     }
 }
@@ -256,6 +285,42 @@ impl Settings {
             }
         }
 
+        // worker_threads：tokio 运行时线程数。nginx 的 worker_processes 在单进程模型下无意义，
+        // 这个指令替代它，并让 CPU 亲和性有一个可对齐的基数。
+        if let Some(v) = config.find("worker_threads").and_then(|d| d.arg(0)) {
+            match v.parse::<usize>() {
+                Ok(n) if n > 0 && n <= 1024 => s.worker_threads = Some(n),
+                _ => warnings.push(format!(
+                    "worker_threads 需要 1..=1024 的整数（收到 '{v}'），使用逻辑 CPU 数"
+                )),
+            }
+        }
+        if let Some(d) = config.find("worker_cpu_affinity") {
+            match d.arg(0).map(|v| v.to_ascii_lowercase()).as_deref() {
+                Some("off") | None => s.worker_cpu_affinity = None,
+                Some("auto") => s.worker_cpu_affinity = Some(CpuAffinity::Auto),
+                _ => {
+                    let mut masks = Vec::new();
+                    let mut bad = None;
+                    for raw in &d.args {
+                        match u64::from_str_radix(raw.trim(), 16) {
+                            Ok(0) | Err(_) => {
+                                bad = Some(raw.clone());
+                                break;
+                            }
+                            Ok(m) => masks.push(m),
+                        }
+                    }
+                    match bad {
+                        Some(raw) => warnings.push(format!(
+                            "worker_cpu_affinity 掩码 '{raw}' 非法（应为非零十六进制，如 00000001），已忽略"
+                        )),
+                        None => s.worker_cpu_affinity = Some(CpuAffinity::Masks(masks)),
+                    }
+                }
+            }
+        }
+
         // hyper 的 http1 只有一个读头超时，它同时覆盖"慢速发头"与"keep-alive 空闲"，
         // 因此取两者较大值：否则 keep-alive 空闲会被 header 超时提前掐断导致频繁重连。
         s.client_header_timeout = s.client_header_timeout.max(s.keepalive_timeout);
@@ -338,6 +403,34 @@ mod tests {
         let (s, warnings) = Settings::from_config(&Config::parse("reload banana;").unwrap());
         assert_eq!(s.reload, None);
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn parses_worker_threads_and_affinity() {
+        let cfg = Config::parse(
+            "worker_threads 6; worker_cpu_affinity 00000001 00000002 00000004;",
+        )
+        .unwrap();
+        let (s, warnings) = Settings::from_config(&cfg);
+        assert_eq!(s.worker_threads, Some(6));
+        assert_eq!(
+            s.worker_cpu_affinity,
+            Some(CpuAffinity::Masks(vec![1, 2, 4]))
+        );
+        assert!(warnings.is_empty());
+
+        let (s, _) = Settings::from_config(&Config::parse("worker_cpu_affinity auto;").unwrap());
+        assert_eq!(s.worker_cpu_affinity, Some(CpuAffinity::Auto));
+
+        let (s, _) = Settings::from_config(&Config::parse("worker_cpu_affinity 0000;").unwrap());
+        assert_eq!(s.worker_cpu_affinity, None, "零掩码必须被拒绝");
+
+        let (s, warnings) = Settings::from_config(
+            &Config::parse("worker_threads 0; worker_cpu_affinity zzzz;").unwrap(),
+        );
+        assert_eq!(s.worker_threads, None);
+        assert_eq!(s.worker_cpu_affinity, None);
+        assert_eq!(warnings.len(), 2);
     }
 
     #[test]

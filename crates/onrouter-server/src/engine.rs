@@ -662,6 +662,9 @@ pub fn resolve_var(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
     if let Some(s) = resolve_split(ctx, name, depth) {
         return Some(s);
     }
+    if let Some(c) = resolve_canary(ctx, name, depth) {
+        return Some(c);
+    }
     builtin_var(ctx, name)
 }
 
@@ -987,6 +990,255 @@ pub fn split_branch_values() -> Vec<String> {
         out.extend(d.star.clone());
     }
     out
+}
+
+// ---------- 灰度发布（canary）：按请求特征选择版本 ----------
+
+/// 一条灰度条件。全部来自请求本身（Cookie / Header / query / User-Agent / OS），
+/// 不回源、不写请求，只决定 `$canary` 展开成哪个版本。
+#[derive(Debug, Clone)]
+pub enum CanaryWhen {
+    /// `cookie <name> <target>`（存在且非空）或 `cookie <name>=<value> <target>`（精确）
+    Cookie { name: String, value: Option<String> },
+    /// `header <name> ...`，头名大小写不敏感
+    Header { name: String, value: Option<String> },
+    /// `arg <name> ...`，query 参数名大小写敏感（与 `$arg_*` 一致）
+    Arg { name: String, value: Option<String> },
+    /// `ua ~ <re> <target>` / `ua ~* <re> <target>`
+    UserAgent {
+        regex: regex::Regex,
+        pattern: String,
+        case_insensitive: bool,
+    },
+    /// `os windows|macos|linux|android|ios|other <target>`
+    Os(CanaryOs),
+}
+
+/// 灰度规则认的操作系统族。识别顺序在 [`detect_os`] 里固定：iOS 先于 macOS、
+/// Android 先于 Linux —— 这两组 UA 都同时含有后者的标记，顺序错了会把 iPhone
+/// 判成 Mac、把 Android 判成 Linux。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanaryOs {
+    Windows,
+    Macos,
+    Linux,
+    Android,
+    Ios,
+    Other,
+}
+
+impl CanaryOs {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "windows" | "win" => Some(CanaryOs::Windows),
+            "macos" | "mac" | "osx" | "macosx" => Some(CanaryOs::Macos),
+            "linux" => Some(CanaryOs::Linux),
+            "android" => Some(CanaryOs::Android),
+            "ios" | "iphone" | "ipad" => Some(CanaryOs::Ios),
+            "other" | "unknown" => Some(CanaryOs::Other),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CanaryOs::Windows => "windows",
+            CanaryOs::Macos => "macos",
+            CanaryOs::Linux => "linux",
+            CanaryOs::Android => "android",
+            CanaryOs::Ios => "ios",
+            CanaryOs::Other => "other",
+        }
+    }
+}
+
+/// 从 User-Agent 判操作系统族。标记顺序即语义的一部分（见 [`CanaryOs`]）。
+pub fn detect_os(ua: &str) -> CanaryOs {
+    let ua = ua.to_ascii_lowercase();
+    if ua.contains("iphone") || ua.contains("ipad") || ua.contains("ipod") {
+        CanaryOs::Ios
+    } else if ua.contains("android") {
+        CanaryOs::Android
+    } else if ua.contains("windows") {
+        CanaryOs::Windows
+    } else if ua.contains("macintosh") || ua.contains("mac os x") {
+        CanaryOs::Macos
+    } else if ua.contains("linux") || ua.contains("cros") {
+        CanaryOs::Linux
+    } else {
+        CanaryOs::Other
+    }
+}
+
+fn ua_of<'a>(ctx: &'a RequestCtx) -> &'a str {
+    ctx.header("user-agent").unwrap_or("")
+}
+
+/// 条件值匹配：`want=None` 表示"存在且非空"，`Some(v)` 表示精确相等。
+/// 空值不算"存在"——`Cookie: release=` 是浏览器清掉标记后的常见残留，
+/// 把它当成灰度命中会让用户永远回不到默认版本。
+fn canary_value_matches(actual: Option<String>, want: &Option<String>) -> bool {
+    match (actual, want) {
+        (None, _) => false,
+        (Some(v), None) => !v.is_empty(),
+        (Some(v), Some(w)) => v == *w,
+    }
+}
+
+impl CanaryWhen {
+    pub fn matches(&self, ctx: &RequestCtx) -> bool {
+        match self {
+            CanaryWhen::Cookie { name, value } => {
+                canary_value_matches(cookie_value(ctx, name), value)
+            }
+            CanaryWhen::Header { name, value } => {
+                canary_value_matches(ctx.header(name).map(str::to_string), value)
+            }
+            CanaryWhen::Arg { name, value } => {
+                canary_value_matches(query_arg(ctx, name), value)
+            }
+            CanaryWhen::UserAgent { regex, .. } => regex.is_match(ua_of(ctx)),
+            CanaryWhen::Os(os) => detect_os(ua_of(ctx)) == *os,
+        }
+    }
+
+    /// `-t` / 启动横幅里的条件自述；与配置写法尽量同形，运维一眼能对上。
+    pub fn label(&self) -> String {
+        match self {
+            CanaryWhen::Cookie { name, value } => match value {
+                Some(v) => format!("cookie {name}={v}"),
+                None => format!("cookie {name}"),
+            },
+            CanaryWhen::Header { name, value } => match value {
+                Some(v) => format!("header {name}={v}"),
+                None => format!("header {name}"),
+            },
+            CanaryWhen::Arg { name, value } => match value {
+                Some(v) => format!("arg {name}={v}"),
+                None => format!("arg {name}"),
+            },
+            CanaryWhen::UserAgent {
+                pattern,
+                case_insensitive,
+                ..
+            } => format!("ua {} {pattern}", if *case_insensitive { "~*" } else { "~" }),
+            CanaryWhen::Os(os) => format!("os {}", os.as_str()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CanaryRule {
+    pub when: CanaryWhen,
+    pub target: String,
+}
+
+/// 顶层 `canary $dest [key] { ... }`：按声明顺序取第一条命中的规则；
+/// 都不命中时用 `percent` 对粘性键做哈希分桶；最后落到 `default`。
+#[derive(Debug, Clone)]
+pub struct CanaryDef {
+    pub dest: String,
+    pub rules: Vec<CanaryRule>,
+    pub buckets: Vec<SplitBucket>,
+    /// 百分比档的粘性键模板（缺省 `${remote_addr}`）
+    pub key: String,
+    /// 必填：没有任何条件/百分比命中时的版本，也是灰度回退的终点
+    pub default: String,
+}
+
+impl CanaryDef {
+    /// `-t` / 启动横幅里的一行规则自述（不含 location）。
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = self
+            .rules
+            .iter()
+            .map(|r| format!("{}→{}", r.when.label(), r.target))
+            .collect();
+        parts.extend(
+            self.buckets
+                .iter()
+                .map(|b| format!("{}%→{}", trim_percent(b.percent), b.result)),
+        );
+        parts.push(format!("default→{}", self.default));
+        format!("[{}]", parts.join(" "))
+    }
+}
+
+fn trim_percent(p: f64) -> String {
+    let s = format!("{p:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+static CANARIES: std::sync::OnceLock<std::sync::RwLock<Vec<Arc<CanaryDef>>>> =
+    std::sync::OnceLock::new();
+/// 没配 canary 时（绝大多数部署）让 `resolve_var` 只付一次原子读，
+/// 不读锁、不扫表 —— 变量解析在每请求热路径上被调用很多次。
+static CANARY_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn canary_store() -> &'static std::sync::RwLock<Vec<Arc<CanaryDef>>> {
+    CANARIES.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// 由 Router::build 在每次构建路由表时原子替换（与 map/geo/split 一样热重载安全）。
+pub fn install_canaries(defs: Vec<CanaryDef>) {
+    CANARY_ACTIVE.store(!defs.is_empty(), std::sync::atomic::Ordering::Release);
+    *canary_store().write().unwrap() = defs.into_iter().map(Arc::new).collect();
+}
+
+/// 按目标变量名查灰度定义（构建路由表时用来把 `proxy_pass http://$x` 接上候选表）。
+pub fn canary_def(dest: &str) -> Option<Arc<CanaryDef>> {
+    if !CANARY_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    canary_store()
+        .read()
+        .unwrap()
+        .iter()
+        .find(|d| d.dest == dest)
+        .cloned()
+}
+
+/// 配置里每一条 canary 写过的版本值（规则 + 百分比 + default），
+/// 供路由表构建"能列出来的落点"集合（与 `split_branch_values` 同责）。
+pub fn canary_target_values() -> Vec<String> {
+    if !CANARY_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
+    let store = canary_store().read().unwrap();
+    let mut out = Vec::new();
+    for d in store.iter() {
+        out.extend(d.rules.iter().map(|r| r.target.clone()));
+        out.extend(d.buckets.iter().map(|b| b.result.clone()));
+        out.push(d.default.clone());
+    }
+    out
+}
+
+fn resolve_canary(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {
+    let def = canary_def(name)?;
+    Some(match_canary(&def, ctx, depth + 1))
+}
+
+/// 纯规则求值：条件按声明顺序第一条命中；否则百分比哈希分桶；最后 default。
+/// 与全局表解耦，便于单测直接喂任意规则组合（并发单测里全局表会被互相覆盖）。
+fn match_canary(def: &CanaryDef, ctx: &RequestCtx, depth: u8) -> String {
+    for r in &def.rules {
+        if r.when.matches(ctx) {
+            return r.target.clone();
+        }
+    }
+    if !def.buckets.is_empty() {
+        let key = expand_split_key(ctx, &def.key, depth);
+        let id = split_id(&key);
+        let mut sum = 0.0;
+        for b in &def.buckets {
+            sum += b.percent * 100.0;
+            if (id as f64) < sum {
+                return b.result.clone();
+            }
+        }
+    }
+    def.default.clone()
 }
 
 // ---------- 分流落点统计（split_clients 的结果被 proxy_pass 当路由目标时） ----------
@@ -1893,6 +2145,200 @@ mod tests {
             "203.0.113.7curl/8"
         );
         assert_eq!(expand_split_key(&ctx, "$remote_addr-$no_such", 0), "203.0.113.7-");
+    }
+
+    // ---- canary：灰度条件与求值 ----
+
+    fn canary_ctx() -> RequestCtx {
+        let mut ctx = RequestCtx::default();
+        ctx.remote_addr = "203.0.113.7".into();
+        ctx.query = "ver=beta&debug=1".into();
+        ctx.req_headers
+            .push(("cookie".into(), "sid=abc; release=beta".into()));
+        ctx.req_headers
+            .push(("x-client-channel".into(), "CANARY".into()));
+        ctx
+    }
+
+    #[test]
+    fn canary_conditions_read_cookie_header_arg_and_ua() {
+        let ctx = canary_ctx();
+        // cookie：精确值 / 存在且非空
+        let cookie = |v: Option<&str>| CanaryWhen::Cookie {
+            name: "release".into(),
+            value: v.map(str::to_string),
+        };
+        assert!(cookie(Some("beta")).matches(&ctx));
+        assert!(!cookie(Some("stable")).matches(&ctx));
+        assert!(cookie(None).matches(&ctx), "存在即命中");
+        // 空 cookie 是浏览器清标记后的残留，不算命中
+        let mut empty = canary_ctx();
+        empty.req_headers[0].1 = "release=".into();
+        assert!(!cookie(None).matches(&empty));
+        assert!(!cookie(Some("beta")).matches(&empty));
+
+        // header 名大小写不敏感，值大小写敏感
+        let hdr = |v: Option<&str>| CanaryWhen::Header {
+            name: "X-Client-Channel".into(),
+            value: v.map(str::to_string),
+        };
+        assert!(hdr(Some("CANARY")).matches(&ctx));
+        assert!(!hdr(Some("canary")).matches(&ctx));
+        assert!(hdr(None).matches(&ctx));
+
+        // query 参数（百分号解码由既有 query_arg 负责）
+        let arg = |v: Option<&str>| CanaryWhen::Arg {
+            name: "ver".into(),
+            value: v.map(str::to_string),
+        };
+        assert!(arg(Some("beta")).matches(&ctx));
+        assert!(!arg(Some("stable")).matches(&ctx));
+        assert!(arg(None).matches(&ctx));
+
+        // UA 正则：区分大小写与不区分两档
+        let ua = |pat: &str, ci: bool| CanaryWhen::UserAgent {
+            regex: regex::RegexBuilder::new(pat)
+                .case_insensitive(ci)
+                .build()
+                .unwrap(),
+            pattern: pat.to_string(),
+            case_insensitive: ci,
+        };
+        let mut mic = canary_ctx();
+        mic.req_headers
+            .push(("user-agent".into(), "Mozilla/5.0 Firefox/129.0".into()));
+        assert!(ua("firefox", true).matches(&mic));
+        assert!(!ua("firefox", false).matches(&mic));
+        assert!(ua("Firefox/[0-9]+", false).matches(&mic));
+
+        // os 条件复用同一份 UA 判据
+        let mut ios = canary_ctx();
+        ios.req_headers.push((
+            "user-agent".into(),
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)".into(),
+        ));
+        assert!(CanaryWhen::Os(CanaryOs::Ios).matches(&ios));
+        assert!(!CanaryWhen::Os(CanaryOs::Macos).matches(&ios));
+    }
+
+    #[test]
+    fn detect_os_orders_ios_before_macos_and_android_before_linux() {
+        // 两组 UA 都同时含后者标记：顺序错了就会把 iPhone 判成 Mac、Android 判成 Linux
+        assert_eq!(
+            detect_os("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"),
+            CanaryOs::Ios
+        );
+        assert_eq!(
+            detect_os("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"),
+            CanaryOs::Macos
+        );
+        assert_eq!(
+            detect_os("Mozilla/5.0 (Linux; Android 13; Pixel 7)"),
+            CanaryOs::Android
+        );
+        assert_eq!(
+            detect_os("Mozilla/5.0 (X11; Linux x86_64)"),
+            CanaryOs::Linux
+        );
+        assert_eq!(
+            detect_os("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
+            CanaryOs::Windows
+        );
+        assert_eq!(detect_os("curl/8.4.0"), CanaryOs::Other);
+        // 配置别名与回显一致
+        assert_eq!(CanaryOs::parse("WIN"), Some(CanaryOs::Windows));
+        assert_eq!(CanaryOs::parse("osx"), Some(CanaryOs::Macos));
+        assert_eq!(CanaryOs::parse("plan9"), None);
+        assert_eq!(CanaryOs::Ios.as_str(), "ios");
+    }
+
+    #[test]
+    fn match_canary_prefers_first_rule_then_percent_then_default() {
+        let rule = |target: &str| CanaryRule {
+            when: CanaryWhen::Cookie {
+                name: "release".into(),
+                value: Some("beta".into()),
+            },
+            target: target.into(),
+        };
+        let def = CanaryDef {
+            dest: "release".into(),
+            rules: vec![rule("rule-hit")],
+            // 100% 桶：只要规则没命中就必然落到这里，用来证明"规则优先于百分比"
+            buckets: vec![SplitBucket {
+                percent: 100.0,
+                result: "percent".into(),
+            }],
+            key: "${remote_addr}".into(),
+            default: "stable".into(),
+        };
+        assert_eq!(match_canary(&def, &canary_ctx(), 0), "rule-hit");
+        let mut plain = canary_ctx();
+        plain.req_headers[0].1 = "sid=abc".into();
+        assert_eq!(
+            match_canary(&def, &plain, 0),
+            "percent",
+            "规则未命中时先走百分比，而不是直接掉到 default"
+        );
+
+        // 没有百分比档时落到 default
+        let no_pct = CanaryDef {
+            dest: "release".into(),
+            rules: vec![rule("rule-hit")],
+            buckets: Vec::new(),
+            key: "${remote_addr}".into(),
+            default: "stable".into(),
+        };
+        assert_eq!(match_canary(&no_pct, &plain, 0), "stable");
+    }
+
+    #[test]
+    fn canary_percent_is_sticky_per_key_and_covers_both_sides() {
+        let def = CanaryDef {
+            dest: "release".into(),
+            rules: Vec::new(),
+            buckets: vec![
+                SplitBucket { percent: 50.0, result: "a".into() },
+                SplitBucket { percent: 50.0, result: "b".into() },
+            ],
+            key: "${cookie_sid}".into(),
+            default: "stable".into(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..200 {
+            let mut ctx = RequestCtx::default();
+            ctx.req_headers
+                .push(("cookie".into(), format!("sid=user-{i}")));
+            let first = match_canary(&def, &ctx, 0);
+            // 同一用户重复访问必须稳定落在同一版本（粘性键的全部意义）
+            assert_eq!(first, match_canary(&def, &ctx, 0));
+            seen.insert(first);
+        }
+        assert_eq!(
+            seen,
+            ["a".to_string(), "b".to_string()].into_iter().collect(),
+            "50/50 分桶应覆盖两边，实际 {seen:?}"
+        );
+    }
+
+    #[test]
+    fn canary_summary_lists_rules_percent_and_default() {
+        let def = CanaryDef {
+            dest: "release".into(),
+            rules: vec![CanaryRule {
+                when: CanaryWhen::Os(CanaryOs::Ios),
+                target: "beta".into(),
+            }],
+            buckets: vec![SplitBucket { percent: 0.5, result: "beta".into() }],
+            key: "${cookie_sid}".into(),
+            default: "stable".into(),
+        };
+        let s = def.summary();
+        assert!(s.contains("os ios→beta"), "{s}");
+        assert!(s.contains("0.5%→beta"), "{s}");
+        assert!(s.contains("default→stable"), "{s}");
+        // 粘性键由外层 location 描述统一追加一次，summary 里再写会重复
+        assert!(!s.contains("粘性键"), "{s}");
     }
 
     #[test]

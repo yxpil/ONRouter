@@ -1850,7 +1850,11 @@ async fn process(
                         .lua_phases
                         .iter()
                         .find(|(p, n, _)| *p == Phase::Content && n.starts_with("body_filter_by_lua"));
-                    if hf.is_none() && bf.is_none() && loc.sub_filter.is_none() {
+                    if hf.is_none()
+                        && bf.is_none()
+                        && !has_wasm_filter(loc)
+                        && loc.sub_filter.is_none()
+                    {
                         if so_target.is_none() {
                             return convert_upstream_response(upstream_resp, loc, server, ctx);
                         }
@@ -1908,6 +1912,9 @@ async fn process(
                         } else if let Some(nc) = ctx.filter_chunk.take() {
                             ctx.body = Some(nc);
                         }
+                    }
+                    if run_wasm_filters(loc, ctx, true) {
+                        return error_response(ctx, server, Some(loc), 500).await;
                     }
                     let body_bytes = bytes::Bytes::from(ctx.body.take().unwrap_or_default());
                     let hdrs = ctx.resp_headers.clone();
@@ -1975,10 +1982,27 @@ async fn process(
                         store_still_online(state, loc, ctx, so_zone, so_key, status, &hdrs, &body);
                     }
                 }
+                // 配了 WASM 响应过滤器：缓存里存上游原件，发给客户端的那份过过滤器。
+                // 先存后滤是刻意的——否则同一条响应每命中一次就被改写一次，缓存会漂移。
+                let (out_status, out_headers, out_body) = if has_wasm_filter(loc) {
+                    ctx.status = status;
+                    ctx.resp_headers = hdrs;
+                    ctx.body = Some(body.to_vec());
+                    if run_wasm_filters(loc, ctx, true) {
+                        return error_response(ctx, server, Some(loc), 500).await;
+                    }
+                    (
+                        ctx.status,
+                        std::mem::take(&mut ctx.resp_headers),
+                        Bytes::from(ctx.body.take().unwrap_or_default()),
+                    )
+                } else {
+                    (status, hdrs, body)
+                };
                 build_buffered_response(
-                    status,
-                    &hdrs,
-                    body,
+                    out_status,
+                    &out_headers,
+                    out_body,
                     loc,
                     server,
                     if cacheable { status_tag } else { "BYPASS" },
@@ -2032,6 +2056,7 @@ async fn process(
         // header/body filter 与 sub_filter 需要完整响应体才能处理，命中它们时不流式。
         let streamable = scope.allow_stream
             && loc.sub_filter.is_none()
+            && !has_wasm_filter(loc)
             && !loc.lua_phases.iter().any(|(p, n, _)| {
                 *p == Phase::Content
                     && (n.starts_with("header_filter_by_lua")
@@ -2097,13 +2122,20 @@ async fn process(
                 }
             }
         }
-        
+
+        if run_wasm_filters(loc, ctx, true) {
+            return error_response(ctx, server, Some(loc), 500).await;
+        }
+
         return finish_response(ctx, server, Some(loc));
     }
 
     if let Some((_, spec)) = loc.rust_phases.iter().find(|(p, _)| *p == Phase::Content) {
         if let Err(e) = state.handlers.run_phase(Phase::Content, spec, ctx).await {
             log_error!("content_by_rust 失败: {e}");
+            return error_response(ctx, server, Some(loc), 500).await;
+        }
+        if run_wasm_filters(loc, ctx, true) {
             return error_response(ctx, server, Some(loc), 500).await;
         }
         return finish_response(ctx, server, Some(loc));
@@ -2140,6 +2172,21 @@ async fn run_phases(
             return true;
         }
     }
+    // WASM 插件目前只接 access 阶段（响应过滤器在响应生成后单独跑）。与 Lua 共用
+    // ctx：插件改过的请求头会随转发送给后端，插件生成的响应走 ctx.done 收口。
+    if phase == Phase::Access {
+        for (p, plugin) in &loc.wasm_phases {
+            if *p != crate::wasm::WasmPhase::Access || ctx.done {
+                continue;
+            }
+            if let Err(e) = crate::wasm::access(plugin, ctx) {
+                log_error!("{e}");
+                ctx.status = 500;
+                ctx.done = true;
+                return true;
+            }
+        }
+    }
     let _ = server;
     false
 }
@@ -2161,6 +2208,39 @@ async fn run_lua(
         ctx.status = 500;
         ctx.done = true;
         return true;
+    }
+    false
+}
+
+fn has_wasm_filter(loc: &Location) -> bool {
+    loc.wasm_phases.iter().any(|(p, _)| {
+        matches!(
+            p,
+            crate::wasm::WasmPhase::HeaderFilter | crate::wasm::WasmPhase::BodyFilter
+        )
+    })
+}
+
+/// 运行 location 上声明的 WASM 响应过滤器（先全部 header_filter，再全部 body_filter）。
+/// 返回 true 表示失败：必须就此收口成 5xx。过滤器是"看过了才放行"的关口，
+/// 插件 trap 或耗尽 fuel 时把原响应原样发出去，等于让一个安全检查静默失效。
+fn run_wasm_filters(loc: &Location, ctx: &mut RequestCtx, with_body: bool) -> bool {
+    for (phase, plugin) in &loc.wasm_phases {
+        let wanted = match phase {
+            crate::wasm::WasmPhase::HeaderFilter => true,
+            crate::wasm::WasmPhase::BodyFilter => with_body,
+            crate::wasm::WasmPhase::Access => false,
+        };
+        if !wanted {
+            continue;
+        }
+        if let Err(e) = crate::wasm::filter(plugin, *phase, ctx) {
+            log_error!("{e}");
+            ctx.status = 500;
+            ctx.body = None;
+            ctx.done = true;
+            return true;
+        }
     }
     false
 }
@@ -2499,6 +2579,64 @@ async fn serve_static_flow(
                 FileSource::Memory(b) => b.len() as u64,
                 FileSource::Disk { len, .. } => *len,
             });
+            // WASM 响应过滤器：静态响应也要过（nginx 的 header/body filter 对静态文件同样生效）。
+            // 需要整份体，小文件/内存体直接改；超过缓冲上限的磁盘文件按原样发送（与 sub_filter
+            // 同一取舍：宁可漏一次改写，也不让一条过滤器指令变成内存放大开关）。
+            if has_wasm_filter(loc) {
+                let buffered = match &source {
+                    FileSource::Memory(b) => Some(b.clone()),
+                    FileSource::Disk { path, start, len } if *len <= SUB_FILTER_MAX_BUFFER => {
+                        match read_file_window(path, *start, *len).await {
+                            Ok(win) => Some(Bytes::from(win)),
+                            Err(e) => {
+                                log_warn!("静态文件读取失败 {}: {e}", path.display());
+                                return error_response(ctx, server, Some(loc), 404).await;
+                            }
+                        }
+                    }
+                    FileSource::Disk { path, len, .. } => {
+                        log_warn!(
+                            "WASM 响应过滤器跳过 {}: 响应体 {len} 字节超过缓冲上限 {} MiB，按原样发送",
+                            path.display(),
+                            SUB_FILTER_MAX_BUFFER >> 20
+                        );
+                        None
+                    }
+                };
+                if let Some(content) = buffered {
+                    let mut headers: Vec<(String, String)> = vec![
+                        ("content-type".to_string(), mime.clone()),
+                        ("server".to_string(), SERVER_HEADER.to_string()),
+                    ];
+                    if let Some(m) = &meta {
+                        headers.push(("etag".to_string(), m.etag.clone()));
+                        headers.push(("last-modified".to_string(), m.last_modified.clone()));
+                        headers.push(("accept-ranges".to_string(), "bytes".to_string()));
+                    }
+                    if let Some((start, end)) = window {
+                        headers.push((
+                            "content-range".to_string(),
+                            format!("bytes {start}-{end}/{total}"),
+                        ));
+                    }
+                    ctx.status = status.as_u16();
+                    ctx.resp_headers = headers;
+                    ctx.body = Some(if ctx.method == "HEAD" {
+                        Vec::new()
+                    } else {
+                        content.to_vec()
+                    });
+                    if run_wasm_filters(loc, ctx, true) {
+                        return error_response(ctx, server, Some(loc), 500).await;
+                    }
+                    let resp_status = ctx.status;
+                    let hdrs = std::mem::take(&mut ctx.resp_headers);
+                    let body = Bytes::from(ctx.body.take().unwrap_or_default());
+                    return build_buffered_response(
+                        resp_status, &hdrs, body, loc, server, "", false, ctx,
+                    );
+                }
+            }
             let body_len = match &source {
                 FileSource::Memory(b) => b.len() as u64,
                 FileSource::Disk { len, .. } => *len,
@@ -3335,10 +3473,27 @@ fn serve_still_online(
     let age = snap.age().as_secs();
     let headers = crate::still_online::strip_for_replay(&snap.resp.headers);
     ctx.still_online = "STALE".to_string();
+    // 回放同样是一条发往客户端的正常响应：配了 WASM 过滤器就要过。
+    // 过滤的是回放副本，脏表里的原件不动（下次重取仍以源站为准）。
+    let (status, body, headers) = if has_wasm_filter(loc) {
+        ctx.status = snap.resp.status;
+        ctx.resp_headers = headers;
+        ctx.body = Some((*snap.resp.body).to_vec());
+        if run_wasm_filters(loc, ctx, true) {
+            return Some(error_page(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+        (
+            ctx.status,
+            Bytes::from(ctx.body.take().unwrap_or_default()),
+            std::mem::take(&mut ctx.resp_headers),
+        )
+    } else {
+        (snap.resp.status, (*snap.resp.body).clone(), headers)
+    };
     let mut resp = build_buffered_response(
-        snap.resp.status,
+        status,
         &headers,
-        (*snap.resp.body).clone(),
+        body,
         loc,
         server,
         "",
@@ -3486,23 +3641,27 @@ async fn refresh_copy(state: &Arc<AppState>, job: &crate::still_online::RefreshJ
 }
 
 /// 命中缓存：用存储的状态/头/体重建响应，带上 X-Cache-Status 与 add_header。
+/// 配了 WASM 响应过滤器时，命中同样要过一遍——缓存只该省掉回源，不该省掉关口。
 fn serve_from_cache(
     resp: Arc<crate::proxy_cache::CachedResponse>,
     loc: &Location,
     server: &Server,
     status_tag: &str,
-    ctx: &RequestCtx,
+    ctx: &mut RequestCtx,
 ) -> BoxResponse {
-    build_buffered_response(
-        resp.status,
-        &resp.headers,
-        (*resp.body).clone(),
-        loc,
-        server,
-        status_tag,
-        true,
-        ctx,
-    )
+    let (mut status, mut headers, mut body) = (resp.status, resp.headers.clone(), (*resp.body).clone());
+    if has_wasm_filter(loc) {
+        ctx.status = status;
+        ctx.resp_headers = headers;
+        ctx.body = Some(body.to_vec());
+        if run_wasm_filters(loc, ctx, true) {
+            return error_page(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        status = ctx.status;
+        headers = std::mem::take(&mut ctx.resp_headers);
+        body = Bytes::from(ctx.body.take().unwrap_or_default());
+    }
+    build_buffered_response(status, &headers, body, loc, server, status_tag, true, ctx)
 }
 
 /// 由缓冲好的状态/头/字节构造最终响应；`with_status_tag` 为真时附带 `X-Cache-Status`。
