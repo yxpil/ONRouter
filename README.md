@@ -4,12 +4,12 @@
 
 # ONRouter (Rust)
 
-> **ONRouter** (short **ORR**) — an OpenResty alternative written from scratch in Rust.
+> **ONRouter** (short **ORR**) — a gateway server written from scratch in Rust.
 
-A Nginx / OpenResty-style gateway server **implemented from scratch in Rust**: reverse proxy, load
-balancing (with passive health checks), rewrite, virtual hosts, an embedded Lua 5.4 scripting layer
-(the `ngx.*` API), plus native Rust modules. Apart from foundational libraries such as tokio/hyper,
-all gateway logic is hand-written.
+A gateway server **implemented from scratch in Rust** that speaks the nginx config language: reverse
+proxy, load balancing (with passive health checks), rewrite, virtual hosts, an embedded Lua 5.4
+scripting layer (the `ngx.*` API), WASM plugins, plus native Rust modules. Apart from foundational
+libraries such as tokio/hyper, all gateway logic is hand-written.
 
 ## What's new in 1.0
 
@@ -113,13 +113,13 @@ all gateway logic is hand-written.
   With `worker_cpu_affinity auto;` or explicit masks, each worker is pinned to its core; the
   default is `off`, so existing deployments keep the OS scheduler's placement. `-t` reports the
   per-thread plan and the startup log records each successful binding.
-- **Lua VM pool**: one independent Lua VM per CPU core (mirroring OpenResty's one VM per worker).
+- **Lua VM pool**: one independent Lua VM per CPU core, so no script state is shared across cores.
   Multiple requests execute scripts fully in parallel with no global single-point lock;
   `init_by_lua` runs once per VM (matching nginx's once-per-worker initialization semantics).
 - **Within-VM coroutine scheduler**: each VM is driven by a dedicated scheduler task that interleaves
   many in-flight requests as Lua coroutines — a request yields only at `ngx.sleep` and the VM lock is
   released between synchronous resume segments, so `ngx.timer` callbacks and sleep timers progress
-  while other requests on the same VM run (OpenResty's single-worker C10K, not one-request-per-VM).
+  while other requests on the same VM run (many requests in flight per VM, not one-request-per-VM).
   Because there is only one process, a script that *never* yields is more damaging here than in
   multi-worker nginx — it parks that VM's tokio worker outright. So every resume arms a Lua count hook
   (`lua_slice_instructions`, default 1 000 000 VM instructions ≈ 10 ms) that yields the coroutine back
@@ -152,7 +152,7 @@ all gateway logic is hand-written.
 
 ## Feature map
 
-| Nginx / OpenResty | ONRouter (Rust) | Location |
+| Config / API surface | ONRouter (Rust) | Location |
 |---|---|---|
 | master/worker event loop | tokio async runtime + hyper HTTP/1 | `server.rs` |
 | nginx.conf syntax | custom lexer + recursive-descent parser, incl. `include <file \| glob>` (with unit tests) | `crates/onrouter-config` |
@@ -184,11 +184,11 @@ all gateway logic is hand-written.
 | `ssl_certificate_by_lua*` | per-SNI handshake script runs before certificate selection: `ngx.ssl.server_name()`, `ngx.ssl.parse_pem_cert` / `parse_pem_priv_key`, `ngx.ssl.set_cert` / `set_priv_key` / `clear_certs`, plus the `certificate` / `priv_key` legacy aliases; dynamic configs cached by cert+key hash. A handshake script error or `ngx.exit(ngx.ERROR)` aborts the handshake; `_file` form supported | `certs.rs`, `tls.rs`, `lua_engine.rs`, `tools/ssl_cert_lua_e2e.py` |
 | HTTP/2 serving (`http2 on;` + `listen … http2`) | TLS h2 via ALPN; cleartext h2c prior-knowledge via 24-byte preface sniff (MSG_PEEK, non-consuming) so h1/h2c share one listener; hyper multiplexed streams | `server.rs`, `router.rs` |
 | `SIGHUP` graceful config reload | in-process hot swap of the routing table behind `RwLock<Arc<Router>>`; listeners never rebound (no accept gap), per-request snapshot, invalid config keeps old; portable `reload <interval>;` mtime poll | `server.rs`, `main.rs` |
-| `init_by_lua*` / `init_worker_by_lua*` / `lua_package_path` | `init_by_lua*` once per VM at startup; `init_worker_by_lua*` (inline and `_file`) once per VM after its scheduler is live, so timers/cosockets/`ngx.sleep` work; startup aborts non-zero on script errors. `lua_package_path` supports `$prefix`/`${prefix}` and OpenResty's `;;` default-path semantics, repeatable directives joined with `;`, applied before init scripts | `lua_engine.rs`, `main.rs`, `tools/init_worker_package_e2e.py` |
+| `init_by_lua*` / `init_worker_by_lua*` / `lua_package_path` | `init_by_lua*` once per VM at startup; `init_worker_by_lua*` (inline and `_file`) once per VM after its scheduler is live, so timers/cosockets/`ngx.sleep` work; startup aborts non-zero on script errors. `lua_package_path` supports `$prefix`/`${prefix}` and the `;;` default-path expansion, repeatable directives joined with `;`, applied before init scripts | `lua_engine.rs`, `main.rs`, `tools/init_worker_package_e2e.py` |
 | HTTP/3 serving (`listen … quic`) | quinn QUIC endpoint (UDP) + h3 over it, TLS1.3/ALPN `h3` reusing the SNI cert store; same body-agnostic request core as h1/h2 (vhost/location/rewrite/access/proxy/lua); TCP-TLS on the same port serves h1/h2 and advertises `Alt-Svc: h3=":port"` | `server.rs`, `certs.rs`, `router.rs` |
 | `ngx_lua` scripting layer | mlua (Lua 5.4), see the Lua API list below | `lua_engine.rs` |
 | `lua_slice_instructions <n>;` | ONRouter-only cooperative preemption quantum: every coroutine resume arms a Lua count hook that yields back to the VM scheduler after `n` VM instructions (default 1 000 000 ≈ 10 ms of pure Lua; `0` disables). Bounds how long one script can hold a VM/tokio worker, so a runaway loop no longer blackouts the single process. Normal request scripts never reach a slice, so measured Lua throughput is unchanged (12.9k → 13.3k req/s within noise) | `lua_engine.rs`, `tools/security_matrix_e2e.py` |
-| `lua_shared_dict` / `ngx.shared.DICT` | full OpenResty method surface: `get`/`get_stale`/`get_plus`/`get2`, `set`/`safe_set`/`force_set`/`set_auto`, `add`/`force_add`/`replace`, `incr`/`decr`/`bump`, `delete`/`flush_all`/`flush_expired`, `ttl`/`key_present`/`size`/`len`/`num`/`capacity`/`free_space`/`get_keys`/`expire` (true multi-value returns) | `shared_dict.rs`, `lua_engine.rs` |
+| `lua_shared_dict` / `ngx.shared.DICT` | the full `ngx.shared.DICT` method surface: `get`/`get_stale`/`get_plus`/`get2`, `set`/`safe_set`/`force_set`/`set_auto`, `add`/`force_add`/`replace`, `incr`/`decr`/`bump`, `delete`/`flush_all`/`flush_expired`, `ttl`/`key_present`/`size`/`len`/`num`/`capacity`/`free_space`/`get_keys`/`expire` (true multi-value returns) | `shared_dict.rs`, `lua_engine.rs` |
 | `lua_shared_dict … disk=` cold tier (ONRouter-only) | optional second tier per zone: eviction victims whose access frequency passes `spill_after` are written to `disk=` (always async, one writer thread per store, temp+rename), everything else is dropped. A cold hit reads the entry back and promotes it into memory, so **one key lives in exactly one tier at a time**. Cold index is in memory, so a true miss costs zero disk I/O; `num()`/`size()`/`get_keys()`/`ttl()`/`delete()` see both tiers while `capacity()`/`free_space()` stay memory-only. Restart rebuilds the index by scanning the directory (no index file). `max_disk=` caps the tier, `max_value=` skips oversized blobs, and a corrupt/truncated entry file is counted and dropped, never a panic | `disk_cache.rs`, `shared_dict.rs`, `tools/disk_cache_e2e.py` |
 | `Learning` subsystem: one shared byte budget (ONRouter-only) | `learning on;` master switch (**default off** — with it off every learning path below short-circuits and behavior is identical to a build without it) plus one process-wide ledger `learning_memory_budget <size>;` (default 1 MiB, clamped to 8 KiB…16 MiB). Every learned structure — cache frequency sketch, burst-shape table, reputation table — claims from and releases back into this one ledger, so "the models fit in a tiny amount of memory" is a number the operator sets rather than something the gateway grows into. A claim that does not fit is refused, counted (`onrouter_learning_budget_denied_total`), written to the log, and that feature falls back to its configured unlearned behavior — never a silent partial table | `learning.rs`, `metrics.rs` |
 | `proxy_cache_learning` TinyLFU admission + eviction (ONRouter-only) | `proxy_cache_learning <zone> [sketch=<size>];` (default 256 KiB per zone, minimum 8 KiB): a 4-row × 4-bit count-min sketch (estimate = min over rows, aging = whole table halved once every counter has been written on average) sits in front of `proxy_cache`. A newcomer is admitted only when its estimate beats the coldest of the `8` oldest entries, so one-shot URLs can no longer flush a hot object; when a newcomer does win, the eviction inside that window is by frequency, not by pure LRU. Weighted writes still advance the aging clock, so a saturating scanner cannot freeze the sketch's memory of the old hot set | `learning.rs`, `proxy_cache.rs` |
@@ -332,10 +332,10 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   also overrides what `proxy_pass` forwards. `start_time()` / `http_version()` / `is_internal()` expose
   the request timestamp, the HTTP version (1.0/1.1/2.0), and whether this is an internal subrequest.
 - Request body reader: `ngx.req.socket([raw])` → `receive(size?) / receiveuntil(delim, opts?) / close()`
-  — reads the already-buffered request body in order, with OpenResty's `nil, err, partial` convention;
+  — reads the already-buffered request body in order, with the `nil, err, partial` convention;
   `receiveuntil` defaults to trimming the delimiter and its iterator can be called repeatedly.
   Verified by `tools/lua_flush_socket_e2e.py` (raw body bytes, delimiter boundaries, inclusive mode).
-- Control: `ngx.redirect(uri, code?) / ngx.exec(uri) / ngx.exit / ngx.sleep(secs) (async coroutine, seconds unit aligned with OpenResty)`
+- Control: `ngx.redirect(uri, code?) / ngx.exec(uri) / ngx.exit / ngx.sleep(secs) (async coroutine, seconds unit)`
 - Cosocket: `ngx.socket.tcp()` → `connect / send / receive(*l | *a | n) / receiveany(min,max) /
   receiveuntil(delim) / shutdown(read?,write?) / settimeout / setsize / setkeepalive(timeout,pool) /
   tlshandshake(opts) / reconnect / close / getstats` — non-blocking TCP, every op yields to the VM
@@ -394,7 +394,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   `ngx.status` incl. 5xx and request info; its `ngx.say` writes go to a throwaway copy so they can't
   alter the already-built response — verified by `tools/log_by_lua_e2e.py`)
 - Constants: `ngx.OK / ngx.ERROR`, log levels `ngx.STDERR/EMERG/ALERT/CRIT/ERR/WARN/NOTICE/INFO/DEBUG`
-  (OpenResty's numeric values, recognized by `ngx.log`), and the common `ngx.HTTP_*` status codes
+  (the numeric levels `ngx.log` accepts), and the common `ngx.HTTP_*` status codes
 - cosocket: `ngx.socket.tcp()` with `connect/send/receive(*l|*a|n)/settimeout/close` — ops run in
   tokio tasks (no VM lock held) and yield to the scheduler, so many socket-bound requests share one
   VM concurrently; partial-data + timeout semantics mirror ngx_lua (`nil, err, partial`)
@@ -429,7 +429,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   and, on `set_current_peer`, routing the connection to the Lua-selected `host:port` *instead of* the
   upstream's load balancer (so Lua drives dynamic peer selection / service discovery). `set_timeouts`
   overrides the location's connect/send/read timeouts for that hop, and the read value also bounds the
-  idle timeout of a WebSocket tunnel opened to the selected peer. All five functions return OpenResty's
+  idle timeout of a WebSocket tunnel opened to the selected peer. All five functions return the
   `true` / `nil, err` convention; `set_current_peer('')` and negative timeouts reject. Tradeoff vs
   ngx_lua: the balancer runs once per request (not once per retry attempt), so a Lua-chosen peer is a
   single hop without in-upstream failover, and the `ngx.balancer.set_upstream_*` override APIs remain
@@ -455,7 +455,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   $http_<name> (request header) / $sent_http_<name> (response header) / $proxy_add_x_forwarded_for /
   $upstream_addr / $upstream_status / $upstream_header_time(≡$upstream_response_time) /
   $upstream_cache_status (empty string when the request never engaged the cache, e.g. a POST)`, all returned
-  as strings with `nil` for undefined vars (OpenResty semantics). `$uri` (rewrites the path) and
+  as strings with `nil` for undefined vars. `$uri` (rewrites the path) and
   `$status` are writable; read-only vars ignore assignment. Verified by `tools/ngxvar_e2e.py` (19
   checks: live request metadata, `$http_x_test` header echo, undefined→nil, `$uri` write-then-read,
   `$status=418` producing a real 418 response) + unit test `ngx_var_reads_and_writes`, plus the
@@ -755,7 +755,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   sha1_bin(s[, hex]) / sha256_bin(s[, hex]) / hmac_sha1(secret, s) / crc32_short / crc32_long` — verified byte-for-byte
   against RFC 1321 / RFC 2202 / FIPS 180-4 / the CRC-32 `0xCBF43926` vector
 - `resty.*` Lua modules (loaded with `require`, registered via `package.preload`; original pure-Lua
-  implementations, not vendored OpenResty source): `resty.string` (`to_hex / sha256_hex / md5_hex`,
+  implementations, not vendored source): `resty.string` (`to_hex / sha256_hex / md5_hex`,
   layered on the native digests) and `resty.lock` (`new(dict, {timeout,exptime}) / lock(key) / unlock()`,
   a shared-dict `add`-based mutex with `ngx.sleep` backoff polling and a monotonic owner token so an
   expired lock is never unlocked by the wrong holder). Verified by `tools/resty_e2e.py`, including N-way
@@ -779,7 +779,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   samesite/version/comment`; `value=false` emits a delete cookie, and multiple cookies append as
   repeated response headers. `resty.limit.req` (leaky bucket `new(dict, rate, burst) / incoming(key,
   commit) / uncommit`), `resty.limit.count` (fixed 1 s window), and `resty.limit.conn` (in-flight
-  connection accounting) reuse the shared-dict primitives and return the OpenResty `delay / nil,
+  connection accounting) reuse the shared-dict primitives and return the `delay / nil,
   "rejected" / remaining` conventions. Verified by `tools/api_compat_e2e.py` (real traffic incl.
   concurrent rejection of the second `limit_conn` request and multi-line Set-Cookie).
 - Time: `ngx.today() / cookie_time(ts) / http_time(ts) / parse_http_time(str) / update_time()`
@@ -792,7 +792,7 @@ Verified routes (28 smoke checks, full HTTP + HTTPS coverage):
   SIGTERM/SIGINT — or Ctrl+C/Ctrl+Break on Windows — starts a graceful stop)
 - All of the above are exercised end-to-end against real traffic by `tools/ngx_api_e2e.py` (36 checks).
 
-## E2E tests (aligned with the OpenResty official suite)
+## E2E tests (ported assertions from the upstream Lua-module suite)
 
 OpenResty publishes its E2E tests in the `t/` directory of `openresty/lua-nginx-module` (193 `.t`
 files driven by Perl Test::Nginx). This repo adopts a "ported-assertions" strategy: extract
@@ -1169,7 +1169,7 @@ them as standalone runnable assertion scripts.
   machinery runs on every request (`routed` delta == requests) without measurably moving throughput.
   The single-node row is again only a shape reference (6.5k req/s at c=32 against 10.9k for the two-node
   rows on the release build — one Python process is the cap, not the gateway).
-- `docs/OPENRESTY_GAP_ANALYSIS.md` is the current capability/gap matrix with test evidence.
+- `docs/OPENRESTY_GAP_ANALYSIS.md` is the capability matrix with test evidence.
 - `docs/USR2_HOT_UPGRADE.md` explains why nginx-style USR2 needs a process-model change,
   gives two designs (SO_REUSEPORT handover / master+worker FD inheritance), and a Linux test plan.
 
@@ -1610,7 +1610,7 @@ Already done (previously listed as gaps, now implemented):
   the cached scripts once per second (`lua_engine::LUA_FILE_CHECK_INTERVAL`; always on, independent
   of `reload off`) and re-reads only the ones whose mtime moved, so an edit lands within ~1s without
   a restart. The new source is then compiled once per VM into that VM's chunk cache, which mirrors
-  OpenResty's `lua_code_cache on` (mlua's `Function` is `!Send`, so the cache holds `RegistryKey`
+  `lua_code_cache on` (mlua's `Function` is `!Send`, so the cache holds `RegistryKey`
   handles instead). A half-written file keeps serving the previous version instead of returning 500,
   and each phase's bucket is capped so repeated edits cannot grow the cache without bound.
   (Verified by `tools/lua_watch_e2e.py`: with no `reload` directive in the config at all, six in-place
@@ -1685,7 +1685,7 @@ Already done (previously listed as gaps, now implemented):
 
 Remaining tradeoffs / roadmap:
 
-- **Cosocket coverage**: `ngx.socket.tcp` now runs the full OpenResty method surface as scheduler
+- **Cosocket coverage**: `ngx.socket.tcp` now runs the full cosocket method surface as scheduler
   yield points — `connect/send/receive(*l|*a|n)/receiveany/receiveuntil/shutdown/setsize/
   settimeout/setkeepalive`(backed by a real process-global connection pool)`/reconnect/close`
   (see the API section and `tools/sock_ext_e2e.py`). `ngx.socket.udp` (datagram I/O) is covered too

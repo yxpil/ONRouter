@@ -612,7 +612,7 @@ curl -s http://127.0.0.1:18600/lua/count
 
 Lua 文件脚本用 `content_by_lua_file "../lua/time.lua";` 引用；文件只读一次并缓存，
 编辑后由脚本自检/重载机制生效。大量计算或需要强隔离的第三方代码优先放 WASM；需要
-OpenResty 生态和快速迭代时用 Lua。
+成熟的 Lua 生态和快速迭代时用 Lua。
 
 ---
 

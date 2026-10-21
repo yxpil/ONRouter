@@ -2,7 +2,7 @@
 
 适用版本：**1.0.0**（2026-10-21）
 面向：部署、值守、容量规划与故障排查。
-配套文档：[使用教程](TUTORIAL.md)、[完整功能矩阵与 Lua API](../README.md)、[OpenResty 差距分析](OPENRESTY_GAP_ANALYSIS.md)。
+配套文档：[使用教程](TUTORIAL.md)、[完整功能矩阵与 Lua API](../README.md)、[能力矩阵与证据](OPENRESTY_GAP_ANALYSIS.md)。
 
 ---
 
