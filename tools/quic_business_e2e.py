@@ -29,9 +29,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)          # import selfsigned：夹具模块与套件同目录
+import selfsigned                     # noqa: E402
 CONF = os.path.join(ROOT, "conf", "quic_business.conf")
-CERT = os.path.join("certs_scenario", "server.pem")
-KEY = os.path.join("certs_scenario", "server.key")
+CERT = os.path.join("certs_qbiz", "server.pem")
+KEY = os.path.join("certs_qbiz", "server.key")
 SITE = os.path.join(ROOT, "public_qbiz")
 CACHE = os.path.join(ROOT, "conf", "logs", "qbiz_cache")
 ERRLOG = os.path.join(ROOT, "conf", "logs", "qbiz_err.log")
@@ -250,6 +253,10 @@ def main():
     for f in (ERRLOG,):
         if os.path.exists(f):
             os.remove(f)
+    # 自带夹具：这张证书 h3 客户端是**真校验**的（CA=自己 + SAN 必须含 localhost），
+    # 不能借别的套件的目录——CI 干净检出时那个目录根本不存在。
+    selfsigned.ensure(ROOT, "certs_qbiz", base="server",
+                      dns=("localhost",), ips=("127.0.0.1",))
 
     # 1) -t：quic 监听要在检查里说出来
     t = subprocess.run([gw_exe, "-t", "-c", CONF], cwd=ROOT, capture_output=True,

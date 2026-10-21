@@ -44,11 +44,13 @@ natb.exe
 
 # 测试夹具的生成物（各 e2e 脚本每次跑都重建，不进版本库）
 /certs_random/
+/certs_qbiz/
+/certs_prodshape/
+/public_qbiz/
 /public_prodshape/
 /public_course/
 /public_expires/
 /public_flash/
-/public_qbiz/
 /conf/logs/qbiz_cache/
 /conf/logs/qbiz*
 /logs/qbiz_out.log

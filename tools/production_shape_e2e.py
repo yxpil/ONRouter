@@ -41,6 +41,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)          # import selfsigned：夹具模块与套件同目录
+import selfsigned                     # noqa: E402
 EXE = os.path.join(ROOT, "target", "release", "onrouter.exe" if os.name == "nt" else "onrouter")
 SITE = os.path.join(ROOT, "public_prodshape")
 CONF = os.path.join(ROOT, "conf", "production_shape.conf")
@@ -133,6 +136,9 @@ def write_conf():
     wasm_dir = "wasm"
     # root 相对**配置文件所在目录**（conf/）解析，不是进程 CWD
     SITE_REL = "../" + os.path.relpath(SITE, ROOT).replace(os.sep, "/")
+    # 自带夹具：CI 是干净检出，certs_random/ 只有跑过 random_scenarios 才存在
+    selfsigned.ensure(ROOT, "certs_prodshape", base="ps",
+                      dns=("tls.prodshape.test", "localhost"))
     tpl = f"""
 error_log "logs/prodshape_err.log" warn;
 pid logs/prodshape.pid;
@@ -164,8 +170,8 @@ server {{
 
 server {{
     listen {GW_TLS} ssl http2;
-    ssl_certificate "../certs_random/fallback.pem";
-    ssl_certificate_key "../certs_random/fallback.key";
+    ssl_certificate "../certs_prodshape/ps.pem";
+    ssl_certificate_key "../certs_prodshape/ps.key";
     server_name tls.prodshape.test;
     root "{SITE_REL}";
     index index.html;
