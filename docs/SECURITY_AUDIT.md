@@ -145,7 +145,50 @@ thing: **client input must never become script source, script path, or upstream 
   Note `rewrite … last` and `try_files` into an internal location are *internal redirects* and therefore
   allowed — same as nginx (`r->internal = 1`); `capture`/`ngx.exec` are allowed for the same reason.
 
+## WASM runtime dependency surface (2026-10-22, checked against RustSec)
+
+Trigger: the April 2026 Wasmtime/Cranelift batch (e.g. `GHSA-jhxm-h53p-jm7w`, a miscompiled guest
+heap access on aarch64 that escapes the sandbox; `RUSTSEC-2026-0094`, Winch typing `table.grow`'s
+result wrongly; `RUSTSEC-2026-0022`, a panic when an async `Func::call` future is dropped early —
+wasmtime currently carries 47 recorded advisories in total). **None of them reach ONRouter, and the
+reason is structural rather than a version we happened to be on:**
+
+- `Cargo.lock` contains **zero** `cranelift*` entries and no `wasmtime`. ONRouter's plugin host is
+  `wasmi` — a bytecode interpreter with **no JIT/AOT code generation**, so there is no native
+  codegen step that could miscompile guest memory accesses. The whole class "compiler emits wrong
+  machine code ⇒ sandbox escape" does not exist in this binary.
+- What we actually ship for WASM: `wasmi 0.31.2` (runtime) plus `wat 1.262.0` / `wast 262.0.0` /
+  `wasmparser 0.262.0` (the `.wat` text assembler and validator used by the shipped examples and
+  suites). RustSec records **no advisory for any of these four** (`rustsec.org/packages/<name>.html`
+  has no page for them, while it does for wasmtime — so this is absence of advisories, not absence
+  of a lookup). The parser stack is on the **current release line** (0.262 is the newest on the
+  registry index).
+- What bounds the blast radius even if the interpreter itself were ever found faulty: modules are
+  named in operator config and never derived from a request; the import surface is only what
+  `wasm.rs` registers on its `Linker`; every call is fuel-metered (exhaustion traps rather than
+  hanging a worker) under a `StoreLimits` memory ceiling; exports are validated at `-t` time so a
+  module that does not match the declared phases never serves traffic. Evidence:
+  `tools/wasm_e2e.py`, `tools/production_shape_e2e.py` (WASM access/header/body filters over TLS),
+  `tools/api_compat_e2e.py`.
+
+**Honest gap, recorded and deliberately not acted on in this batch:** upstream `wasmi` is at
+**2.0.0** while we are on **0.31.2** — two majors behind. Nothing is known to be exploitable here,
+but the cost of that gap is *responsiveness*: when a wasmi advisory does land, taking it will be an
+API migration (fuel accounting, `TrapCode` paths, resource-limiter naming), not a version bump. The
+API surface we touch is small (`Engine`/`Store`/`Module`/`Linker`/`Caller`/`Extern(Type)`/
+`StoreLimits(Builder)` + `add_fuel`/`consume_fuel`/`call`/`memory_size`), so the migration is
+contained — it just needs its own change with its own evidence pass (`wasm_e2e`, `production_shape`,
+`protocol_matrix`, `api_compat`, then the full roll), not a drive-by during a release.
+
 ## Residual risk / follow-ups
+
+- **`wasmi 0.31.2 → 2.0.0` is open** (see the section above). Recorded as a follow-up rather than a
+  drive-by during a release: the upgrade is an API migration in `wasm.rs` and must come with its own
+  evidence pass. Until then, "we are not affected by the Cranelift advisories" is a statement about
+  *architecture* (interpreter, no codegen), not about being current.
+- **`cargo audit` is a release-gate command, not a per-push CI step.** A transitive `unsound`/
+  `unmaintained` advisory should not silently block shipping a production fix, but it must be triaged
+  into this file before the tag (§16 of OPERATIONS.md).
 
 - S8's polarity is a hazard the compiler cannot catch (`run_phases` returns a plain `bool`), so the guard
   is the `rce_matrix_e2e.py` probe plus the doc comment at `server.rs:1954`. Returning a `Result` from

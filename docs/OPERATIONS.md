@@ -1214,6 +1214,9 @@ tail -n 200 conf/logs/error.log
 
 ### 16.2 发布前检查表
 
+- [ ] `cargo audit`（发布闸门之一，不进每次 push 的 CI：一条无关的传递性 unmaintained 公告不该
+      拦住一次生产修复，但**必须在打标签之前**把结果写进 `docs/SECURITY_AUDIT.md`——
+      是"受影响、已升级"还是"结构性不受影响（例如运行时无 JIT）"，都要落成一句可核对的话）；
 - [ ] `cargo test --workspace` 全绿；
 - [ ] `cargo clippy --workspace --all-targets` 无 error；
 - [ ] 全量回归 `python run_regression.py <本次发布名>.txt` 记录零非零退出（`run_regression.py`

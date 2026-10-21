@@ -96,17 +96,6 @@ libraries such as tokio/hyper, all gateway logic is hand-written.
     and no `Content-Length` (the gateway's own `ngx.req.get_body_data()` reported `nil`), so every
     API write on the site's main TLS transport silently lost its payload while HTTP/1.1 was fine.
     Framed protocols are now always read to stream-end (an empty stream costs one poll).
-  - **Found after v1.0.2 shipped** (the published binaries do not have this fix yet): on a TLS port
-    carrying several vhosts, an unmatched or absent **SNI** presented whichever `server` block
-    happened to be written *first*, instead of the block marked `default_server` as nginx does.
-    Routing was always right, so nothing looked wrong from the HTTP side — the only symptom is a
-    client that typed a domain this edge doesn't serve getting *someone else's* certificate, and a
-    config reorder silently swapping which certificate answers. The fallback certificate now follows
-    `default_server` for both accounts (cert and vhost). Proven by
-    `router::tests::fallback_cert_follows_default_server_not_config_order` and by a new port group in
-    `tools/https_matrix_e2e.py` (76/76): 18443 writes `default_server` **first**, where the two
-    implementations are indistinguishable — which is exactly why this lived for so long — and 18449
-    writes it **last**, which is the only shape that can tell them apart.
   - Business-shape suites added this round: `tools/course_selection_e2e.py` (2400 students at the
     moment enrollment opens — no oversell, and the origin's enroll count equals the gateway's
     admitted count exactly), `tools/flash_sale_e2e.py` 36/36 (flash sale: 1200 concurrent on one hot
@@ -130,6 +119,20 @@ libraries such as tokio/hyper, all gateway logic is hand-written.
     (**2,275,361 requests, 0 failures**, private memory +0.49 MiB with slope +0.055 MiB/min against
     a 1.0 MiB/min gate, cold-tier accounts clean: `corrupt` 0 / `never_read` 0 / `pending_jobs` 0) as
     recorded in [OPERATIONS.md](docs/OPERATIONS.md) §13.1, and `tools/release_verify.py` 26/26 against the **unpacked** `target/dist/archives/onrouter-v1.0.2-*.zip` (the artifact a user actually downloads, not the build tree's binary). CI's E2E job was widened in 1.0.2 from six suites to fourteen across three steps (functional contract, business shapes, HTTP/3+HTTPS transport parity), and is **fifteen** now: `https_matrix` joined the functional-contract step because it is the only suite that can tell "the fallback certificate follows config order" from "it follows `default_server`".
+
+- **Unreleased since 1.0.2 — the fallback certificate**: on a TLS port carrying several vhosts, an
+  unmatched or absent **SNI** presented whichever `server` block happened to be written *first*,
+  instead of the block marked `default_server` as nginx does. Routing was always right, so nothing
+  looked wrong from the HTTP side — the only symptom is a client that typed a domain this edge
+  doesn't serve getting *someone else's* certificate, and a config reorder silently changing which
+  certificate answers. The fallback now follows `default_server` for both accounts (cert and vhost).
+  Proven by `router::tests::fallback_cert_follows_default_server_not_config_order` and by a new port
+  group in `tools/https_matrix_e2e.py` (76/76): 18443 writes `default_server` **first**, where the two
+  implementations are indistinguishable — which is exactly why this survived every earlier suite — and
+  18449 writes it **last**, the only shape that can tell them apart. Also in this unreleased batch:
+  TLS suites now sign their own fixtures (`tools/selfsigned.py`), guarded readiness probes, and
+  `random_scenarios_e2e` back in the roll with a cert oracle that reads SNI (roll: 95 scripts, `SKIP`
+  empty). This is what the next tag will contain.
 
 - **Release engineering**: CI runs unit tests + clippy + fifteen real-traffic E2E suites in three
   steps (functional contract, business shapes, then the h1/h2/h3 transport-parity suite), with an
