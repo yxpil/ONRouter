@@ -166,9 +166,13 @@ def main():
     proc = subprocess.Popen([exe, CONF], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
     try:
         for _ in range(80):
-            if get("/ping")[0] == 200:
+            try:
+                ready = get("/ping")[0] == 200
+            except (urllib.error.URLError, OSError):
+                ready = False      # 还没监听：Linux CI 上首个探测常常早于 bind 完成
+            if ready:
                 break
-            time.sleep(0.1)
+            time.sleep(0.25)
         else:
             raise SystemExit("!! 网关未就绪，见 logs/expires_out.log")
         print("网关已就绪", GW)

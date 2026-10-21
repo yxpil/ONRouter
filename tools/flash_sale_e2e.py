@@ -292,9 +292,13 @@ def main():
     proc = subprocess.Popen([exe, CONF], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
     try:
         for _ in range(120):
-            if req("/ping")[0] == 200:
+            try:
+                ready = req("/ping")[0] == 200
+            except (OSError, http.client.HTTPException):
+                ready = False      # 还没监听：Linux CI 上首个探测常常早于 bind 完成
+            if ready:
                 break
-            time.sleep(0.1)
+            time.sleep(0.25)
         else:
             raise SystemExit("!! 网关未就绪，见 logs/flash_sale_out.log / conf/logs/flash_sale_err.log")
         print("网关已就绪", GW)
