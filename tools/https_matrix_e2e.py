@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 # HTTPS 实际业务矩阵 E2E —— 一个进程内同时验证：
 #   1) 多证书 SNI 选择：精确 > *.通配 > 默认第一张；大小写、无 SNI、未知 SNI、通配打通配
+#      （18443 的 default_server 写在最前）
+#   1b) 同形状但 default_server 写在最后一个块（18449）：兜底证书必须跟着 default_server 走，
+#      而不是跟着配置顺序 —— 只有这一组能分辨这两种实现
 #   2) 证书链/主机名校验：用各自自签证书当 CA，正常域名通过、错域名被拒
 #   3) Host 与 SNI 不一致：证书由 SNI 决定，路由由 Host 决定（互相独立）
 #   4) 多端口隔离：同一域名在 TLS / 明文 / 仅1.2 / 仅1.3 / h2 端口上各回各的
@@ -39,7 +42,8 @@ P13 = 18445        # 仅 TLS1.3
 PPLAIN = 18446     # 明文
 PH2 = 18447        # TLS + ALPN h2
 PHMH = 18448       # TLS + ALPN h2 + 多域名（default_server 在最前）
-PORTS = [SNI_PORT, P12, P13, PPLAIN, PH2]
+PDEFAULT_LAST = 18449  # 多域名，但 default_server 写在最后一个块
+PORTS = [SNI_PORT, P12, P13, PPLAIN, PH2, PHMH, PDEFAULT_LAST]
 
 results = []
 gaps = []
@@ -426,6 +430,25 @@ def main():
             check(f"SNI {sni or '<无>'} → {want} 证书（{why}）",
                   r.get("ok") and r.get("fp") == fps[want],
                   f"ok={r.get('ok')} fp={str(r.get('fp'))[:16]} want={fps[want][:16]} err={r.get('err')}")
+
+        # ========== 1b) 兜底证书跟的是 default_server，不是配置顺序 ==========
+        # 上面那组恰好把 default_server 写在第一个块，两种实现看不出差别；这一组写在最后。
+        print("\n-- 1b) default_server 写在最后：兜底证书仍必须是它的那张 --")
+        for sni, want, why in [
+            ("a.local", "a", "精确名照旧（对照组：证明指纹判定不是恒真）"),
+            ("unknown.local", "default", "未知 SNI → default_server 的证书"),
+            (None, "default", "无 SNI → default_server 的证书"),
+        ]:
+            r = tls_request(PDEFAULT_LAST, sni)
+            check(f"18449 SNI {sni or '<无>'} → {want} 证书（{why}）",
+                  r.get("ok") and r.get("fp") == fps[want],
+                  f"ok={r.get('ok')} fp={str(r.get('fp'))[:16]} want={fps[want][:16]} err={r.get('err')}")
+        r = tls_request(PDEFAULT_LAST, "unknown.local")
+        check("18449 未知 Host 由 default_server 应答（证书与站点同源，不能一个按顺序一个按 default）",
+              r.get("ok") and r.get("body", "").strip() == "lastgroup-default", f"{r}")
+        r = tls_request(PDEFAULT_LAST, "a.local")
+        check("18449 SNI=a.local 且 Host=a.local → a 站内容",
+              r.get("ok") and r.get("body", "").strip() == "lastgroup-a", f"{r}")
 
         # ========== 2) 证书链 + 主机名校验 ==========
         print("\n-- 2) 证书链与主机名校验（各自自签证书当 CA） --")

@@ -584,6 +584,20 @@ pub fn parse_listen_addr(arg: &str) -> Option<SocketAddr> {
     })
 }
 
+/// 同一端口上多份证书/多份 `ssl_certificate_by_lua` 脚本的存放顺序，就是
+/// "SNI 匹配不上时用哪一份"的答案：`certs::SniResolver` 与 `tls::select_script` 都取
+/// 列表第一项当兜底，并且各自的注释都写着"兜底 = 默认 server"。nginx 也是这个规则
+/// （SNI 找不到对应 server_name 时走该地址的 default server 的证书），所以显式写了
+/// `default_server` 的那个块必须排到最前面——只按配置顺序放，兜底证书就会是
+/// "恰好第一个写的 vhost" 的证书，与 nginx 不一致，而且换一行配置顺序就会变。
+fn push_tls_slot<T>(list: &mut Vec<T>, item: T, is_default_server: bool) {
+    if is_default_server {
+        list.insert(0, item);
+    } else {
+        list.push(item);
+    }
+}
+
 fn parse_listen(directive: &Directive) -> Result<(SocketAddr, ListenFlags), AppError> {
     let arg = directive
         .arg(0)
@@ -2788,19 +2802,28 @@ impl Router {
                             tmpl.server_name
                         ))
                     })?;
-                    tls_specs.entry(addr).or_default().push(CertSpec {
-                        names: tmpl.server_names.clone(),
-                        cert,
-                        key,
-                    });
+                    let default_block = flags.default_server;
+                    push_tls_slot(
+                        tls_specs.entry(addr).or_default(),
+                        CertSpec {
+                            names: tmpl.server_names.clone(),
+                            cert,
+                            key,
+                        },
+                        default_block,
+                    );
                     if let Some(mut script) = tmpl.ssl_cert_script.clone() {
                         script.names = tmpl.server_names.clone();
-                        tls_scripts.entry(addr).or_default().push(script);
+                        push_tls_slot(tls_scripts.entry(addr).or_default(), script, default_block);
                     }
                 } else if ep.ssl {
                     if let Some(mut script) = tmpl.ssl_cert_script.clone() {
                         script.names = tmpl.server_names.clone();
-                        tls_scripts.entry(addr).or_default().push(script);
+                        push_tls_slot(
+                            tls_scripts.entry(addr).or_default(),
+                            script,
+                            flags.default_server,
+                        );
                     }
                     // 该端点已被其他 server 要求 TLS：这个 vhost 复用同一监听 socket，
                     // 只能走 HTTPS（与 nginx 行为一致：同一地址不能同时有明文与 TLS）
@@ -6868,6 +6891,45 @@ mod tests {
                      ssl_certificate_key k.pem; ssl_protocols TLSv1.3; }"#,
         );
         assert_eq!(merged.enabled, vec![TlsVersion::Tls12, TlsVersion::Tls13]);
+    }
+
+    #[test]
+    fn fallback_cert_follows_default_server_not_config_order() {
+        let file_names = |conf: &str| -> Vec<String> {
+            let r = build(conf);
+            r.listeners
+                .iter()
+                .find(|l| l.addr.port() == 18443)
+                .and_then(|l| l.tls.as_ref())
+                .map(|t| {
+                    t.specs
+                        .iter()
+                        .map(|s| s.cert.file_name().unwrap().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // default_server 写在第二个块：兜底证书仍然得是它的（SniResolver 取列表第一项当兜底）
+        assert_eq!(
+            file_names(
+                r#"server { listen 127.0.0.1:18443 ssl; server_name first.example.com;
+                       ssl_certificate first.pem; ssl_certificate_key first.key; }
+                   server { listen 127.0.0.1:18443 ssl default_server; server_name _;
+                       ssl_certificate catchall.pem; ssl_certificate_key catchall.key; }"#
+            ),
+            vec!["catchall.pem", "first.pem"]
+        );
+        // 没写 default_server：保持配置顺序第一项（nginx 同理，第一个声明的就是默认 server）
+        assert_eq!(
+            file_names(
+                r#"server { listen 127.0.0.1:18443 ssl; server_name a.example.com;
+                       ssl_certificate a.pem; ssl_certificate_key a.key; }
+                   server { listen 127.0.0.1:18443 ssl; server_name b.example.com;
+                       ssl_certificate b.pem; ssl_certificate_key b.key; }"#
+            ),
+            vec!["a.pem", "b.pem"]
+        );
     }
 
     #[test]
