@@ -2,7 +2,7 @@
 
 适用版本：**1.0.4**（2026-10-22）
 面向：部署、值守、容量规划与故障排查。
-配套文档：[使用教程](TUTORIAL.md)、[完整功能矩阵与 Lua API](../README.md)、[能力矩阵与证据](CAPABILITY_MATRIX.md)。
+配套文档：[使用教程](TUTORIAL.md)、[功能矩阵](FEATURES.md)、[Lua API](LUA_API.md)、[能力矩阵与证据](CAPABILITY_MATRIX.md)。
 
 ---
 

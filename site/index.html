@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ONRouter — 用 Rust 写的通用网关</title>
+<meta name="description" id="meta-description" content="ONRouter 是用 Rust 从零实现的通用网关：HTTP/1.1、HTTP/2、HTTP/3、反向代理、响应缓存、Lua 5.4 与 WASM 脚本、TCP/UDP 转发。单个二进制，MIT 开源。">
+<link rel="canonical" href="https://onrouter.yxpil.com/">
+<meta name="theme-color" content="#0a0c0f">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://onrouter.yxpil.com/">
+<meta property="og:locale" id="og-locale" content="zh_CN">
+<meta property="og:title" id="og-title" content="ONRouter — 用 Rust 写的通用网关">
+<meta property="og:description" id="og-description" content="TLS、反向代理、缓存、Lua 与 WASM 脚本、TCP/UDP 转发，一个进程全部接管。">
+<meta property="og:image" content="https://onrouter.yxpil.com/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.png" type="image/png">
+<style>
+  :root {
+    --bg: #0a0c0f;
+    --panel: #101419;
+    --panel-2: #0d1116;
+    --line: #232a32;
+    --line-soft: #1a2027;
+    --text: #e9e6df;
+    --muted: #9aa3ad;
+    --dim: #6c7681;
+    --accent: #ff6b3d;
+    --accent-soft: rgba(255, 107, 61, .12);
+    --mint: #7dd3c0;
+    --sans: "Inter", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* hold first paint until the English text is applied */
+  html[data-i18n-pending] body { visibility: hidden; }
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image:
+      linear-gradient(rgba(255,255,255,.022) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.022) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, #000 35%, transparent 100%);
+  }
+  ::selection { background: var(--accent); color: #0a0c0f; }
+  a { color: inherit; text-decoration: none; }
+  .wrap { width: min(1120px, calc(100% - 48px)); margin: 0 auto; }
+  .skip { position: absolute; left: -9999px; top: 0; background: var(--accent); color: #0a0c0f; padding: 10px 16px; z-index: 10; }
+  .skip:focus { left: 12px; top: 12px; }
+
+  /* ---------- nav ---------- */
+  .nav { position: relative; z-index: 2; display: flex; align-items: center; justify-content: space-between; padding: 26px 0; }
+  .brand { display: inline-flex; align-items: center; gap: 12px; font-weight: 650; letter-spacing: -.02em; font-size: 17px; }
+  .brand img { width: 30px; height: 30px; filter: invert(1); }
+  .nav-links { display: flex; align-items: center; gap: 28px; font-size: 14px; color: var(--muted); }
+  .nav-links a:hover { color: var(--text); }
+  .nav-links .nav-dl { color: var(--text); border: 1px solid var(--line); padding: 7px 14px; border-radius: 2px; }
+  .nav-links .nav-dl:hover { border-color: var(--accent); color: var(--accent); }
+  .lang-toggle { -webkit-appearance: none; appearance: none; margin: 0; font-family: var(--mono); font-size: 12px; letter-spacing: .06em; line-height: 1.2; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 2px; padding: 7px 10px; cursor: pointer; transition: border-color .15s ease, color .15s ease; }
+  .lang-toggle:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ---------- hero ---------- */
+  .hero { position: relative; z-index: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 48px; align-items: center; padding: 54px 0 72px; }
+  .hero > * { min-width: 0; }
+  .eyebrow { margin: 0 0 18px; font-family: var(--mono); font-size: 12px; letter-spacing: .18em; color: var(--accent); }
+  h1 { margin: 0; font-size: clamp(44px, 6.1vw, 78px); line-height: 1.06; letter-spacing: -.045em; font-weight: 700; }
+  h1 em { font-style: normal; color: var(--accent); }
+  .lede { margin: 26px 0 0; max-width: 34em; font-size: 17px; color: var(--muted); }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 32px; }
+  .btn { display: inline-flex; align-items: center; gap: 10px; padding: 13px 20px; border-radius: 2px; font-size: 15px; font-weight: 600; border: 1px solid transparent; transition: transform .15s ease, border-color .15s ease, background .15s ease; }
+  .btn svg { width: 15px; height: 15px; }
+  .btn.primary { background: var(--accent); color: #0a0c0f; }
+  .btn.primary:hover { transform: translateY(-1px); background: #ff7d54; }
+  .btn.ghost { border-color: var(--line); color: var(--text); }
+  .btn.ghost:hover { border-color: var(--dim); }
+  .facts { display: flex; flex-wrap: wrap; gap: 10px 26px; margin: 34px 0 0; padding: 0; list-style: none; font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  .facts li { display: flex; align-items: center; gap: 8px; }
+  .facts li::before { content: ""; width: 5px; height: 5px; background: var(--mint); display: block; }
+
+  /* ---------- diagram ---------- */
+  .diagram { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; padding: 18px 14px 8px; }
+  .diagram svg { display: block; width: 100%; height: auto; }
+  .diagram figcaption { font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; color: var(--dim); text-align: right; padding: 4px 6px 8px; }
+  .d-node { fill: var(--panel-2); stroke: var(--line); }
+  .d-gw { fill: #12171d; stroke: #2c343d; }
+  .d-wire { fill: none; stroke: #2a313a; stroke-width: 1.2; }
+  .d-wire-hot { fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-dasharray: 3 7; animation: flow 1.1s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -10; } }
+  /* 示意图在移动端隐藏细节，只保留阶段名 */
+  .d-title { fill: var(--text); font-family: var(--mono); font-size: 14px; letter-spacing: .14em; }
+  .d-label { fill: var(--muted); font-family: var(--mono); font-size: 15px; }
+  .d-dim { fill: var(--dim); font-family: var(--mono); font-size: 10.5px; letter-spacing: .08em; }
+  .d-accent { fill: var(--accent); }
+  .d-mint { fill: var(--mint); }
+  @media (prefers-reduced-motion: reduce) { .d-wire-hot { animation: none; } }
+
+  /* ---------- strips and sections ---------- */
+  .strip { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 0; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); font-family: var(--mono); font-size: 11px; letter-spacing: .14em; color: var(--dim); }
+  .strip b { color: var(--muted); font-weight: 500; }
+  .section { padding: 92px 0 0; scroll-margin-top: 24px; }
+  .section-head { max-width: 640px; }
+  h2 { margin: 0; font-size: clamp(30px, 3.6vw, 44px); line-height: 1.15; letter-spacing: -.03em; font-weight: 680; }
+  h2 em { font-style: normal; color: var(--accent); }
+  .section-head p:last-child, .section-copy p { margin: 18px 0 0; color: var(--muted); font-size: 16px; }
+  .grid { display: grid; gap: 1px; margin-top: 44px; background: var(--line-soft); border: 1px solid var(--line-soft); }
+  .grid.three { grid-template-columns: repeat(3, 1fr); }
+  .card { background: var(--panel); padding: 28px 26px 26px; }
+  .card .ico { display: block; width: 26px; height: 26px; margin-bottom: 18px; stroke: var(--accent); fill: none; stroke-width: 1.4; }
+  .card h3 { margin: 0 0 8px; font-size: 17px; font-weight: 620; letter-spacing: -.01em; }
+  .card p { margin: 0; font-size: 14px; color: var(--muted); }
+  .card code, .ops code, .section-copy code { font-family: var(--mono); font-size: .88em; color: var(--mint); background: rgba(125,211,192,.07); padding: 1px 5px; border-radius: 2px; }
+
+  .split { display: grid; grid-template-columns: .85fr 1.15fr; gap: 56px; align-items: start; }
+  .split > * { min-width: 0; }
+  .checklist { list-style: none; margin: 26px 0 0; padding: 0; font-size: 14.5px; color: var(--muted); }
+  .checklist li { position: relative; padding: 8px 0 8px 24px; border-top: 1px solid var(--line-soft); }
+  .checklist li::before { content: "→"; position: absolute; left: 0; color: var(--accent); font-family: var(--mono); }
+  .code { margin: 0; max-width: 100%; background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px; padding: 22px 24px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.8; color: #c9d1da; tab-size: 4; }
+  .code .k { color: var(--mint); }
+  .code .s { color: #e6b673; }
+  .code .c { color: var(--dim); }
+  .code .v { color: #9fb6c9; }
+  .code-wrap { margin: 0; }
+  .code-wrap figcaption { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; color: var(--dim); padding: 10px 2px 0; }
+
+  /* ---------- docs ---------- */
+  .docs-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; margin-top: 44px; background: var(--line-soft); border: 1px solid var(--line-soft); }
+  .doc-item { display: flex; flex-direction: column; gap: 7px; min-width: 0; background: var(--panel); padding: 24px 26px 22px; transition: background .15s ease; }
+  .doc-item:hover { background: #13181e; }
+  .doc-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+  .doc-tag { font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; color: var(--dim); border: 1px solid var(--line); border-radius: 2px; padding: 2px 6px; }
+  .doc-arrow { font-family: var(--mono); font-size: 14px; color: var(--dim); }
+  .doc-item h3 { margin: 0; font-size: 17px; font-weight: 620; letter-spacing: -.01em; transition: color .15s ease; }
+  .doc-item:hover h3, .doc-item:hover .doc-arrow { color: var(--accent); }
+  .doc-item p { margin: 0; font-size: 14px; color: var(--muted); }
+  .doc-item code { font-family: var(--mono); font-size: .88em; color: var(--mint); background: rgba(125,211,192,.07); padding: 1px 5px; border-radius: 2px; }
+  .docs-foot { margin: 22px 0 0; font-family: var(--mono); font-size: 12px; letter-spacing: .08em; }
+  .docs-foot a { color: var(--muted); border-bottom: 1px solid var(--line); padding-bottom: 2px; }
+  .docs-foot a:hover { color: var(--accent); border-color: var(--accent); }
+
+  .download { margin-top: 96px; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); padding: 84px 0; text-align: center; }
+  .download img { width: 76px; height: 76px; filter: invert(1); margin-bottom: 22px; }
+  .download h2 { font-size: clamp(28px, 3.4vw, 40px); }
+  .download p { margin: 14px auto 0; color: var(--muted); max-width: 46em; }
+  .download .btn.big { margin-top: 28px; padding: 15px 24px; font-size: 16px; }
+  .download .small { font-size: 13px; color: var(--dim); margin-top: 22px; }
+  .download .small a { color: var(--muted); border-bottom: 1px solid var(--line); }
+  .download .small a:hover { color: var(--text); }
+
+  footer { padding: 52px 0 64px; }
+  .foot-top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 20px; }
+  .foot-links { display: flex; flex-wrap: wrap; gap: 22px; font-size: 13.5px; color: var(--muted); }
+  .foot-links a:hover { color: var(--text); }
+  .fine { margin: 26px 0 0; font-size: 12px; color: var(--dim); max-width: 60em; }
+
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+  @media (max-width: 1100px) {
+    .nav-links { gap: 20px; }
+  }
+  @media (max-width: 940px) {
+    .nav-links a[href^="#"] { display: none; }
+    .hero { grid-template-columns: 1fr; gap: 40px; padding-top: 34px; }
+    .hero-visual { max-width: 560px; }
+    .grid.three { grid-template-columns: 1fr; }
+    .split { grid-template-columns: 1fr; gap: 36px; }
+    .download { padding: 68px 0; }
+  }
+  @media (max-width: 620px) {
+    .wrap { width: min(1120px, calc(100% - 32px)); }
+    .nav-links { gap: 12px; }
+    .nav-links .nav-gh { display: none; }
+    .nav-links .nav-dl { padding: 7px 12px; }
+    .lang-toggle { padding: 7px 8px; }
+    .section { padding-top: 68px; }
+    .docs-list { grid-template-columns: 1fr; }
+    .doc-item { padding: 20px 20px 18px; }
+    .download { margin-top: 72px; }
+    .d-dim { display: none; }
+    .d-title { font-size: 21px; }
+    .d-label { font-size: 24px; }
+    .code { font-size: 11.5px; padding: 18px 16px; }
+  }
+</style>
+<noscript><style>.lang-toggle { display: none; }</style></noscript>
+<script>
+(function () {
+  var lang = "";
+  try {
+    var q = new URLSearchParams(location.search).get("lang");
+    if (q === "zh" || q === "en") lang = q;
+  } catch (e) {}
+  if (!lang) {
+    try {
+      var stored = localStorage.getItem("onrouter-lang");
+      if (stored === "zh" || stored === "en") lang = stored;
+    } catch (e) {}
+  }
+  if (!lang) {
+    var list = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || ""];
+    lang = "en";
+    for (var i = 0; i < list.length; i++) {
+      var code = String(list[i]).toLowerCase();
+      if (code.indexOf("zh") === 0) { lang = "zh"; break; }
+      if (code.indexOf("en") === 0) { lang = "en"; break; }
+    }
+  }
+  document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+  document.documentElement.setAttribute("data-lang", lang);
+  if (lang === "en") {
+    document.documentElement.setAttribute("data-i18n-pending", "");
+    setTimeout(function () {
+      document.documentElement.removeAttribute("data-i18n-pending");
+    }, 1500);
+  }
+})();
+</script>
+</head>
+<body>
+<a class="skip" href="#main" data-i18n="skip">跳到正文</a>
+
+<header class="wrap nav">
+  <a class="brand" href="/">
+    <img src="/logo.png" alt="">
+    <span>ONRouter</span>
+  </a>
+  <nav class="nav-links" aria-label="主导航" data-i18n-aria="nav.label">
+    <a href="#runtime" data-i18n="nav.runtime">能力</a>
+    <a href="#script" data-i18n="nav.script">脚本</a>
+    <a href="#config" data-i18n="nav.config">配置</a>
+    <a href="#learning" data-i18n="nav.learning">学习</a>
+    <a href="#docs" data-i18n="nav.docs">文档</a>
+    <a href="#download" data-i18n="nav.download">下载</a>
+    <a class="nav-gh" href="https://github.com/yxpil/ONRouter" rel="noopener">GitHub</a>
+    <button class="lang-toggle" id="lang-toggle" type="button" lang="en" aria-label="Switch to English" title="Switch to English">EN</button>
+    <a class="nav-dl" href="https://github.com/yxpil/ONRouter/releases/latest" rel="noopener" data-i18n="nav.get">获取 ONRouter</a>
+  </nav>
+</header>
+
+<main id="main">
+  <section class="wrap hero">
+    <div>
+      <p class="eyebrow">GENERAL-PURPOSE GATEWAY · RUST</p>
+      <h1 data-i18n="hero.title">一个进程，<br><em>接管全部入口。</em></h1>
+      <p class="lede" data-i18n="hero.lede">ONRouter 是用 Rust 从零实现的通用网关。TLS、反向代理、响应缓存、Lua 与 WASM 脚本、TCP/UDP 转发——不拼装中间件，不依赖外部运行时，一个二进制跑起来。</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/yxpil/ONRouter/releases/latest" rel="noopener">
+          <span data-i18n="hero.ctaDownload">下载最新版本</span>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h9M8.5 3.5 13 8l-4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+        </a>
+        <a class="btn ghost" href="https://github.com/yxpil/ONRouter" rel="noopener" data-i18n="hero.ctaSource">查看源码</a>
+      </div>
+      <ul class="facts">
+        <li>HTTP/1.1 · HTTP/2 · HTTP/3</li>
+        <li>Lua 5.4 · WASM</li>
+        <li>MIT License</li>
+      </ul>
+    </div>
+
+    <figure class="diagram" aria-label="请求路径示意图：客户端进入 ONRouter，经过 TLS、路由、缓存与脚本阶段，转发到 HTTP、TCP 或 UDP 上游" data-i18n-aria="diagram.label">
+      <svg viewBox="0 20 560 360" role="img">
+        <title data-i18n="diagram.title">请求在 ONRouter 内的路径</title>
+        <g>
+          <rect class="d-node" x="10" y="160" width="126" height="76" rx="3"/>
+          <text class="d-title" x="26" y="190">CLIENT</text>
+          <text class="d-dim" x="26" y="212">h1 · h2 · h3</text>
+        </g>
+
+        <path class="d-wire" d="M136 198 H 192"/>
+        <path class="d-wire-hot" d="M136 198 H 192"/>
+
+        <g>
+          <rect class="d-gw" x="192" y="54" width="188" height="288" rx="3"/>
+          <text class="d-title" x="210" y="86">ONROUTER</text>
+          <text class="d-dim" x="210" y="104">ONE PROCESS</text>
+          <line x1="192" y1="118" x2="380" y2="118" stroke="#232a32"/>
+
+          <text class="d-label" x="210" y="152">TLS</text>
+          <line x1="192" y1="168" x2="380" y2="168" stroke="#232a32"/>
+
+          <text class="d-label" x="210" y="198">ROUTE</text>
+          <line x1="192" y1="214" x2="380" y2="214" stroke="#232a32"/>
+
+          <text class="d-label" x="210" y="244">CACHE</text>
+          <line x1="192" y1="260" x2="380" y2="260" stroke="#232a32"/>
+
+          <text class="d-label" x="210" y="290">SCRIPT</text>
+
+          <text class="d-dim" x="210" y="324">L7 + L4</text>
+          <circle class="d-mint" cx="362" cy="320" r="2.4"/>
+        </g>
+
+        <path class="d-wire" d="M380 134 H 440"/>
+        <path class="d-wire" d="M380 198 H 440"/>
+        <path class="d-wire" d="M380 262 H 440"/>
+        <path class="d-wire-hot" d="M380 198 H 440"/>
+
+        <g>
+          <rect class="d-node" x="440" y="104" width="112" height="60" rx="3"/>
+          <text class="d-label" x="456" y="130">HTTP</text>
+          <text class="d-dim" x="456" y="148">upstream pool</text>
+        </g>
+        <g>
+          <rect class="d-node" x="440" y="168" width="112" height="60" rx="3"/>
+          <text class="d-label" x="456" y="194">TCP</text>
+          <text class="d-dim" x="456" y="212">sni preread</text>
+        </g>
+        <g>
+          <rect class="d-node" x="440" y="232" width="112" height="60" rx="3"/>
+          <text class="d-label" x="456" y="258">UDP</text>
+          <text class="d-dim" x="456" y="276">sessions</text>
+        </g>
+      </svg>
+      <figcaption>REQUEST PATH / SINGLE PROCESS</figcaption>
+    </figure>
+  </section>
+
+  <div class="wrap">
+    <div class="strip">
+      <span><b>LINUX</b> x86_64 · aarch64 · armv7 · riscv64</span>
+      <span><b>MACOS</b> Intel · Apple Silicon</span>
+      <span><b>WINDOWS</b> x86_64 · arm64</span>
+      <span>SHA256SUMS</span>
+    </div>
+  </div>
+
+  <section class="wrap section" id="runtime">
+    <div class="section-head">
+      <p class="eyebrow">01 / RUNTIME</p>
+      <h2 data-i18n="runtime.title">请求只走一跳。</h2>
+      <p data-i18n="runtime.lede">从 TLS 终止到上游连接，全部在同一个进程里完成。没有反向代理链，没有跨进程队列，也没有需要单独部署的脚本运行时。</p>
+    </div>
+    <div class="grid three">
+      <article class="card">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/><circle cx="18" cy="17" r="2"/></svg>
+        <h3 data-i18n="runtime.card1.title">协议在入口终止</h3>
+        <p data-i18n="runtime.card1.body">HTTP/1.1、HTTP/2（TLS 与 h2c）、HTTP/3 over QUIC、WebSocket Upgrade，同一个端口按 ALPN 分流；L4 另有 SNI 预读、TCP 隧道和 UDP 会话。</p>
+      </article>
+      <article class="card">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l3 6 3-6h4M4 18h6l3-6"/></svg>
+        <h3 data-i18n="runtime.card2.title">代理与负载均衡</h3>
+        <p data-i18n="runtime.card2.body">加权轮询、<code>least_conn</code>、<code>ip_hash</code>；被动健康检查、懒重连、熔断、keepalive 连接池，以及 TLS / mTLS 上游。</p>
+      </article>
+      <article class="card">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="7" ry="2.5"/><path d="M5 6v6c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V6M5 12v6c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5v-6"/></svg>
+        <h3 data-i18n="runtime.card3.title">缓存有冷热两层</h3>
+        <p data-i18n="runtime.card3.body">命名缓存区、可选的磁盘冷层与 TinyLFU 学习准入、ETag / Last-Modified 复验证、请求合并、过期兜底；每个响应都能看到命中状态。</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="wrap section split" id="script">
+    <div class="section-copy">
+      <p class="eyebrow">02 / SCRIPTING</p>
+      <h2 data-i18n="script.title">脚本不是外挂。</h2>
+      <p data-i18n="script.lede">Lua 5.4 在每个请求阶段可用：access、rewrite、content、header_filter、body_filter。共享字典、定时器、cosocket、子请求和 resty.* 模块都是内建的；需要强隔离的第三方逻辑放进 WASM，燃料和内存都有上限。</p>
+      <ul class="checklist">
+        <li data-i18n="script.li1"><code>ngx.*</code> 请求、响应、变量与日志</li>
+        <li data-i18n="script.li2">shared dict、semaphore、light thread</li>
+        <li data-i18n="script.li3">WASM access / header / body 过滤器</li>
+      </ul>
+    </div>
+    <figure class="code-wrap">
+      <pre class="code"><code><span class="c" data-i18n="code.authComment"># 在 access 阶段做鉴权，失败直接结束请求</span>
+<span class="k">access_by_lua_block</span> {
+    <span class="k">local</span> auth = ngx.var.http_authorization
+    <span class="k">if</span> auth ~= <span class="s">"Bearer demo"</span> <span class="k">then</span>
+        <span class="k">return</span> ngx.exit(<span class="v">401</span>)
+    <span class="k">end</span>
+}
+
+<span class="c" data-i18n="code.dictComment"># content 阶段读写共享字典</span>
+<span class="k">location</span> = /count {
+    <span class="k">content_by_lua_block</span> {
+        <span class="k">local</span> cache = ngx.shared.hits
+        <span class="k">local</span> n = cache:incr(<span class="s">"n"</span>, <span class="v">1</span>, <span class="v">0</span>)
+        ngx.say(<span class="s">"hits="</span>, n)
+    }
+}</code></pre>
+      <figcaption>LUA 5.4 / NGX API</figcaption>
+    </figure>
+  </section>
+
+  <section class="wrap section split" id="config">
+    <div class="section-copy">
+      <p class="eyebrow">03 / CONFIG</p>
+      <h2 data-i18n="config.title">声明式，不改代码。</h2>
+      <p data-i18n="config.lede1">配置沿用 nginx 风格的语法，现有习惯可以直接迁移。上游、缓存区、路由、限流和脚本都在同一个文件里；改完先跑 <code>-t</code>，再热重载。</p>
+      <p data-i18n="config.lede2">运行中的进程支持 <code>SIGHUP</code> 换路由、Lua 和证书，新连接不受影响；只有新增监听端口需要重启。</p>
+    </div>
+    <figure class="code-wrap">
+      <pre class="code"><code><span class="k">proxy_cache_path</span> /var/cache/onrouter
+    <span class="v">keys_zone</span>=api:32m;
+
+<span class="k">upstream</span> app_pool {
+    <span class="k">least_conn</span>;
+    <span class="k">server</span> <span class="v">10.0.0.11:8080</span>;
+    <span class="k">server</span> <span class="v">10.0.0.12:8080</span>;
+}
+
+<span class="k">server</span> {
+    <span class="k">listen</span> <span class="v">443</span> ssl;
+    <span class="k">http2</span> on;
+    <span class="k">server_name</span> <span class="s">example.com</span>;
+
+    <span class="k">location</span> /api/ {
+        <span class="k">proxy_pass</span> http://app_pool/;
+        <span class="k">proxy_cache</span> api;
+        <span class="k">proxy_set_header</span> Host $host;
+    }
+
+    <span class="k">location</span> / {
+        <span class="k">root</span> /srv/www;
+        <span class="k">index</span> index.html;
+    }
+}</code></pre>
+      <figcaption>ONROUTER.CONF / MINIMAL</figcaption>
+    </figure>
+  </section>
+
+  <section class="wrap section split" id="learning">
+    <div class="section-copy">
+      <p class="eyebrow">04 / LEARNING</p>
+      <h2 data-i18n="learning.title">冷热不用猜，<br><em>它自己学。</em></h2>
+      <p data-i18n="learning.lede">一层可选的在线学习：TinyLFU 草图决定谁值得留在缓存里，每个 key 的已完成突发决定它能排多深，客户端信誉只从限流器已有的裁决里累积。默认关闭；打开后三张表共用一份可配置的字节账本。</p>
+      <ul class="checklist">
+        <li data-i18n="learning.li1"><code>proxy_cache_learning</code>：一次性 URL 的扫描，挤不掉热点对象</li>
+        <li data-i18n="learning.li2"><code>limit_req_learning</code>：深度在 <code>[depth_min, depth]</code> 里按突发形状伸缩</li>
+        <li data-i18n="learning.li3"><code>vip_learning</code>：信誉只换排队与驻留，不换速率，也不跳过准入</li>
+      </ul>
+      <p data-i18n="learning.lede2">没有外部模型、后台训练线程或跨进程状态；老化跟着写入与沉默走，热重载不会重启模型，配置没变时学到的状态原地保留。默认预算 1 MiB，实际占用在指标里能对上字节数。</p>
+      <p class="fine" data-i18n="learning.fine">学习层只改准入、排队与驻留；TTL、复验证和速率上限仍按配置执行。</p>
+    </div>
+    <figure class="code-wrap">
+      <pre class="code"><code><span class="k">learning</span> on;
+<span class="k">learning_memory_budget</span> <span class="v">1m</span>;
+
+<span class="c" data-i18n="code.ageComment"># 热度赢过最老的 8 个条目，才允许占位</span>
+<span class="k">proxy_cache_learning</span> api <span class="v">sketch</span>=64k;
+
+<span class="c" data-i18n="code.burstComment"># 每个 key 的突发形状，决定它能排多深</span>
+<span class="k">limit_req_queue</span> api <span class="v">depth</span>=32 <span class="v">depth_min</span>=4;
+<span class="k">limit_req_learning</span> api <span class="v">table</span>=16k;
+
+<span class="c" data-i18n="code.repComment"># 信誉只来自限流器已经看到的裁决</span>
+<span class="k">vip_learning</span> <span class="v">table</span>=16k <span class="v">min</span>=10 <span class="v">decay</span>=30s;</code></pre>
+      <figcaption>ONROUTER.CONF / LEARNING</figcaption>
+    </figure>
+  </section>
+
+  <section class="wrap section" id="ops">
+    <div class="section-head">
+      <p class="eyebrow">05 / OPERATIONS</p>
+      <h2 data-i18n="ops.title">上线之后，少一件事。</h2>
+      <p data-i18n="ops.lede">没有要跟着升级的运行时，没有要拼接的模块。部署是一个二进制，观测、重载和停机都在进程内完成。</p>
+    </div>
+    <div class="grid three">
+      <article class="card">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 12 3 3 7-7"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+        <h3 data-i18n="ops.card1.title">配置先验证</h3>
+        <p data-i18n="ops.card1.body"><code>-t</code> 检查监听、证书、缓存区和指令引用，把被忽略的写法逐条列出来；退出码不代替告警。</p>
+      </article>
+      <article class="card">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5"/></svg>
+        <h3 data-i18n="ops.card2.title">热重载</h3>
+        <p data-i18n="ops.card2.body"><code>SIGHUP</code> 替换路由、脚本与证书；<code>reload 2s;</code> 还能盯住配置文件变化，自动完成同一件事。</p>
+      </article>
+      <article class="card">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9M9 19V5M14 19v-7M19 19v-4"/></svg>
+        <h3 data-i18n="ops.card3.title">指标是内建的</h3>
+        <p data-i18n="ops.card3.body">Prometheus 指标覆盖进程、上游、缓存、限流与 TLS；访问日志带 upstream 地址、状态和分段耗时。</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="wrap section" id="docs">
+    <div class="section-head">
+      <p class="eyebrow">06 / DOCS</p>
+      <h2 data-i18n="docs.title">文档，<br><em>跟着代码走。</em></h2>
+      <p data-i18n="docs.lede">使用教程、运维手册、Lua API、能力矩阵、可运行示例和安全模型都和源码放在同一个仓库，按版本一起更新。下面每一条都指向仓库里的原文，不另存一份会过期的副本。</p>
+    </div>
+    <div class="docs-list">
+      <a class="doc-item" href="https://github.com/yxpil/ONRouter/blob/main/docs/TUTORIAL.md" rel="noopener">
+        <span class="doc-meta"><span class="doc-tag">中文</span><span class="doc-arrow" aria-hidden="true">↗</span></span>
+        <h3 data-i18n="docs.tutorial.title">使用教程</h3>
+        <p data-i18n="docs.tutorial.body">从一条 <code>return</code> 开始，逐章搭起反向代理、缓存、脚本与 L4。</p>
+      </a>
+      <a class="doc-item" href="https://github.com/yxpil/ONRouter/blob/main/docs/OPERATIONS.md" rel="noopener">
+        <span class="doc-meta"><span class="doc-tag">中文</span><span class="doc-arrow" aria-hidden="true">↗</span></span>
+        <h3 data-i18n="docs.operations.title">运维手册</h3>
+        <p data-i18n="docs.operations.body">进程、信号、容量、发布与回滚，按生产场景组织。</p>
+      </a>
+      <a class="doc-item" href="https://github.com/yxpil/ONRouter/blob/main/docs/CAPABILITY_MATRIX.md" rel="noopener">
+        <span class="doc-meta"><span class="doc-tag">EN</span><span class="doc-arrow" aria-hidden="true">↗</span></span>
+        <h3 data-i18n="docs.matrix.title">能力矩阵</h3>
+        <p data-i18n="docs.matrix.body">逐项列出已实现的能力、每行对应的测试证据，以及尚未完成的部分。</p>
+      </a>
+      <a class="doc-item" href="https://github.com/yxpil/ONRouter/blob/main/docs/LUA_API.md" rel="noopener">
+        <span class="doc-meta"><span class="doc-tag">EN</span><span class="doc-arrow" aria-hidden="true">↗</span></span>
+        <h3 data-i18n="docs.lua.title">Lua API</h3>
+        <p data-i18n="docs.lua.body"><code>ngx.*</code> 的阶段、共享字典、cosocket 与 <code>resty.*</code> 模块。</p>
+      </a>
+      <a class="doc-item" href="https://github.com/yxpil/ONRouter/tree/main/examples" rel="noopener">
+        <span class="doc-meta"><span class="doc-tag">EN</span><span class="doc-arrow" aria-hidden="true">↗</span></span>
+        <h3 data-i18n="docs.examples.title">可运行示例</h3>
+        <p data-i18n="docs.examples.body">从单站点到 TLS、缓存、限流、灰度与 L4，每个配置文件都能直接 <code>-t</code>。</p>
+      </a>
+      <a class="doc-item" href="https://github.com/yxpil/ONRouter/blob/main/docs/SECURITY.md" rel="noopener">
+        <span class="doc-meta"><span class="doc-tag">EN</span><span class="doc-arrow" aria-hidden="true">↗</span></span>
+        <h3 data-i18n="docs.security.title">安全模型</h3>
+        <p data-i18n="docs.security.body">默认值、硬性规则，以及每条规则防的是什么。</p>
+      </a>
+    </div>
+    <p class="docs-foot"><a href="https://github.com/yxpil/ONRouter/tree/main/docs" rel="noopener" data-i18n="docs.index">浏览完整文档目录 →</a></p>
+  </section>
+
+  <section class="wrap download" id="download">
+    <img src="/logo.png" alt="ONRouter logo">
+    <div>
+      <p class="eyebrow">07 / DOWNLOAD</p>
+      <h2 data-i18n="download.title">下载 ONRouter</h2>
+      <p data-i18n="download.lede">最新构建发布在 GitHub Releases：Linux、macOS、Windows 共 8 个平台，每个版本附带 <code>SHA256SUMS.txt</code>。</p>
+      <a class="btn primary big" href="https://github.com/yxpil/ONRouter/releases/latest" rel="noopener">
+        <span data-i18n="download.cta">前往 GitHub Releases</span>
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h9M8.5 3.5 13 8l-4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+      </a>
+      <p class="small" data-i18n="download.small">版本历史见 <a href="https://github.com/yxpil/ONRouter/releases" rel="noopener">Releases</a>，从 <a href="https://github.com/yxpil/ONRouter/blob/main/docs/TUTORIAL.md" rel="noopener">使用教程</a> 开始配置。</p>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap">
+  <div class="foot-top">
+    <a class="brand" href="/">
+      <img src="/logo.png" alt="">
+      <span>ONRouter</span>
+    </a>
+    <nav class="foot-links" aria-label="页脚" data-i18n-aria="footer.navLabel">
+      <a href="https://github.com/yxpil/ONRouter" rel="noopener">GitHub</a>
+      <a href="https://github.com/yxpil/ONRouter/releases" rel="noopener">Releases</a>
+      <a href="https://github.com/yxpil/ONRouter/tree/main/docs" rel="noopener" data-i18n="footer.docs">文档</a>
+      <a href="https://github.com/yxpil/ONRouter/issues" rel="noopener">Issues</a>
+    </nav>
+    <p class="fine" style="margin:0">MIT License · Built with Rust</p>
+  </div>
+  <p class="fine" data-i18n="footer.fine">ONRouter 是独立实现，与 nginx 或任何其他网关没有隶属关系。</p>
+</footer>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = "onrouter-lang";
+  var toggle = document.getElementById("lang-toggle");
+  var en = {
+    "skip": "Skip to content",
+    "nav.label": "Main navigation",
+    "nav.runtime": "Runtime",
+    "nav.script": "Scripting",
+    "nav.config": "Config",
+    "nav.learning": "Learning",
+    "nav.docs": "Docs",
+    "nav.download": "Download",
+    "nav.get": "Get ONRouter",
+    "hero.title": "One process.<br><em>Every way in.</em>",
+    "hero.lede": "ONRouter is a general-purpose gateway built from scratch in Rust. TLS, reverse proxy, response caching, Lua and WASM scripting, TCP/UDP forwarding — no middleware to assemble, no external runtime. One binary, and it runs.",
+    "hero.ctaDownload": "Download latest",
+    "hero.ctaSource": "View source",
+    "diagram.label": "Request path: clients enter ONRouter, pass TLS, routing, cache and scripting, then reach HTTP, TCP or UDP upstreams",
+    "diagram.title": "Request path through ONRouter",
+    "runtime.title": "One hop per request.",
+    "runtime.lede": "From TLS termination to the upstream connection, everything happens in one process. No reverse-proxy chain, no cross-process queue, no separate scripting runtime to deploy.",
+    "runtime.card1.title": "Protocols terminate at the edge",
+    "runtime.card1.body": "HTTP/1.1, HTTP/2 (TLS and h2c), HTTP/3 over QUIC and WebSocket upgrade, split by ALPN on one port; L4 adds SNI preread, TCP tunnels and UDP sessions.",
+    "runtime.card2.title": "Proxy and load balancing",
+    "runtime.card2.body": "Weighted round-robin, <code>least_conn</code>, <code>ip_hash</code>; passive health checks, lazy reconnect, circuit breaking, a keepalive pool, and TLS / mTLS upstreams.",
+    "runtime.card3.title": "Two cache tiers",
+    "runtime.card3.body": "Named zones, an optional disk cold tier with TinyLFU admission, ETag / Last-Modified revalidation, request coalescing, stale fallback; every response shows its cache status.",
+    "script.title": "Scripting is native.",
+    "script.lede": "Lua 5.4 runs in every request phase: access, rewrite, content, header_filter, body_filter. Shared dicts, timers, cosockets, subrequests and resty.* modules are built in; third-party logic that needs hard isolation runs in WASM, with fuel and memory caps.",
+    "script.li1": "<code>ngx.*</code> requests, responses, variables and logs",
+    "script.li2": "shared dicts, semaphores, light threads",
+    "script.li3": "WASM access / header / body filters",
+    "code.authComment": "# authenticate in access; end the request on failure",
+    "code.dictComment": "# read/write a shared dict in content",
+    "config.title": "Config, not code.",
+    "config.lede1": "The config keeps nginx-style syntax, so existing habits carry over. Upstreams, cache zones, routes, rate limits and scripts live in one file; run <code>-t</code> first, then hot reload.",
+    "config.lede2": "A running process swaps routes, Lua and certificates on <code>SIGHUP</code> without touching new connections; only a new listening port needs a restart.",
+    "learning.title": "Hot or cold,<br><em>it learns.</em>",
+    "learning.lede": "An optional online learning layer: a TinyLFU sketch decides what deserves to stay cached, each key's completed burst decides how deep it may queue, and client reputation accumulates only from verdicts the limiter has already made. Off by default; when on, all three tables share one configurable byte ledger.",
+    "learning.li1": "<code>proxy_cache_learning</code>: a one-shot URL scan can't evict hot objects",
+    "learning.li2": "<code>limit_req_learning</code>: depth scales with burst shape within <code>[depth_min, depth]</code>",
+    "learning.li3": "<code>vip_learning</code>: reputation buys queue room and retention, never rate or a skipped admission",
+    "learning.lede2": "No external model, background training thread or cross-process state; aging follows writes and silence, a hot reload doesn't restart the model, and learned state stays in place when the config is unchanged. Default budget 1 MiB, and the actual footprint is reported in bytes in the metrics.",
+    "learning.fine": "The learning layer only changes admission, queueing and retention; TTL, revalidation and rate ceilings still follow the config.",
+    "code.ageComment": "# beat the coldest of the 8 oldest entries",
+    "code.burstComment": "# burst shape sets how deep each key can queue",
+    "code.repComment": "# reputation comes only from limiter verdicts",
+    "ops.title": "One less thing to run.",
+    "ops.lede": "No runtime to upgrade, no modules to stitch together. Deployment is one binary; observability, reload and shutdown all happen in-process.",
+    "ops.card1.title": "Validate before launch",
+    "ops.card1.body": "<code>-t</code> checks listeners, certificates, cache zones and directive references, listing every ignored form; a clean exit code doesn't mean there are no warnings.",
+    "ops.card2.title": "Hot reload",
+    "ops.card2.body": "<code>SIGHUP</code> swaps routes, scripts and certificates; <code>reload 2s;</code> can watch the config file and do the same automatically.",
+    "ops.card3.title": "Metrics built in",
+    "ops.card3.body": "Prometheus metrics cover the process, upstreams, cache, rate limits and TLS; access logs carry the upstream address, status and per-segment timings.",
+    "docs.title": "Docs travel<br><em>with the code.</em>",
+    "docs.lede": "The tutorial, operations manual, Lua API, capability matrix, runnable examples and security model live in the same repository as the source and move with each version. Every link below points at the repository text, not a copy that ages out.",
+    "docs.tutorial.title": "Tutorial",
+    "docs.tutorial.body": "Start with one <code>return</code>, then build a reverse proxy, cache, scripting and L4 chapter by chapter.",
+    "docs.operations.title": "Operations",
+    "docs.operations.body": "Process, signals, capacity, release and rollback, organized for production.",
+    "docs.matrix.title": "Capability matrix",
+    "docs.matrix.body": "Capability-by-capability status, the test evidence behind each row, and what isn't finished yet.",
+    "docs.lua.title": "Lua API",
+    "docs.lua.body": "The <code>ngx.*</code> phases, shared dicts, cosockets and <code>resty.*</code> modules.",
+    "docs.examples.title": "Examples",
+    "docs.examples.body": "From a single site to TLS, cache, rate limits, canary and L4; every config validates with <code>-t</code>.",
+    "docs.security.title": "Security",
+    "docs.security.body": "Defaults, hard rules, and what each one defends against.",
+    "docs.index": "Browse the full docs directory →",
+    "download.title": "Download ONRouter",
+    "download.lede": "The latest builds ship on GitHub Releases: eight targets across Linux, macOS and Windows, each release with <code>SHA256SUMS.txt</code>.",
+    "download.cta": "Go to GitHub Releases",
+    "download.small": 'See <a href="https://github.com/yxpil/ONRouter/releases" rel="noopener">Releases</a> for version history, and start with the <a href="https://github.com/yxpil/ONRouter/blob/main/docs/TUTORIAL.md" rel="noopener">tutorial</a>.',
+    "footer.navLabel": "Footer navigation",
+    "footer.docs": "Docs",
+    "footer.fine": "ONRouter is an independent implementation, not affiliated with nginx or any other gateway.",
+    "meta.title": "ONRouter — A general-purpose gateway in Rust",
+    "meta.description": "ONRouter is a general-purpose gateway built from scratch in Rust: HTTP/1.1, HTTP/2, HTTP/3, reverse proxy, response cache, Lua 5.4 and WASM scripting, TCP/UDP forwarding. One binary, MIT open source.",
+    "meta.ogTitle": "ONRouter — A general-purpose gateway in Rust",
+    "meta.ogDescription": "TLS, reverse proxy, caching, Lua and WASM scripting, TCP/UDP forwarding — one process handles it all."
+  };
+
+  var zhHtml = {};
+  var zhAria = {};
+  var metaDescription = document.getElementById("meta-description");
+  var ogTitle = document.getElementById("og-title");
+  var ogDescription = document.getElementById("og-description");
+  var ogLocale = document.getElementById("og-locale");
+  var zhMeta = {
+    title: document.title,
+    description: metaDescription ? metaDescription.getAttribute("content") : "",
+    ogTitle: ogTitle ? ogTitle.getAttribute("content") : "",
+    ogDescription: ogDescription ? ogDescription.getAttribute("content") : "",
+    ogLocale: ogLocale ? ogLocale.getAttribute("content") : ""
+  };
+
+  Array.prototype.forEach.call(document.querySelectorAll("[data-i18n]"), function (el) {
+    var key = el.getAttribute("data-i18n");
+    if (!Object.prototype.hasOwnProperty.call(zhHtml, key)) zhHtml[key] = el.innerHTML;
+  });
+  Array.prototype.forEach.call(document.querySelectorAll("[data-i18n-aria]"), function (el) {
+    var key = el.getAttribute("data-i18n-aria");
+    if (!Object.prototype.hasOwnProperty.call(zhAria, key)) zhAria[key] = el.getAttribute("aria-label") || "";
+  });
+
+  function apply(lang) {
+    var english = lang === "en";
+    Array.prototype.forEach.call(document.querySelectorAll("[data-i18n]"), function (el) {
+      var key = el.getAttribute("data-i18n");
+      var value = english ? en[key] : zhHtml[key];
+      if (typeof value === "string") el.innerHTML = value;
+    });
+    Array.prototype.forEach.call(document.querySelectorAll("[data-i18n-aria]"), function (el) {
+      var key = el.getAttribute("data-i18n-aria");
+      var value = english ? en[key] : zhAria[key];
+      if (typeof value === "string") el.setAttribute("aria-label", value);
+    });
+    document.title = english ? en["meta.title"] : zhMeta.title;
+    if (metaDescription) metaDescription.setAttribute("content", english ? en["meta.description"] : zhMeta.description);
+    if (ogTitle) ogTitle.setAttribute("content", english ? en["meta.ogTitle"] : zhMeta.ogTitle);
+    if (ogDescription) ogDescription.setAttribute("content", english ? en["meta.ogDescription"] : zhMeta.ogDescription);
+    if (ogLocale) ogLocale.setAttribute("content", english ? "en_US" : zhMeta.ogLocale);
+    root.lang = english ? "en" : "zh-CN";
+    root.setAttribute("data-lang", english ? "en" : "zh");
+    if (toggle) {
+      toggle.textContent = english ? "中文" : "EN";
+      toggle.lang = english ? "zh-CN" : "en";
+      toggle.setAttribute("aria-label", english ? "切换到中文" : "Switch to English");
+      toggle.title = english ? "切换到中文" : "Switch to English";
+    }
+  }
+
+  function current() {
+    return root.getAttribute("data-lang") === "en" ? "en" : "zh";
+  }
+
+  if (toggle) {
+    toggle.addEventListener("click", function () {
+      var next = current() === "zh" ? "en" : "zh";
+      try { localStorage.setItem(KEY, next); } catch (e) {}
+      apply(next);
+      try {
+        var url = new URL(location.href);
+        url.searchParams.set("lang", next);
+        history.replaceState(null, "", url.toString());
+      } catch (e) {}
+    });
+  }
+
+  apply(current());
+  root.removeAttribute("data-i18n-pending");
+})();
+</script>
+</body>
+</html>

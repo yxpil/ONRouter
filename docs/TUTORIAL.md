@@ -56,7 +56,8 @@ target/release/orr-gencert     # Windows: target\release\orr-gencert.exe
 
 ```bash
 target/release/onrouter -V
-# ONRouter/1.0.3 (Rust, OpenResty-compatible)
+# ONRouter/1.0.4 (Rust, OpenResty-compatible)
+#   crypto: rustls/ring [pq=off]
 ```
 
 教程里的辅助后端和压测脚本需要 Python 3.8+，只用于本机练习，不参与网关进程。
@@ -782,7 +783,7 @@ curl -s http://127.0.0.1:18600/lua/count
 
 常用 API 覆盖 `ngx.say/print/header/status/exit`、`ngx.req.*`、`ngx.resp.*`、
 `ngx.shared.DICT`、`ngx.timer.*`、`ngx.re`、`ngx.location.capture`、`ngx.socket` 等，
-完整清单见 [README 的 Lua API 一节](../README.md#lua-api-aligned-with-ngx)。
+完整清单见 [Lua API](LUA_API.md)。
 
 Lua 文件脚本用 `content_by_lua_file "../lua/time.lua";` 引用；文件只读一次并缓存，
 编辑后由脚本自检/重载机制生效。大量计算或需要强隔离的第三方代码优先放 WASM；需要

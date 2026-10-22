@@ -876,4 +876,4 @@ ceiling. Conclusion: neutral within noise on this host; the win is architectural
 - OpenResty documentation: https://openresty.org/
 - lua-nginx-module wiki: https://github.com/openresty/lua-nginx-module/wiki
 - OpenResty best practices: https://github.com/moonbingbing/openresty-best-practices
-- `docs/USR2_HOT_UPGRADE.md`, `docs/LINUX_AB.md`, `README.md` (feature map + Lua API)
+- `USR2_HOT_UPGRADE.md`, `LINUX_AB.md`, `FEATURES.md` (feature map), `LUA_API.md`
