@@ -18,7 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONF = os.path.join(ROOT, "conf", "http2.conf")
 PROBE = os.path.join(HERE, "http2_check.js")
-ACCESS_LOG = os.path.join(ROOT, "logs", "http2_access.log")
+ACCESS_LOG = os.path.join(ROOT, "conf", "logs", "http2_access.log")
 
 H2C_PORT = 18124
 TLS_PORT = 18125
@@ -111,6 +111,7 @@ def main():
 
     exe = find_binary()
     os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
+    os.makedirs(os.path.dirname(ACCESS_LOG), exist_ok=True)
     try:
         os.remove(ACCESS_LOG)
     except FileNotFoundError:

@@ -410,7 +410,12 @@ pub fn build_server_config_with(
 /// max_early_data_size=u32::MAX 是 quinn 转换 QuicServerConfig 的要求（否则拒绝 0-RTT 且校验失败）。
 pub fn build_quic_server_config(specs: &[CertSpec]) -> Result<ServerConfig, String> {
     let resolver = Arc::new(build_resolver(specs)?);
-    let mut config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+    // 必须显式给 provider：开 `pq` 后 ring 与 aws-lc-rs 两个 feature 同时存在，
+    // rustls 的自动探测会 panic（"Could not automatically determine the process-level
+    // CryptoProvider"），而这里没有兜底——QUIC 监听会在 worker 线程里直接崩掉。
+    let mut config = ServerConfig::builder_with_provider(Arc::clone(&kx_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| format!("QUIC 的 TLS 参数不被当前 provider 支持: {e}"))?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     config.alpn_protocols = vec![b"h3".to_vec()];
@@ -440,6 +445,22 @@ mod tests {
         std::fs::write(&cp, cert.cert.pem()).unwrap();
         std::fs::write(&kp, cert.key_pair.serialize_pem()).unwrap();
         (cp, kp)
+    }
+
+    #[test]
+    fn quic_config_builds_with_an_explicit_provider() {
+        // 开 pq 时进程里同时有 ring 与 aws-lc-rs；这里必须不依赖自动探测，否则 panic
+        let dir = std::env::temp_dir().join(format!("onrouter-quic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (c, k) = write_pair(&dir, &["h3.example"]);
+        let cfg = build_quic_server_config(&[CertSpec {
+            names: vec!["h3.example".into()],
+            cert: c,
+            key: k,
+        }])
+        .unwrap();
+        assert_eq!(cfg.alpn_protocols, vec![b"h3".to_vec()]);
+        assert_eq!(cfg.max_early_data_size, u32::MAX);
     }
 
     #[test]
