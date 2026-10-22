@@ -8,7 +8,10 @@
   * `proxy_cache` 与 `limit_req` 是不是**同一本账**（跨传输共享），还是每种协议各一套；
   * POST 的 64 KB 请求体在 h3 上是不是按字节交到源站（多包/流控这条路径最容易出quiet bug）；
   * 上游超时是不是照样 504、连不上是不是照样与 h2 给出同一个码；
-  * SSE 这类逐帧 flush 的响应，h3 上是流式还是被缓冲成一坨。
+  * SSE 这类逐帧 flush 的响应，h3 上是流式还是被缓冲成一坨；
+  * **多证书 / 多 SNI 挂在同一个端口号上**（18156，三张证书）：h2 与 h3 是否都按 SNI 出示
+    各自的证书、站点是否仍按 `:authority` 选、SNI 匹配不上时兜底的是不是 `default_server`
+    那张（它故意写在最后一个块），以及 h2 与 h3 是不是共用同一本证书账。
 
 客户端：h3 用与网关同栈的自研探针 `orr-h3check`（本机 curl/Node 都没有 HTTP/3），
 h2 与 h1.1 用 Node 核心 `http2` / `https`（本机 libcurl 不带 HTTP/2）。三者输出同一套
@@ -17,8 +20,10 @@ h2 与 h1.1 用 Node 核心 `http2` / `https`（本机 libcurl 不带 HTTP/2）�
   cargo build --release -p onrouter-server && python tools/quic_business_e2e.py
 """
 import gzip
+import hashlib
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
@@ -231,6 +236,98 @@ def h1(path, hdrs=None, timeout=60):
     return h2(path, mode="h1", hdrs=hdrs, timeout=timeout)
 
 
+# ── 多证书 / 多 SNI / 单端口（18156）用的另一组探针 ─────────────────────────
+# SNI 与 :authority 必须能分开给：证书在握手期按 SNI 选，站点在收到请求后按 authority 选。
+# 两者相同的情形任何实现都能蒙对，只有分开时才看得出网关是不是真的分账。
+JS_MULTI = os.path.join(HERE, "https_matrix_h2.js")
+GW_MULTI = 18156
+BUNDLE = os.path.join("certs_qbiz", "bundle.pem")
+MULTI_HOSTS = ("a.qbiz.test", "b.qbiz.test", "catchall.qbiz.test")
+# 不在任何 server_name 里、但在兜底证书 SAN 里的名字：拿它当 SNI 就会走"匹配不上 → 默认 server"
+FALLBACK_SNI = "fallback.qbiz.test"
+
+
+def fp_of(name):
+    """<name>.pem 的 DER sha256，与探针打出来的 PEER_SHA256 同一口径。"""
+    with open(os.path.join(ROOT, "certs_qbiz", name + ".pem"), encoding="ascii") as f:
+        return hashlib.sha256(ssl.PEM_cert_to_DER_cert(f.read())).hexdigest()
+
+
+def make_multi_certs():
+    """三张独立证书 + 一份受信包（h3 客户端要同时信任三张才能读出指纹而不是掐断握手）。"""
+    selfsigned.ensure(ROOT, "certs_qbiz", base="a", dns=("a.qbiz.test",), ips=())
+    selfsigned.ensure(ROOT, "certs_qbiz", base="b", dns=("b.qbiz.test",), ips=())
+    selfsigned.ensure(ROOT, "certs_qbiz", base="catchall",
+                      dns=("catchall.qbiz.test", FALLBACK_SNI), ips=())
+    out = os.path.join(ROOT, BUNDLE)
+    with open(out, "w", encoding="ascii", newline="\n") as w:
+        for name in ("a", "b", "catchall"):
+            with open(os.path.join(ROOT, "certs_qbiz", name + ".pem"), encoding="ascii") as f:
+                w.write(f.read())
+    return out
+
+
+def h3_multi(path, sni, authority=None, mode="detail"):
+    exe = find_bin("orr-h3check")
+    env = dict(os.environ, ORR_H3_CERT=BUNDLE)
+    if authority:
+        env["ORRH3_AUTHORITY"] = authority
+    cmd = [exe, "127.0.0.1:%d" % GW_MULTI, sni, path, mode, "1"]
+    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=env, timeout=60)
+    return parse(r.stdout)
+
+
+def h2_multi(path, sni, authority):
+    cmd = ["node", JS_MULTI, "https://127.0.0.1:%d" % GW_MULTI, sni, authority, path]
+    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=60)
+    return parse(r.stdout)
+
+
+def test_multi_sni():
+    """同一个 TCP+UDP 端口号上三张证书：h2 与 h3 都必须按 SNI 出各自的证书，
+    而站点按 authority 选——两本账分开，且**跨传输是同一本账**。"""
+    fp = {h: fp_of(h.split(".")[0]) for h in MULTI_HOSTS}
+    cases = [
+        ("a.qbiz.test", "a.qbiz.test", "a", "vhost-a", "具名站点各归各的证书"),
+        ("b.qbiz.test", "b.qbiz.test", "b", "vhost-b", "另一个具名站点另一张证书"),
+        ("a.qbiz.test", "b.qbiz.test", "a", "vhost-b", "证书按 SNI、站点按 authority：两者可以不同"),
+        (FALLBACK_SNI, "b.qbiz.test", "catchall", "vhost-b",
+         "SNI 谁都不匹配 → 兜底证书必须是 default_server 那张（它写在最后一个块）"),
+        (FALLBACK_SNI, FALLBACK_SNI, "catchall", "vhost-default",
+         "SNI 与 authority 都不匹配 → 兜底证书 + 默认站点应答"),
+    ]
+    for sni, auth, want_cert, want_body, why in cases:
+        d3 = h3_multi("/who", sni, auth)
+        d2 = h2_multi("/who", sni, auth)
+        # h3 探针把体报成 SHA/LEN（它要能传二进制），h2 探针报 BODY 文本：两侧都换算到
+        # "这一站该回的那几个字节"，比较才是逐字节的而不是"看着像"。
+        want = fp[want_cert + ".qbiz.test"]
+        want_sha = hashlib.sha256((want_body + "\n").encode()).hexdigest()
+        check(f"h3 SNI={sni} authority={auth} → {want_cert}.pem + {want_body}（{why}）",
+              d3.get("PEER_SHA256") == want and d3.get("SHA") == want_sha,
+              f"fp={str(d3.get('PEER_SHA256'))[:16]} want={want[:16]} "
+              f"sha={str(d3.get('SHA'))[:16]} want_sha={want_sha[:16]} err={d3.get('ERROR')}")
+        check(f"h2 SNI={sni} authority={auth} → {want_cert}.pem + {want_body}（{why}）",
+              d2.get("PEER_SHA256") == want and (d2.get("BODY") or "") == want_body,
+              f"fp={str(d2.get('PEER_SHA256'))[:16]} want={want[:16]} "
+              f"body={str(d2.get('BODY'))[:40]!r} alpn={d2.get('ALPN')}")
+        check(f"同一 (SNI={sni}, authority={auth}) 在 h2 与 h3 上是同一张证书、同一份应答",
+              d3.get("PEER_SHA256") == d2.get("PEER_SHA256")
+              and d3.get("SHA") == want_sha and (d2.get("BODY") or "") == want_body,
+              f"h3={str(d3.get('PEER_SHA256'))[:12]} h2={str(d2.get('PEER_SHA256'))[:12]}")
+    # ALPN 与站点独立可达性：18156 的 TCP 侧协商 h2、UDP 侧是 h3，两个具名站点都要能用
+    d2 = h2_multi("/ping", "a.qbiz.test", "a.qbiz.test")
+    d3 = h3_multi("/ping", "b.qbiz.test", "b.qbiz.test")
+    check("18156 的 TCP 侧协商到 h2（不是只有 h1）", (d2.get("ALPN") or "") == "h2", d2)
+    check("两个具名站点在新端口上各自应答自己的 /ping（h2 拿 a、h3 拿 b）",
+          (d2.get("BODY") or "") == "pong-a"
+          and d3.get("SHA") == hashlib.sha256(b"pong-b\n").hexdigest(),
+          (str(d2.get("BODY"))[:20], str(d3.get("SHA"))[:12]))
+
+
+
 def status_of(d):
     try:
         return int(d.get("STATUS", "0"))
@@ -257,6 +354,7 @@ def main():
     # 不能借别的套件的目录——CI 干净检出时那个目录根本不存在。
     selfsigned.ensure(ROOT, "certs_qbiz", base="server",
                       dns=("localhost",), ips=("127.0.0.1",))
+    make_multi_certs()
 
     # 1) -t：quic 监听要在检查里说出来
     t = subprocess.run([gw_exe, "-t", "-c", CONF], cwd=ROOT, capture_output=True,
@@ -486,6 +584,10 @@ def main():
               not any(isinstance(k, int) and k >= 500 for k in codes)
               and not any(isinstance(k, str) for k in codes), dict(codes))
         check("混合窗口没有把请求排成长队（%.1fs 内完成 120 个跨三传输请求）" % wall, wall < 120, wall)
+
+        # ── 6b) 多证书 / 多 SNI / 单端口：h2 与 h3 各按 SNI 出示证书，站点仍按 authority ──
+        print("\n-- 6b) 18156：三张证书一个端口（h2 + h3） --")
+        test_multi_sni()
 
         with open(ERRLOG, encoding="utf-8", errors="replace") as f:
             errs = f.read()

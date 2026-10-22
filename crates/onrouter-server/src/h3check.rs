@@ -15,7 +15,8 @@
 //!              CANCELLED=<n> THEN=<状态码>（看网关有没有被半途而废的流拖住）
 //!
 //! 环境变量：
-//!   ORR_H3_CERT  受信根（默认 `certs_scenario/server.pem`；SAN 必须含 <sni>）
+//!   ORR_H3_CERT  受信根（默认 `certs_scenario/server.pem`；SAN 必须含 <sni>；可以是多张证书拼成的包）
+//!   ORRH3_AUTHORITY  `:authority` 覆写（默认与 <sni> 相同）——SNI 与站点分开时用
 //!   ORRH3_HDRS   额外请求头，`;` 分隔、`:` 分键值：`cookie:sid=A;range:bytes=0-99`
 //!   ORRH3_BODY   post 模式请求体的文件路径
 
@@ -90,9 +91,13 @@ fn env_headers() -> Vec<(String, String)> {
 }
 
 fn build(sni: &str, spec: &Spec) -> Option<http::Request<()>> {
+    // `ORRH3_AUTHORITY` 让 SNI 与 `:authority` 分开：多证书 / 多站点的单端口上，
+    // "出示哪张证书"由 SNI 在握手期决定，"哪个站应答"由 authority 决定。
+    // 不分开就只能测两本账一致的情形，测不出它们**不同**的时候各自对不对。
+    let authority = std::env::var("ORRH3_AUTHORITY").unwrap_or_else(|_| sni.to_string());
     let mut b = http::Request::builder()
         .method(spec.method.clone())
-        .uri(format!("https://{sni}{}", spec.path));
+        .uri(format!("https://{authority}{}", spec.path));
     for (k, v) in env_headers() {
         b = b.header(k, v);
     }
@@ -226,6 +231,17 @@ async fn main() {
             std::process::exit(3);
         }
     };
+
+    // 握手成功后先把"服务端实际出示了哪张证书"打出来：多证书 / 多 SNI 的单端口要断言的是
+    // 指纹，而不只是"握手成了"。h3 与 h2 走的是同一本 SNI 证书账，这条把 h3 那半边也变成可见的。
+    // quinn 的 rustls 会话把链以 `Vec<CertificateDer>` 交出来（见 quinn-proto 的 `peer_identity`）。
+    if let Some(id) = conn.peer_identity() {
+        if let Some(chain) = id.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>() {
+            if let Some(leaf) = chain.first() {
+                println!("PEER_SHA256={}", sha256_hex(leaf.as_ref()));
+            }
+        }
+    }
 
     let h3_conn = h3_quinn::Connection::new(conn.clone());
     let (mut driver, mut send_req) = match h3::client::new(h3_conn).await {
