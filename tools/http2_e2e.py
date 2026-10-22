@@ -79,7 +79,8 @@ def wait_for_log(path, needle, timeout=5.0):
     return False, text
 
 
-def node_probe(url, mode, n=None, timeout=20):    """跑 Node http2 探针，返回解析后的键值 dict。"""
+def node_probe(url, mode, n=None, timeout=20):
+    """跑 Node http2 探针，返回解析后的键值 dict。"""
     if not NODE:
         raise SystemExit("!! 需要 node（本机 curl 无 HTTP/2 支持）")
     cmd = [NODE, PROBE, url, mode]
