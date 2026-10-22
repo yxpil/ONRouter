@@ -205,6 +205,15 @@ def metric_lines(prefix, text):
     return out
 
 
+def udp_totals(text=None):
+    """(收到, 转发, 各类丢弃) 三个累计计数。套件用它们做**分段增量**：
+    判定"这一段里每个数据报都能指到原因"，而不是拿绝对值或百分比当契约。"""
+    m = metrics() if text is None else text
+    return (sum(metric_lines("onrouter_stream_udp_datagrams_total", m).values()),
+            sum(metric_lines("onrouter_stream_udp_forwarded_total", m).values()),
+            sum(metric_lines("onrouter_stream_udp_dropped_total", m).values()))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--heavy", action="store_true", help="把吞吐/并发拉到更高一档")
@@ -355,11 +364,14 @@ def main():
               f"新建会话 {created} / {n} 次发包")
 
         # ── 7b) 同一个客户端猛发时，不能把自己的回包饿死 ────────────────────
-        # 会话任务用 tokio::select! + biased，发包分支排在收包分支之前。客户端以最高速
-        # 猛发时，如果发包分支一直就绪，回包分支就会被拖死：表现是"没有报错，但回包
-        # 迟到/丢失"。这条用"自己压自己"的方式把它钉住：一个客户端全速 3000 发，
-        # 另一个线程只管收，要求一个不少、且没有长空窗。
+        # 会话任务用 tokio::select! + biased，发包分支排在收包分支之前。客户端全速猛发时
+        # 如果发包分支一直就绪，回包分支就会被拖死——那是**活性**问题，形状是"回包迟到很久 /
+        # 长空窗不来"，而不是"少了几张"：33k pps 的自压洪水上，有界写队列必然丢包，
+        # 丢本身是设计（悄悄吞包才是故障）。所以这一节判两件事：
+        #   1) 活性——空窗与 p99 首包延迟；
+        #   2) 账目——进来的每个数据报都能指到原因（转发 / 按原因计数），回包不重复不串话。
         N_FLOOD = 3000
+        g_in0, g_fwd0, g_drop0 = udp_totals()
         cli = udp_client()
         cli.settimeout(4.0)
         got_ts = []
@@ -397,11 +409,23 @@ def main():
         lats = [t - t_send0 for t, _ in got_ts]
         p99f = sorted(lats)[int(len(lats) * 0.99) - 1] * 1000 if lats else 0.0
         gap = max((b[0] - a[0] for a, b in zip(got_ts[1:], got_ts[:-1])), default=0.0)
-        print(f"  自压：{sent_f} 发 / {got_n} 收，发送耗时 {t_send1 - t_send0:.2f}s，"
+        f_in, f_fwd, f_drop = udp_totals()
+        f_in, f_fwd, f_drop = f_in - g_in0, f_fwd - g_fwd0, f_drop - g_drop0
+        rate = sent_f / max(t_send1 - t_send0, 1e-9)
+        print(f"  自压：{sent_f} 发 / {got_n} 收，发送耗时 {t_send1 - t_send0:.2f}s（≈{rate:,.0f} pps），"
               f"p99 首包到达 {p99f:.0f}ms，回包最大空窗 {gap * 1000:.0f}ms")
-        check("全速猛发时回包一个不少（发包分支没有饿死收包分支）", got_n == sent_f,
-              f"收 {got_n} / 发 {sent_f}")
-        check("回包没有被攒到最后一次（最大空窗 < 1s）", gap < 1.0, f"空窗 {gap * 1000:.0f}ms")
+        print(f"  这一段网关的账：收到 {f_in:.0f}、转发 {f_fwd:.0f}、计入丢弃 {f_drop:.0f}；"
+              f"发送端与网关入口的差额 {sent_f - f_in:.0f} 走的是内核 UDP 缓冲（本机回环，不是网关）")
+        # 活性判定：饿死的形状是"长空窗"和"首包迟到"，与丢包率无关
+        check("全速猛发没有饿死回包分支（最大空窗 < 1s 且 p99 首包 < 1.5s）",
+              gap < 1.0 and p99f < 1500, f"空窗 {gap * 1000:.0f}ms p99 {p99f:.0f}ms")
+        # 账目判定：悄悄吞包才是最坏的失效，所以守恒必须在**这一段**的增量上成立
+        check("猛发期间每个进入网关的数据报都有着落（收到 = 转发 + 各类丢弃，本段增量）",
+              abs(f_in - (f_fwd + f_drop)) < 0.5,
+              f"in={f_in:.0f} fwd={f_fwd:.0f} drop={f_drop:.0f}")
+        check("客户端收到的都是网关真转发出去的、且没有一份回包重复或串到别人手上",
+              got_n <= f_fwd + 0.5 and len({d for _, d in got_ts}) == got_n and got_n > 0,
+              f"收 {got_n} / 转发 {f_fwd:.0f} / 去重后 {len({d for _, d in got_ts})}")
 
         # ── 8) 会话上限：600 个不同 4 元组的"客户端"（真实场景就是伪造源洪水的形状）
         # 18616 配了 udp_max_sessions 32。没有这个上限时，会话会吃光 worker_connections
