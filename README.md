@@ -166,6 +166,13 @@ libraries such as tokio/hyper, all gateway logic is hand-written.
     regression is **95 scripts with an empty `SKIP` set**, and CI's E2E job is 15 suites in three
     steps, now including `https_matrix` because it is the only suite that can tell "fallback cert
     follows config order" from "follows `default_server`".
+  - Verified on the 1.0.3 release binary: unit **502/502**, full regression **`TOTAL 95 scripts,
+    nonzero=0`**, Linux CI green on unit+clippy and all three E2E steps, and a 21-minute soak —
+    **2,161,682 requests, 0 failures**, private memory 18.71 → 20.02 MiB with a post-warmup slope of
+    **+0.043 MiB/min** against a 1.0 MiB/min gate, and the cold tier churning throughout (79,254
+    spills / 78,520 cold hits / 78,520 promotions) with `corrupt` 0, `never_read` 0,
+    `pending_jobs` 0 and `spill_skipped` 0 (that last counter is new in 1.0.3 — a cold tier that
+    refuses a spill is now visible instead of silent).
 
 - **Release engineering**: CI runs unit tests + clippy + fifteen real-traffic E2E suites in three
   steps (functional contract, business shapes, then the h1/h2/h3 transport-parity suite), with an

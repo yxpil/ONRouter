@@ -1117,6 +1117,25 @@ SAN 必须包含连接用的名字，QUIC 强制校验。
 | RSS | 27.77 MiB → 29.20 MiB |
 | 冷层账目（结束时） | 落盘 83,363 / 冷命中 82,632 / 提升 82,632；`corrupt` 0、`never_read` 0、`pending_jobs` 0 |
 
+1.0.3 的这一轮（同一口径、同一份 `conf/soak.conf`，跑在含兜底证书修复与安全升级的最终二进制上；
+报告存档为 `target/soak_report_v103.json` / `target/soak_metrics_end_v103.txt`）：
+
+| 指标 | 数值 |
+|---|---|
+| 结论 | **PASS**（`failures` 为空、`notes` 为空） |
+| 实际时长 / 平均吞吐 | 20.92 min / 1722.2 req/s（24 短连接 + 4 keep-alive worker） |
+| 请求总数 / 失败 / 回源 | 2,161,682 / **0** / 1,644,907 |
+| 私有内存 | 18.71 MiB → 20.02 MiB（+1.31 MiB，峰值 21.15 MiB） |
+| 私有内存斜率 | **+0.043 MiB/min**（阈值 1.0，预热后 192 个样本） |
+| RSS | 27.40 MiB → 28.27 MiB |
+| 冷层账目（结束时） | 落盘 79,254 / 冷命中 78,520 / 提升 78,520 / 索引 256 条 |
+| 冷层异常账目 | `spill_skipped` 0、`corrupt` 0、`cold_error` 0、`evict` 0、`never_read` 0、`pending_jobs` 0、`pending_bytes` 0 |
+
+两点要如实记下来：这一轮的**总涨幅（+1.31 MiB）比 1.0.2 的 +0.49 MiB 大**，但**预热后斜率更低**
+（0.043 vs 0.055 MiB/min）——因为起点私有内存低了约 1.8 MiB，预热期内把缓存填到稳态的那部分
+被算进了总涨幅。判泄漏看斜率不看总量，这条口径在 13.1 上面就写着。`spill_skipped` 这一项是
+1.0.3 才有的可观测性：冷层拒收不再被静默吞掉，所以它在压测里应当、也确实保持为 0。
+
 顺带修掉一个会把冷层账目弄脏的压测器缺陷：`soak_test.py` 过去只清 `logs/soak_cache`，
 而配置里还有 `logs/soak_cold disk=on`——上一轮留下的 256 个冷层文件会在启动扫描时被记成
 `corrupt`，让"异常账目全零"这条证据失真。现在清理目录是从配置里读 `proxy_cache_path` 得到的，
@@ -1144,6 +1163,20 @@ SAN 必须包含连接用的名字，QUIC 强制校验。
 三条一起修（预言机按 SNI 单算、探针显式发 SNI、网关兜底证书跟默认 server），
 20 轮随机拓扑 4122/4122。`https_matrix` 由 71 条涨到 76 条，多出来的正是"`default_server`
 写在最后一个块"那组——只有它能把两种实现分开。
+
+1.0.3 的发布闸门：`python run_regression.py reg_103_gate2.txt` → **`TOTAL 95 scripts,
+nonzero=0`**（Linux CI 在同一批 commit 上两步全绿：unit+clippy 与三步 15 条 E2E）。
+第一次整批跑（`reg_103_gate.txt`）有两条非零，都记下来，因为它们各代表一类要分开对待的红：
+
+- `governor_e2e` 的 `num/size` 那条是**套件在冷层写线程落账之前一次性快照**（读到 15/64）。
+  改成等待最终状态后 32/32；同一轮里 `disk_cache`/`cache_advanced`/`proxy_cache`/`proxy_disk`/
+  `still_online` 全部复跑通过。
+- `game_udp` 的"全速猛发时回包一个不少"是**断言口径越界**：少掉的 2220 个全部由网关按
+  `dropped{role="queue_full"}` 记了账（3000−780=2220 精确吻合），空载复跑是 3000/3000、
+  ≈46,338 pps、丢弃 0。这条已按 13.1 的"判账不判率"改写（见上面的 UDP 记录）。
+- 还有一条不算在套件头上的：`schedule_e2e` 中途整批失败是因为清理探针时用了
+  `taskkill //F //IM onrouter.exe`——按映像名杀进程把**当时正在跑的这套回归的网关**一起杀了。
+  安静复跑 50/50 通过。规则：只杀自己记录的 PID。
 
 ### 13.2 上线前压测建议
 
