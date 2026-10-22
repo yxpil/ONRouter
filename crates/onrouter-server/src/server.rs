@@ -417,12 +417,14 @@ fn spawn_connection(
                     Ok(Ok(pair)) => pair,
                     Ok(Err(e)) => {
                         crate::metrics::get().on_tls_handshake_failure();
-                        log_debug!("TLS 握手失败 {peer}: {e}");
+                        // nginx 对握手失败也是在 error 日志里点名对端：这通常意味着对端
+                        // 只提供了我们不协商的曲线/密码套件，只有失败现场能看出来。
+                        crate::log_warn!("TLS 握手失败 {peer}: {e}");
                         return;
                     }
                     Err(_) => {
                         crate::metrics::get().on_tls_handshake_failure();
-                        log_debug!(
+                        crate::log_warn!(
                             "TLS 握手超时（{:.0?}）{peer}",
                             state.settings.tls_handshake_timeout
                         );
@@ -4696,7 +4698,7 @@ pub async fn serve_quic(
                         Ok(c) => c,
                         Err(e) => {
                             crate::metrics::get().on_tls_handshake_failure();
-                            log_debug!("QUIC 握手失败 {peer}: {e}");
+                            crate::log_warn!("QUIC 握手失败 {peer}: {e}");
                             return;
                         }
                     };

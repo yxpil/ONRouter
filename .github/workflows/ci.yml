@@ -72,7 +72,7 @@ jobs:
         run: |
           mkdir -p conf/logs
           for suite in canary wasm resilience affinity proxy_split proxy_disk \
-                       limit_key expires herd security_matrix https_matrix; do
+                       limit_key expires herd security_matrix https_matrix tls_groups; do
             echo "::group::${suite}_e2e"
             python3 "tools/${suite}_e2e.py"
             echo "::endgroup::"
@@ -101,6 +101,53 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-logs
+          path: conf/logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  pq:
+    name: Post-quantum build (--features pq)
+    runs-on: ubuntu-latest
+    needs: unit
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `pq` 把 aws-lc-sys（C 代码）带进构建：这个作业既是"入向能谈 X25519MLKEM768"的行为验证，
+      # 也是这条 Linux 构建链本身的验证（真实动因：已有 CDN 的回源 hello 只含后量子组，
+      # 默认构建只能拒绝它 —— 见 docs/OPERATIONS.md §5.6）。
+      - name: Build with pq
+        run: cargo build --release -p onrouter-server --features pq --bin onrouter
+
+      - name: -V must declare the extra group
+        run: |
+          out=$(./target/release/onrouter -V)
+          echo "$out"
+          echo "$out" | grep -q '\[pq=on\]' || { echo "::error::-V 没有报告 pq=on"; exit 1; }
+
+      # 同一套断言在两种构建下都必须 16/16：套件自己读 -V 决定"单给 ML-KEM 组"该谈成还是该拒。
+      - name: TLS group contract on the pq build
+        run: |
+          mkdir -p conf/logs
+          python3 tools/tls_groups_e2e.py
+
+      - name: Upload the pq binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: onrouter-pq-linux-x86_64
+          path: target/release/onrouter
+          retention-days: 14
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pq-logs
           path: conf/logs/
           if-no-files-found: ignore
           retention-days: 7

@@ -58,3 +58,4 @@ natb.exe
 /conf/random_scenarios.conf
 /conf/limit_key_t.conf
 /conf/course_sim.conf
+/certs_tlsgroups/

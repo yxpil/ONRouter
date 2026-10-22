@@ -26,6 +26,11 @@ default = []
 # rustls 无法提供的旧协议 TLSv1/TLSv1.1。默认关闭以保持纯 Rust；开启后按需
 # 依赖 native-tls/tokio-native-tls，legacy 监听自动改走原生握手（HTTP/1.1）。
 native-tls = ["dep:native-tls", "dep:tokio-native-tls"]
+# 入向 TLS 追加后量子密钥交换组 X25519MLKEM768（0x11ec）：ring 没有任何 ML-KEM 实现，
+# 而已有 CDN 会发来"只含后量子组"的 ClientHello（口径见 docs/OPERATIONS.md §5.6）。
+# 默认关闭：它把 aws-lc-sys（C 代码，需要 cmake/汇编）带进构建，八个发布目标都要过。
+# 只借 aws-lc 的这一个 KX 组，cipher/签名/随机源仍然全部是 ring。
+pq = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
 
 [dependencies]
 onrouter-config = { path = "../onrouter-config" }

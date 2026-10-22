@@ -125,6 +125,21 @@ fn parse_args() -> Result<Args, String> {
             "-t" | "--test" => test = true,
             "-V" | "--version" => {
                 println!("ONRouter/{} (Rust, OpenResty-compatible)", VERSION);
+                // 编译期决定能不能谈某些 TLS 参数，所以 -V 必须把它们说出来：
+                // 运维拿到"CDN 报握手失败"时，第一件要确认的就是这份二进制带没带 pq。
+                println!(
+                    "  crypto: rustls/ring{}{}",
+                    if cfg!(feature = "pq") {
+                        ", X25519MLKEM768(aws-lc) [pq=on]"
+                    } else {
+                        " [pq=off]"
+                    },
+                    if cfg!(feature = "native-tls") {
+                        ", native-tls(legacy TLSv1/1.1)"
+                    } else {
+                        ""
+                    }
+                );
                 std::process::exit(0);
             }
             "-h" | "--help" => {

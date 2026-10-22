@@ -217,7 +217,15 @@ impl RustlsAcceptor {
             },
             None => Arc::clone(&self.base),
         };
-        let s = start.into_stream(cfg).await?;
+        // 失败原因里带上 SNI：调用点只看得见对端地址，而出问题的往往是"这个名字的证书/参数"
+        let s = start.into_stream(cfg).await.map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                match sni {
+                    Some(ref n) => format!("{e}（SNI {n}）").into(),
+                    None => e.to_string().into(),
+                }
+            },
+        )?;
         let h2 = alpn_is_h2(&s);
         Ok((ServerStream::Rustls(s), h2))
     }

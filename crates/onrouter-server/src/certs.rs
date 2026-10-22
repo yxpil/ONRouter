@@ -341,6 +341,28 @@ pub fn build_server_config(opts: &TlsOptions) -> Result<ServerConfig, String> {
     build_server_config_with(opts, resolver)
 }
 
+/// 入向 TLS 用哪套密钥交换组。默认（不开 `pq`）就是 rustls 的 ring provider：
+/// `{X25519, P-256, P-384}`，与 1.0.3 及以前的行为逐字节一致。
+///
+/// 开 `pq` 后在 ring 的集合上**追加** `X25519MLKEM768`（`0x11ec`）：ring 里没有任何 ML-KEM
+/// 实现，而真实世界里已经有 CDN 发来"只含后量子组"的 ClientHello（抓包证据与运维口径见
+/// `docs/OPERATIONS.md` §5.6）。这里刻意只加一条组、不换 cipher/signer/随机源：
+/// 其余仍然全部由 ring 提供，aws-lc 只贡献这一个 KX 实现。
+fn kx_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    #[cfg(feature = "pq")]
+    {
+        let mut p = rustls::crypto::ring::default_provider();
+        p.kx_groups = {
+            let mut g = p.kx_groups.clone();
+            g.push(rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768);
+            g
+        };
+        Arc::new(p)
+    }
+    #[cfg(not(feature = "pq"))]
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
 /// 用给定证书解析器装配其余 TLS 参数（协议集、ALPN、会话恢复）。
 pub fn build_server_config_with(
     opts: &TlsOptions,
@@ -355,7 +377,9 @@ pub fn build_server_config_with(
                 .to_string(),
         );
     }
-    let mut config = ServerConfig::builder_with_protocol_versions(&versions)
+    let mut config = ServerConfig::builder_with_provider(Arc::clone(&kx_provider()))
+        .with_protocol_versions(&versions)
+        .map_err(|e| format!("TLS 参数组合不被当前 provider 支持: {e}"))?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     config.alpn_protocols = if opts.http2 {
