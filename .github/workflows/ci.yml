@@ -121,14 +121,29 @@ jobs:
       # `pq` 把 aws-lc-sys（C 代码）带进构建：这个作业既是"入向能谈 X25519MLKEM768"的行为验证，
       # 也是这条 Linux 构建链本身的验证（真实动因：已有 CDN 的回源 hello 只含后量子组，
       # 默认构建只能拒绝它 —— 见 docs/OPERATIONS.md §5.6）。
-      - name: Build with pq
-        run: cargo build --release -p onrouter-server --features pq --bin onrouter
+      #
+      # 构建发生在 debian:bookworm 容器里，不是 runner 主机上。原因实测过：在 ubuntu-24.04
+      # （glibc 2.39）上直接编译 aws-lc 的 C 代码，产物会引用 `GLIBC_2.38` 符号，落到
+      # Debian 12（glibc 2.36）这台生产机上直接起不来；同一份默认构建的产物只要求 2.34。
+      # 用发布目标系统的 glibc 编译，产物才能既在 CI 主机上跑、也在老发行版上跑。
+      - name: Build with pq (inside debian:bookworm, glibc 2.36)
+        run: |
+          docker run --rm -v "$PWD":/work -w /work debian:bookworm bash -euo pipefail -c '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends curl ca-certificates build-essential cmake pkg-config perl python3 openssl
+            curl --proto "=https" -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            export PATH="$HOME/.cargo/bin:$PATH"
+            cargo build --release -p onrouter-server --features pq --bin onrouter
+            ./target/release/onrouter -V
+            chown -R "$(id -u):$(id -g)" target/release
+          '
 
       - name: -V must declare the extra group
         run: |
           out=$(./target/release/onrouter -V)
           echo "$out"
           echo "$out" | grep -q '\[pq=on\]' || { echo "::error::-V 没有报告 pq=on"; exit 1; }
+          echo "产物要求的最高 glibc：$(readelf -V ./target/release/onrouter | grep -oE "GLIBC_2\.[0-9]+" | sort -uV | tail -1)"
 
       # 同一套断言在两种构建下都必须 16/16：套件自己读 -V 决定"单给 ML-KEM 组"该谈成还是该拒。
       - name: TLS group contract on the pq build
