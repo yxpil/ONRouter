@@ -174,8 +174,9 @@ libraries such as tokio/hyper, all gateway logic is hand-written.
     `pending_jobs` 0 and `spill_skipped` 0 (that last counter is new in 1.0.3 — a cold tier that
     refuses a spill is now visible instead of silent).
 
-- **Release engineering**: CI runs unit tests + clippy + fifteen real-traffic E2E suites in three
-  steps (functional contract, business shapes, then the h1/h2/h3 transport-parity suite), with an
+- **Release engineering**: CI runs unit tests + clippy + sixteen real-traffic E2E suites in three
+  steps (functional contract — `tls_groups` joined it, since a refused handshake is a production
+  shape no other suite covers — business shapes, then the h1/h2/h3 transport-parity suite), with an
   optional `workflow_dispatch` 21-minute soak that checks private-memory growth. The 1.0 docs are
   [OPERATIONS.md](docs/OPERATIONS.md) (run it in production) and
   [TUTORIAL.md](docs/TUTORIAL.md) (build it feature by feature).

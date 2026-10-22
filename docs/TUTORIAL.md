@@ -320,6 +320,17 @@ server {
 h2 与 h3 都逐条比"出示的证书指纹"和"`:authority` 选出的站点"，包括 `SNI=a` 而 `authority=b` 这种
 分开打法（58 项）。h3 侧用 `ORRH3_AUTHORITY` 覆写 authority、Node 侧用 `servername` 覆写 SNI，
 两个探针都输出 `PEER_SHA256`，所以"证书按 SNI"这句话在三种传输上都是量出来的，不是推出来的。
+
+**"选哪张证书"之外还有一件事：这条 TLS 连接能不能建成。** 网关入向协商的密钥交换曲线就是
+rustls provider 提供的那三条：X25519、`secp256r1`、`secp384r1`。只给 `secp521r1`（P-521）或只给
+后量子 `X25519MLKEM768` 的客户端会被干净地拒绝（`alert handshake_failure`，不是挂住），而
+"不支持 + 支持"混在一起时必须落到支持的那条上。这件事在挂 CDN 的部署里会以最坏的方式露出来：
+CDN 报 **525 握手失败**，源站 access_log 一片空白，因为失败发生在 HTTP 之前。`tools/tls_groups_e2e.py`
+（16 项）把上面这几种形状逐个钉住，并且要求失败在 **warn** 级日志里点名对端与原因、
+计入 `onrouter_tls_handshake_failures_total`——v1.0.3 及更早它记在 debug，生产阈值下等于没写。
+`ssl_ciphers`/`ssl_prefer_server_ciphers` 则不生效（TLS 1.2 套件顺序由 rustls 自己定），`-t` 会告警。
+运维侧的排查与处理见 [OPERATIONS.md](OPERATIONS.md) 第 5.6 节。
+
 更多运维口径见 [OPERATIONS.md](OPERATIONS.md) 第 5.5 节。
 
 ---
@@ -946,8 +957,12 @@ python tools/security_matrix_e2e.py    # 攻击面矩阵：49 项，含 -t 应�
 python tools/https_matrix_e2e.py         # 76 项：一个 TLS 端口多个域名。证书按 SNI、站点按 Host，
                                          # 两本账分别验；18449 那组把 default_server 写在最后一个块，
                                          # 只有它能分辨"兜底证书跟配置顺序"与"跟默认 server"
-python tools/quic_business_e2e.py        # 41 项：同一站点分别 over h1.1-TLS / h2-TLS / h3，
-                                         # body、缓存、限流桶、状态码逐项对齐
+python tools/tls_groups_e2e.py           # 16 项：这条 TLS 连接建不建得成。支持的曲线逐条谈成、
+                                         # "支持+不支持"混合列表必须回退，只给 P-521 或只给后量子曲线
+                                         # 必须以 alert 干净拒绝，且失败要在 warn 日志与计数器上留痕
+python tools/quic_business_e2e.py        # 58 项：同一站点分别 over h1.1-TLS / h2-TLS / h3，
+                                         # body、缓存、限流桶、状态码逐项对齐；18156 那一组还是一个
+                                         # TCP+UDP 端口号上挂三张证书，h2 与 h3 逐条比指纹
 python tools/random_scenarios_e2e.py --iters 20
                                          # 每轮现掷一份配置（端口聚合、别名、正则、server 级 rewrite、
                                          # L4 SNI），20 轮 4122 项；专治"只有某种拓扑才有的红"
@@ -1000,10 +1015,12 @@ target/soak_metrics_end.txt
 `.github/workflows/ci.yml` 在 push / PR 到 `master`/`main` 时运行：
 
 - `unit`：`cargo test --workspace` + clippy；
-- `e2e`：release 构建后分三步跑 **15 条**套件——功能契约 11 条（canary、wasm、resilience、affinity、
-  proxy_split、proxy_disk、limit_key、expires、herd、security_matrix、https_matrix），
+- `e2e`：release 构建后分三步跑 **16 条**套件——功能契约 12 条（canary、wasm、resilience、affinity、
+  proxy_split、proxy_disk、limit_key、expires、herd、security_matrix、https_matrix、tls_groups），
   业务形状 3 条（course_selection、production_shape、game_udp），
   跨传输 1 条（先 `cargo build --bin orr-h3check`，再 quic_business）。
+  挑进功能契约的那条 `tls_groups` 管的不是"某个指令"，而是一条连接能不能建成：它对端只给一条
+  曲线时要么谈成要么干净拒绝，还要在 warn 日志里留下现场——CDN 报 525 时唯一能看的就这一行。
   这一步是刻意挑的而不是"全跑"：全量回归在本地按发布闸门跑（§11.2），CI 负责每次 push 都过一遍
   最容易因平台差异而退化的部分。失败时上传 `conf/logs/`；
 - `soak`：仅 `workflow_dispatch` 且输入分钟数非 0 时运行（建议填 21），报告作为 artifact 上传。

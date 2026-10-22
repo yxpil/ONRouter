@@ -167,6 +167,30 @@ The remaining gaps are concentrated in four areas:
   the catch-all block at a random position; 20 rounds 4122/4122).
 - TLS 1.2/1.3 via rustls; legacy TLS 1.0/1.1 via the optional `native-tls`
   platform backend.
+- **Inbound key-exchange groups are {X25519, secp256r1, secp384r1}** in the default build — that is
+  rustls' `ring` provider `ALL_KX_GROUPS`, and it is not a config knob. `--features pq` appends
+  rustls' `aws_lc_rs::kx_group::X25519MLKEM768` (cipher/signer/RNG stay ring, and the new group is
+  ordered last, so any client offering X25519 is unaffected); `onrouter -V` prints which surface a
+  binary has (`[pq=off]` / `[pq=on]`), and release artifacts stay `[pq=off]` until enabling aws-lc's
+  C build for every target is decided. No rustls provider — ring *or* aws-lc — ships a **P-521** key
+  exchange, so a client offering only that can never be served. Either way a client offering a group
+  we lack is refused cleanly (`peer is incompatible: NoKxGroupsInCommon` → `handshake_failure`
+  alert, never a half-open connection), while a client offering it **alongside** a supported group
+  must fall back to the supported one — that mixed shape is what separates "ignores unknown groups"
+  from "rejects the whole ClientHello". Real-world consequence, measured rather than inferred: a
+  Cloudflare zone whose origin fetch offered **only post-quantum codepoints** (`0x11ec` =
+  X25519MLKEM768 plus two experimental ones, no classic curve at all) gets 525 from the default
+  build and negotiates TLS 1.3 on a `pq` build; the same edge's other eight zones include `x25519`
+  and work either way. Runbook, including the AF_PACKET ClientHello capture that proved it on a box
+  with no tcpdump (`tools/tls_hello_tap.py`), is `docs/OPERATIONS.md` §5.6.
+  `ssl_ciphers` / `ssl_prefer_server_ciphers` are reported as ignored directives: TLS 1.2 suite
+  order is rustls' own. Evidence: `tools/tls_groups_e2e.py` 16/16 **on both builds** — it reads
+  `-V` to decide whether a single-group `X25519MLKEM768` hello must be refused or must succeed,
+  checks per-group negotiation and both mixed-list fall-backs, requires P-521 to be refused as an
+  alert rather than a timeout under any provider, and tracks
+  `onrouter_tls_handshake_failures_total` plus the warn-level log line (with the peer) against the
+  actual refusal count — mutation check: putting the log back at `debug` turns those three
+  assertions red (13/16) while the behavioural ones stay green.
 - **TLS sessions**: process-wide `ssl_session_cache` (`off` / `builtin[:n]` /
   `shared:name:size`, approximate LRU) plus a stateless ticketer, shared by every
   listener and SNI config; `ssl_session_tickets on|off`. Cross-port resumption

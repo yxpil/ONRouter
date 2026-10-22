@@ -213,6 +213,20 @@ five-minute check rather than a question.
   drive-by during a release: the upgrade is an API migration in `wasm.rs` and must come with its own
   evidence pass. Until then, "we are not affected by the Cranelift advisories" is a statement about
   *architecture* (interpreter, no codegen), not about being current.
+- **Inbound TLS post-quantum support is opt-in at build time; P-521 does not exist.** The default
+  build negotiates rustls' `ring` set — X25519, `secp256r1`, `secp384r1`. `--features pq` appends
+  `X25519MLKEM768` from aws-lc (ring keeps cipher suites, signing and the RNG; the extra group is
+  ordered last so clients offering X25519 are unaffected), and `onrouter -V` states which surface a
+  binary has. Two consequences are recorded rather than hidden. First, a client whose ClientHello
+  contains only groups we do not implement is refused outright — the captured real case was a
+  Cloudflare zone whose origin fetch offered **only** `0x11ec` (X25519MLKEM768) plus two experimental
+  codepoints, which surfaces as **525** at the CDN while every direct probe to the origin succeeds
+  (runbook `docs/OPERATIONS.md` §5.6, capture tool `tools/tls_hello_tap.py`); a `pq` build serves it,
+  a default build does not, and **whether any release target should default to `pq` is still the
+  user's call** — aws-lc-sys is C code (cmake/assembly) and the exotic targets are unverified.
+  Second, P-521 key exchange exists in neither rustls provider, so refusing it is the intended,
+  documented behaviour rather than something to "fix". Visitors also do not get hybrid post-quantum
+  key agreement on the client→gateway leg in default builds — that is the same decision, stated.
 - **`cargo audit` is a release-gate command, not a per-push CI step.** A transitive `unsound`/
   `unmaintained` advisory should not silently block shipping a production fix, but it must be triaged
   into this file before the tag (§16 of OPERATIONS.md).

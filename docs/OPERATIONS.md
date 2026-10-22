@@ -463,6 +463,89 @@ server {
 
 ---
 
+### 5.6 TLS 握手的可谈集合：版本、ALPN、曲线与套件顺序
+
+一条 TLS 连接能不能建成，看的是客户端 ClientHello 与网关两边集合有没有交集：
+
+| 维度 | 网关这边的取值 | 由什么决定 |
+|---|---|---|
+| 协议版本 | TLS 1.2 / 1.3，按 `ssl_protocols` 裁剪；要 TLS 1.0/1.1 得 `native-tls` 编译选项 | rustls |
+| ALPN | `http/1.1` 恒有，`h2` 取决于写了 `http2 on;` | rustls |
+| 密钥交换曲线 | **X25519、secp256r1(P-256)、secp384r1(P-384)**；`--features pq` 再追加 X25519MLKEM768 | rustls 的 crypto provider（`onrouter -V` 会报当前构建是哪一种） |
+| TLS 1.2 套件顺序 | 网关内置顺序；`ssl_ciphers` / `ssl_prefer_server_ciphers` 是**未知指令（已忽略）** | rustls |
+
+曲线那一行改配置改不掉，它由 crypto provider 决定：rustls 的 **ring** provider 的
+`ALL_KX_GROUPS` 就三条（X25519 / P-256 / P-384），**没有 P-521，也没有任何 ML-KEM 混合曲线**；
+`aws-lc-rs` provider 有 `X25519MLKEM768` 等后量子组，但同样没有 P-521。客户端"只给我们没有的
+组"时只能拒绝——`peer is incompatible: NoKxGroupsInCommon`，落到线上是一条干净的
+`alert handshake_failure`（不挂半条连接）。
+
+这条边界在真实部署里长这样：域名挂在 CDN 后面，CDN 报 **525 SSL handshake failed**，而源站
+access_log 和 error_log 在 warn 阈值下**一行都没有**——握手失败发生在 HTTP 之前，本来就不会
+进访问日志。
+
+**别猜，把对端的 ClientHello 抓下来看。** 握手失败的成因全在客户端提供的曲线列表里，而这台机器
+上没有 tcpdump/strace：`tools/tls_hello_tap.py <网卡> <秒>` 用 AF_PACKET 原始套接字镜像 :443 的
+入向报文、按 seq 重组、解出 `supported_groups`（ClientHello 是明文）。只镜像不劫持——不占端口、
+不改路由、不动网关、不装任何包。同一次抓取里，八个正常站点与那个坏站点的差别一目了然：
+
+```
+sni=yxpil.com   groups=[x25519, secp256r1, secp384r1, secp521r1, 0x11ec, 0x6399, 0xfe32]  → 200
+sni=cidaiji.com groups=[0x11ec, 0x6399, 0xfe32]                                            → 525
+```
+
+`0x11ec` 是 **X25519MLKEM768**（rustls `NamedGroup::X25519MLKEM768 => 0x11ec`），另两个是实验
+codepoint。也就是说那个 zone 的回源 hello **一条经典曲线都没给**：rustls 的 ring provider 只有
+`{x25519, P-256, P-384}`（`ALL_KX_GROUPS` 就这三条，ring 里根本没有 ML-KEM 实现），交集为空 →
+`NoKxGroupsInCommon` → 干净的一条 `alert handshake_failure`。注意这条 hello 里**也没有 P-521**，
+所以它不是"换了网关才坏"：任何 OpenSSL 3.0 的入口同样谈不成它，只是 CDN 会复用已有的回源连接，
+于是旧入口在连接被重建之前看起来还是好的。
+
+现在这类失败留下现场了：
+
+```
+2026/10/22 14:48:52 [warn] TLS 握手失败 127.0.0.1:48968: peer is incompatible: NoKxGroupsInCommon
+onrouter_tls_handshake_failures_total 2
+```
+
+- 级别是 `warn`（v1.0.3 及更早记在 `debug`，生产阈值等于不写）。配了 `ssl_certificate_by_lua`
+  的监听还会带上 SNI，因为那条路径在 ClientHello 之后才决定用哪张证书。
+- 计数在 `onrouter_tls_handshake_failures_total`（含超时，`tls_handshake_timeout` 到点也记一次）。
+- 排查顺序：先 `-groups <曲线>` 单曲线探一遍 → 再翻 warn 日志里对端报上来的原因 → 最后才怀疑
+  证书。"CDN 报证书与域名不符"走的是另一条路，看 §5.5。
+
+能怎么办，按代价排：
+
+1. **让回源端把经典曲线放回 hello（CDN 侧一行设置，立刻恢复）**：同一个 CDN、同一个源站 IP，
+   八个站点的 hello 里有 `x25519`，坏的那个只有后量子 codepoint——差异只可能在 zone 设置里。
+   拿坏 zone 与好 zone 的 SSL/TLS 页逐项对比（量子安全/后量子回源、Cipher Suites、最小 TLS 版本），
+   把它改回和正常 zone 一致即可。源站不需要动。
+2. **让网关能谈后量子（根治，已实现为编译选项）**：`X25519MLKEM768` 在 rustls 里由
+   **aws-lc-rs** provider 提供（`ALL_KX_GROUPS` 含它），ring 没有。`cargo build --features pq`
+   在 ring 的集合上**追加**这一条组（其余 cipher/签名/随机源仍是 ring，且它排在最后，
+   所以只要客户端给了 X25519 就仍按 X25519 谈——对现有站点零行为变化），
+   `onrouter -V` 会把这件事说出来：`crypto: rustls/ring, X25519MLKEM768(aws-lc) [pq=on]`。
+   代价是构建链引入 C 依赖 aws-lc-sys（需要 cmake/汇编；Windows MSVC 与 Linux 实测可编，
+   八个发布目标里 armv7/riscv64 尚未验证），并且"100% in Rust"这条表述要按构建口径改写。
+   因此它**默认关闭**：发布包默认仍是 `[pq=off]`，只服务 {X25519, P-256, P-384}。
+   要不要在某个目标上默认打开，是一个明确的发布策略决定，不是 bug 修复。
+3. **把它当边界写进验收清单**：默认构建的入向曲线集合就是 {X25519, P-256, P-384}。
+   只给 P-521、只给 ML-KEM 混合曲线（默认构建）、或只给实验 codepoint 的客户端一律拒绝——
+   **不要**按"源站前面那个入口以前能谈成"来假设客户端能谈成，CDN 的连接复用会掩盖这一点。
+
+（`--features native-tls` 不是本例的解法：它只在 `ssl_protocols` 显式允许 TLS 1.0/1.1 时接管该
+监听、并固定 HTTP/1.1，而 Debian 12 那类 OpenSSL 3.0 系统栈同样不认识 `0x11ec`。）
+
+验证：`tools/tls_groups_e2e.py` 16/16，两种构建各跑一遍。它先读 `onrouter -V` 决定期望值：
+三条支持的曲线逐条谈成；`P-384:P-521`、`P-521:X25519` 这类混合列表必须**回退到支持的那条**
+而不是整条拒绝；P-521 单一曲线在**任何** provider 下都必须以 `handshake_failure` 干净拒绝；
+X25519MLKEM768 单一曲线在 `[pq=off]` 下必须被拒、在 `[pq=on]` 下必须谈成 TLS1.3；失败计数与
+warn 日志行数跟着实际被拒的次数走（默认构建 +2，pq 构建 +1）；失败握手之后同一监听照常应答。
+把 `warn` 临时降回 `debug` 重新编译，日志那三条断言立刻红（13/16）而行为断言全绿——
+这条套件钉的是可见性，不是运气。抓 CDN 真实 hello 的工具是 `tools/tls_hello_tap.py`。
+
+---
+
 ## 6. CPU 亲和性
 
 ### 6.1 配置
@@ -980,7 +1063,7 @@ scrape_configs:
 | `onrouter_upstream_*` | 节点可选性（`server_available`）、主动检查、失败、懒探测、熔断 |
 | `onrouter_proxy_split_*` | 灰度落点与改投账本 |
 | `onrouter_wasm_*` | 插件调用、失败、fuel 耗尽、拒绝 |
-| `onrouter_tls_handshake_failures_total` | TLS 握手失败 |
+| `onrouter_tls_handshake_failures_total` | TLS/QUIC 握手失败（含超时）。它只说"有几条连接没建成"，对端与原因在 **warn** 级 error_log 里，见 5.6 |
 | `onrouter_limit_rejections_total` | 限流/限连拒绝 |
 | `onrouter_access_log_dropped_total` | 日志丢弃（磁盘告警） |
 | `onrouter_still_online_*` | 副本区条目/字节/待恢复任务 |
@@ -1213,6 +1296,7 @@ nonzero=0`**（Linux CI 在同一批 commit 上两步全绿：unit+clippy 与三
 | 502 | `onrouter_upstream_requests_total{result="failure"}` | 后端连不上、响应非法、或所有节点都在摘除期；看 `healthy` 与熔断状态 |
 | 504 | `proxy_read_timeout`/后端日志 | 后端慢；不要用增大超时掩盖容量问题。口径见 7.1：**等满超时才是 504**，同一现象返回 502 说明卡在连接层而不是慢 |
 | 浏览器报"证书与域名不符" | `-t` 输出的 `TLS -> […(default)]`、各块的 `ssl_certificate` | 见 5.5：SNI 匹配不上时出示的是该地址**默认 server** 的证书。要么给这个域名补一个带自己证书的站点，要么让 `default_server` 那个块配上通配/兜底证书 |
+| CDN 报 525/握手失败，源站日志空白 | `onrouter_tls_handshake_failures_total`、warn 级 `TLS 握手失败 …` | 握手失败不进 access_log，v1.0.3 及更早也只记 debug。按 5.6 抓一份入向 ClientHello 看它的 `supported_groups`：实测过一例是 CDN 该 zone 的回源 hello **只含后量子 codepoint**（`0x11ec` 等），一条经典曲线都没给，而 ring provider 只有 {X25519, P-256, P-384}。改回源端设置（与正常 zone 逐项对比）或换支持 ML-KEM 的 provider |
 | 灰度不生效 | `proxy_split_targets_total`、`$proxy_split` 头 | 条件顺序、cookie 名、percent、default |
 | 灰度整池挂掉仍 502 | `proxy_split_failover` | 默认 on 会改投；写 off 的实验本来就不串台 |
 | 缓存一直 MISS | 上游 `Cache-Control`/`Set-Cookie`、方法、key | 见第 9.1 节排查顺序 |
@@ -1252,6 +1336,15 @@ tail -n 200 conf/logs/error.log
 阶段失败并点名，而不是线上 500 或静默放行。升级时用新二进制对**旧配置**跑一次 `-t`，
 逐条读告警，就是这一版的全部迁移成本。
 
+**手改一份现成配置时，告警不是全部风险——值也会被改错。** 把多站点的 nginx 配置合并成一份时，
+真正难查的不是被忽略的指令（那些有告警），而是"看起来抄过去了、值却是隔壁站点的"这种：
+一次真实的接管里就出过两条，五个站点被写成 `client_max_body_size 50m`（原来是 100m，
+上传 50~100 MB 直接 413）与 `proxy_cache_valid 200 50d`（原来是 30m，命中后内容能挂五十天）。
+两条都不报错、不告警，`-t` 全绿，响应码全对——只有按站点逐条比才对得出来。做法：把旧配置
+按 `server_name` 拆开、新配置也按 `server_name` 拆开，逐指令取集合做差（旧有新无＝丢了，
+同名不同值＝改错了），一次脚本就能列全；然后**在新配置上重放旧配置的每个真实请求**，
+比对状态码、`Content-Type`、`X-Cache-Status` 与证书指纹。这两步都过了，才叫接管完成。
+
 ### 16.2 发布前检查表
 
 - [ ] `cargo audit`（发布闸门之一，不进每次 push 的 CI：一条无关的传递性 unmaintained 公告不该
@@ -1262,10 +1355,10 @@ tail -n 200 conf/logs/error.log
 - [ ] 全量回归 `python run_regression.py <本次发布名>.txt` 记录零非零退出（`run_regression.py`
       顶部的 `SKIP` 集是**唯一**允许"不参与"的地方，往里加一条必须同时写清为什么它的红绿
       不构成证据；当前 `SKIP` 为空）；
-- [ ] CI 的三个 E2E 步骤在 Linux 上全绿：功能契约（11 条：canary、wasm、resilience、affinity、
-      proxy_split、proxy_disk、limit_key、expires、herd、security_matrix、https_matrix）、业务形状
+- [ ] CI 的三个 E2E 步骤在 Linux 上全绿：功能契约（12 条：canary、wasm、resilience、affinity、
+      proxy_split、proxy_disk、limit_key、expires、herd、security_matrix、https_matrix、tls_groups）、业务形状
       （选课/静态站+WASM+Lua/游戏 UDP 共 3 条）、跨传输一致性（`orr-h3check` 探针 + `quic_business` 1 条），
-      共 15 条；
+      共 16 条；
 - [ ] 21 分钟 soak 通过，私有内存预热后走平；
 - [ ] 发布包内二进制的 `-V` 与 `Cargo.toml` 版本一致；
 - [ ] 用发布包里的二进制跑 `-t` 与一次真实请求；
