@@ -1,6 +1,6 @@
 # ONRouter 1.0 操作手册
 
-适用版本：**1.0.3**（2026-10-22）
+适用版本：**1.0.4**（2026-10-22）
 面向：部署、值守、容量规划与故障排查。
 配套文档：[使用教程](TUTORIAL.md)、[完整功能矩阵与 Lua API](../README.md)、[能力矩阵与证据](CAPABILITY_MATRIX.md)。
 
@@ -49,22 +49,22 @@ target 为 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、
 | `certs/` | 打包时由 `orr-gencert` 现生成的自签名证书对，供 `conf/onrouter.conf` 的 8443 TLS 演示直接使用 |
 | `docs/`、`README.md` | 操作手册、使用教程与项目说明 |
 
-两种包的压缩结构都是"内容在压缩包根"，**没有** `onrouter-v1.0.3-…/` 这样的外层目录，
+两种包的压缩结构都是"内容在压缩包根"，**没有** `onrouter-v1.0.4-…/` 这样的外层目录，
 所以解压时先自己建目录，别指望 `cd` 进一个包里不存在的名字：
 
 ```bash
 # A 类（GitHub 资产）：Linux / macOS
-mkdir -p /usr/local/onrouter && tar xzf onrouter-v1.0.3-x86_64-unknown-linux-gnu.tar.gz -C /usr/local/onrouter
+mkdir -p /usr/local/onrouter && tar xzf onrouter-v1.0.4-x86_64-unknown-linux-gnu.tar.gz -C /usr/local/onrouter
 install -m 0755 /usr/local/onrouter/onrouter /usr/local/onrouter/orr-gencert /usr/local/bin/
 onrouter -V
 
 # A 类：Windows PowerShell
 New-Item -ItemType Directory -Force C:\onrouter | Out-Null
-Expand-Archive onrouter-v1.0.3-x86_64-pc-windows-msvc.zip -DestinationPath C:\onrouter
+Expand-Archive onrouter-v1.0.4-x86_64-pc-windows-msvc.zip -DestinationPath C:\onrouter
 C:\onrouter\onrouter.exe -V
 
 # B 类（完整目录包）：解开就是推荐布局，conf/ 与可执行文件同级，直接能跑
-mkdir -p orr && tar xzf onrouter-v1.0.3-x86_64-unknown-linux-gnu.tar.gz -C orr
+mkdir -p orr && tar xzf onrouter-v1.0.4-x86_64-unknown-linux-gnu.tar.gz -C orr
 cd orr && ./onrouter -t -c conf/onrouter.conf
 ```
 
@@ -1296,7 +1296,7 @@ nonzero=0`**（Linux CI 在同一批 commit 上两步全绿：unit+clippy 与三
 | 502 | `onrouter_upstream_requests_total{result="failure"}` | 后端连不上、响应非法、或所有节点都在摘除期；看 `healthy` 与熔断状态 |
 | 504 | `proxy_read_timeout`/后端日志 | 后端慢；不要用增大超时掩盖容量问题。口径见 7.1：**等满超时才是 504**，同一现象返回 502 说明卡在连接层而不是慢 |
 | 浏览器报"证书与域名不符" | `-t` 输出的 `TLS -> […(default)]`、各块的 `ssl_certificate` | 见 5.5：SNI 匹配不上时出示的是该地址**默认 server** 的证书。要么给这个域名补一个带自己证书的站点，要么让 `default_server` 那个块配上通配/兜底证书 |
-| CDN 报 525/握手失败，源站日志空白 | `onrouter_tls_handshake_failures_total`、warn 级 `TLS 握手失败 …` | 握手失败不进 access_log，v1.0.3 及更早也只记 debug。按 5.6 抓一份入向 ClientHello 看它的 `supported_groups`：实测过一例是 CDN 该 zone 的回源 hello **只含后量子 codepoint**（`0x11ec` 等），一条经典曲线都没给，而 ring provider 只有 {X25519, P-256, P-384}。改回源端设置（与正常 zone 逐项对比）或换支持 ML-KEM 的 provider |
+| CDN 报 525/握手失败，源站日志空白 | `onrouter_tls_handshake_failures_total`、warn 级 `TLS 握手失败 …` | 握手失败不进 access_log，v1.0.3 及更早也只记 debug。按 5.6 抓一份入向 ClientHello 看它的 `supported_groups`：实测过一例是 CDN 该 zone 的回源 hello **只含后量子 codepoint**（`0x11ec` 等），一条经典曲线都没给，而 ring provider 只有 {X25519, P-256, P-384}。改回源端设置（与正常 zone 逐项对比），或用 `--features pq` 构建的二进制（`-V` 报 `[pq=on]`）直接谈那条后量子组 |
 | 灰度不生效 | `proxy_split_targets_total`、`$proxy_split` 头 | 条件顺序、cookie 名、percent、default |
 | 灰度整池挂掉仍 502 | `proxy_split_failover` | 默认 on 会改投；写 off 的实验本来就不串台 |
 | 缓存一直 MISS | 上游 `Cache-Control`/`Set-Cookie`、方法、key | 见第 9.1 节排查顺序 |
@@ -1368,7 +1368,7 @@ tail -n 200 conf/logs/error.log
 ### 16.3 打包
 
 ```powershell
-# Windows：生成 target\dist\archives\onrouter-v1.0.3-x86_64-pc-windows-msvc.zip
+# Windows：生成 target\dist\archives\onrouter-v1.0.4-x86_64-pc-windows-msvc.zip
 powershell -ExecutionPolicy Bypass -File .\build-release.ps1 build
 python tools\release_verify.py
 ```
