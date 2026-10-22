@@ -18,6 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CONF = os.path.join(ROOT, "conf", "http2.conf")
 PROBE = os.path.join(HERE, "http2_check.js")
+ACCESS_LOG = os.path.join(ROOT, "logs", "http2_access.log")
 
 H2C_PORT = 18124
 TLS_PORT = 18125
@@ -62,8 +63,23 @@ def split_ver(stdout):
     return stdout, ""
 
 
-def node_probe(url, mode, n=None, timeout=20):
-    """跑 Node http2 探针，返回解析后的键值 dict。"""
+def wait_for_log(path, needle, timeout=5.0):
+    """等 access_log 落盘（写线程是异步的），返回 (命中, 全文)。"""
+    end = time.time() + timeout
+    text = ""
+    while time.time() < end:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except FileNotFoundError:
+            text = ""
+        if needle in text:
+            return True, text
+        time.sleep(0.1)
+    return False, text
+
+
+def node_probe(url, mode, n=None, timeout=20):    """跑 Node http2 探针，返回解析后的键值 dict。"""
     if not NODE:
         raise SystemExit("!! 需要 node（本机 curl 无 HTTP/2 支持）")
     cmd = [NODE, PROBE, url, mode]
@@ -94,6 +110,10 @@ def main():
 
     exe = find_binary()
     os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
+    try:
+        os.remove(ACCESS_LOG)
+    except FileNotFoundError:
+        pass
     logf = open(os.path.join(ROOT, "logs", "http2_out.log"), "wb")
     proc = subprocess.Popen([exe, CONF], cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
     try:
@@ -139,6 +159,13 @@ def main():
             "HTTP/1.1 $request_uri 保持原样",
             rc == 0 and "location: https://dest.local/redir?x=1" in so.lower(),
             f"rc={rc} out={so!r} err={se}",
+        )
+        ok, logtext = wait_for_log(ACCESS_LOG, '"GET /redir?x=1 HTTP/2.0"')
+        check("h2 access log 的 request 是 origin-form", ok, f"log={logtext[-500:]!r}")
+        check(
+            "access log 不含绝对 URI",
+            "GET http://" not in logtext and "GET https://" not in logtext,
+            f"log={logtext[-500:]!r}",
         )
 
         # 3) 同一明文端口 HTTP/1.1 共存（前导未命中回落 h1）

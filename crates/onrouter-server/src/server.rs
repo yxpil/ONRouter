@@ -597,7 +597,7 @@ impl Service<Request<Incoming>> for Gateway {
         let rec = state.access_log.record(
             remote,
             req.method().as_str().to_string(),
-            req.uri().to_string(),
+            request_target(req.uri(), req.version()),
             proto_name(req.version()).to_string(),
             header_of(&req, "referer").unwrap_or_else(|| "-".into()),
             header_of(&req, "user-agent").unwrap_or_else(|| "-".into()),
@@ -4834,7 +4834,7 @@ async fn handle_h3_request(
     let rec = state.access_log.record(
         remote,
         parts.method.as_str().to_string(),
-        parts.uri.to_string(),
+        request_target(&parts.uri, parts.version),
         proto_name(parts.version).to_string(),
         header_str("referer"),
         header_str("user-agent"),
