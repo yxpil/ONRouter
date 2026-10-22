@@ -120,19 +120,52 @@ libraries such as tokio/hyper, all gateway logic is hand-written.
     a 1.0 MiB/min gate, cold-tier accounts clean: `corrupt` 0 / `never_read` 0 / `pending_jobs` 0) as
     recorded in [OPERATIONS.md](docs/OPERATIONS.md) §13.1, and `tools/release_verify.py` 26/26 against the **unpacked** `target/dist/archives/onrouter-v1.0.2-*.zip` (the artifact a user actually downloads, not the build tree's binary). CI's E2E job was widened in 1.0.2 from six suites to fourteen across three steps (functional contract, business shapes, HTTP/3+HTTPS transport parity), and is **fifteen** now: `https_matrix` joined the functional-contract step because it is the only suite that can tell "the fallback certificate follows config order" from "it follows `default_server`".
 
-- **Unreleased since 1.0.2 — the fallback certificate**: on a TLS port carrying several vhosts, an
-  unmatched or absent **SNI** presented whichever `server` block happened to be written *first*,
-  instead of the block marked `default_server` as nginx does. Routing was always right, so nothing
-  looked wrong from the HTTP side — the only symptom is a client that typed a domain this edge
-  doesn't serve getting *someone else's* certificate, and a config reorder silently changing which
-  certificate answers. The fallback now follows `default_server` for both accounts (cert and vhost).
-  Proven by `router::tests::fallback_cert_follows_default_server_not_config_order` and by a new port
-  group in `tools/https_matrix_e2e.py` (76/76): 18443 writes `default_server` **first**, where the two
-  implementations are indistinguishable — which is exactly why this survived every earlier suite — and
-  18449 writes it **last**, the only shape that can tell them apart. Also in this unreleased batch:
-  TLS suites now sign their own fixtures (`tools/selfsigned.py`), guarded readiness probes, and
-  `random_scenarios_e2e` back in the roll with a cert oracle that reads SNI (roll: 95 scripts, `SKIP`
-  empty). This is what the next tag will contain.
+- **1.0.3 — the fallback certificate, six TLS-stack advisories closed, and a cold tier that no longer
+  eats what it was told to demote**:
+  - **The fallback certificate follows `default_server`.** On a TLS port carrying several vhosts, an
+    unmatched or absent **SNI** presented whichever `server` block happened to be written *first*,
+    instead of the block marked `default_server` as nginx does. Routing was always right, so nothing
+    looked wrong from the HTTP side — the symptom is a client that typed a domain this edge doesn't
+    serve getting *someone else's* certificate, and a config reorder silently changing which
+    certificate answers. Fixed for both accounts (static certs and `ssl_certificate_by_lua*` scripts),
+    proven by `router::tests::fallback_cert_follows_default_server_not_config_order` and by a new port
+    group in `tools/https_matrix_e2e.py` (76/76): 18443 writes `default_server` **first**, where the
+    two implementations are indistinguishable — which is exactly why this survived every earlier
+    suite — and 18449 writes it **last**, the only shape that can tell them apart. The framed
+    transports got their own multi-cert port: `tools/quic_business_e2e.py` **18156** hangs three
+    certificates on one TCP+UDP port number and asserts over h2 (Node, `servername` split from
+    `:authority`) and h3 (`orr-h3check` + `ORRH3_AUTHORITY`) that the certificate follows SNI while
+    the vhost follows authority, including the unmatched-SNI case — where reverting the fix does not
+    merely mismatch a fingerprint but fails the handshake outright with
+    `certificate is only valid for DnsName("a.qbiz.test")` (58/58).
+  - **Six vulnerabilities in the TLS stack, all closed.** `cargo audit` against 1.0.2's lockfile found
+    `rustls 0.23.45` × 4 (RUSTSEC-2026-0346/0347/**0348**/0349 — 0348 lets a Brotli-compressed
+    certificate allocate ~1 GiB *before* authentication, i.e. attacker-shaped input at a TLS edge;
+    0349 lets an unauthenticated ServerHello downgrade later connections to classical key exchange),
+    `rustls-webpki 0.103.15` (verification may accept distrusted intermediates) and
+    `webpki-root-certs 1.0.9` (bundled roots trusted distrusted emSign intermediates). All six were
+    patch-level inside the declared range → 0.23.46 / 0.103.16 / 1.0.10; re-audit reports **zero**,
+    and the whole TLS suite family was re-run on the rebuilt binary (`https_matrix` 76/76,
+    `tls_session` 45/45, `tls_protocols` 13/13, `tls_legacy` 12/12, `mtls_upstream` 11/11,
+    `https_backend` 12/12, `protocol_matrix` 37/37, `quic_business` 58/58). What this is *not*: the
+    Cranelift/Wasmtime advisories do not reach ONRouter — `Cargo.lock` has zero `cranelift*` entries
+    and the plugin host is a bytecode interpreter with no code generation, so "compiler miscompiles
+    guest memory ⇒ sandbox escape" has no path here (analysis in `docs/SECURITY_AUDIT.md`).
+  - **A refused cold-tier spill no longer destroys the value.** The cache governor's deep-sleep
+    demotion removed a `lua_shared_dict` value from memory and then ignored `spill()`'s refusal (disk
+    full, pending byte/job caps, writer channel closed) while still counting it as demoted — under
+    cold-tier pressure, "demote" silently meant "delete". It now restores the entry, counts the
+    refusal, and stops the pass to retry later
+    (`shared_dict::tests::governor_demote_pass_keeps_values_the_cold_tier_refuses`).
+  - **Test and CI infrastructure** — all of it previously "green on this host, red in CI": each TLS
+    suite signs its own fixture (`tools/selfsigned.py`) instead of borrowing a neighbour's gitignored
+    directory; suites that write into `logs/` create it; readiness probes survive a gateway that is
+    still binding; the token-refill unit test no longer requires two checks inside one millisecond;
+    and `random_scenarios_e2e` is back in the roll with a cert oracle that derives certificates from
+    SNI (its probe had been sending `127.0.0.1` as the SNI) — 20 random topologies, 4122/4122. The
+    regression is **95 scripts with an empty `SKIP` set**, and CI's E2E job is 15 suites in three
+    steps, now including `https_matrix` because it is the only suite that can tell "fallback cert
+    follows config order" from "follows `default_server`".
 
 - **Release engineering**: CI runs unit tests + clippy + fifteen real-traffic E2E suites in three
   steps (functional contract, business shapes, then the h1/h2/h3 transport-parity suite), with an
@@ -285,7 +318,7 @@ libraries such as tokio/hyper, all gateway logic is hand-written.
 | `proxy_read_timeout` / `_connect_timeout` / `_send_timeout` | per-chunk response idle, connect, and idle-write watchdog (ms precision; `0` disables); `proxy_next_upstream` tokens + `_tries` / `_timeout` | `router.rs`, `proxy.rs`, `proxy_tls.rs` |
 | `location =` / prefix / `~` regex | exact > regex > longest prefix | `router.rs` |
 | `listen <port> ssl` + `ssl_certificate` | rustls TLS (HTTPS endpoints; multiple `listen` directives coexist) | `server.rs` |
-| Multi-certificate SNI vhosts | several `server` blocks share one `listen … ssl` port, each with its own cert; ClientHello `server_name` selects exact > `*.suffix` wildcard > **the address's `default_server`** cert (falling back to config order only when no block declares `default_server`, as nginx does), while request routing still follows `Host`/`:authority` — the two accounts are independent and may intentionally differ (SNI=a ⇒ a's cert, Host=b ⇒ b's vhost). Verified by `tools/https_matrix_e2e.py` 76/76, whose 18449 group writes `default_server` *last* (the only arrangement that distinguishes "follows config order" from "follows the default server"), plus `tools/random_scenarios_e2e.py` which randomises that position every round | `certs.rs`, `router.rs`, `tools/https_matrix_e2e.py` |
+| Multi-certificate SNI vhosts | several `server` blocks share one `listen … ssl` port, each with its own cert; ClientHello `server_name` selects exact > `*.suffix` wildcard > **the address's `default_server`** cert (falling back to config order only when no block declares `default_server`, as nginx does), while request routing still follows `Host`/`:authority` — the two accounts are independent and may intentionally differ (SNI=a ⇒ a's cert, Host=b ⇒ b's vhost). Verified by `tools/https_matrix_e2e.py` 76/76, whose 18449 group writes `default_server` *last* (the only arrangement that distinguishes "follows config order" from "follows the default server"), plus `tools/random_scenarios_e2e.py` which randomises that position every round, and on the framed transports by `tools/quic_business_e2e.py` port 18156 — **three certificates on one TCP+UDP port**, with SNI and `:authority` supplied separately over h2 (Node `servername`) and h3 (`orr-h3check` + `ORRH3_AUTHORITY`), comparing `PEER_SHA256` case by case (58/58; with the fix reverted that port fails the h3 handshake rather than serving the wrong name's cert) | `certs.rs`, `router.rs`, `tools/https_matrix_e2e.py`, `tools/quic_business_e2e.py` |
 | `ssl_protocols TLSv1..TLSv1.3` | explicit enabled-version set (rustls serves the 1.2/1.3 subset by default); `--features native-tls` routes a legacy-needing listener to the OS stack (Windows Schannel) to truly negotiate TLS 1.0/1.1 | `certs.rs`, `tls.rs`, `router.rs` |
 | `ssl_session_cache` / `ssl_session_tickets` | process-wide session resumption shared by every TLS listener (all SNI vhosts and ports): `off` / `builtin[:n]` / `shared:name:size` with approximate LRU eviction, plus rustls `Ticketer` for stateless TLS1.3 tickets (`ssl_session_tickets on/off`, default on). Verified across two ports with `openssl -sess_out/-sess_in` and Python `session_reused` | `certs.rs`, `router.rs`, `tools/tls_session_e2e.py` |
 | `ssl_certificate_by_lua*` | per-SNI handshake script runs before certificate selection: `ngx.ssl.server_name()`, `ngx.ssl.parse_pem_cert` / `parse_pem_priv_key`, `ngx.ssl.set_cert` / `set_priv_key` / `clear_certs`, plus the `certificate` / `priv_key` legacy aliases; dynamic configs cached by cert+key hash. A handshake script error or `ngx.exit(ngx.ERROR)` aborts the handshake; `_file` form supported | `certs.rs`, `tls.rs`, `lua_engine.rs`, `tools/ssl_cert_lua_e2e.py` |

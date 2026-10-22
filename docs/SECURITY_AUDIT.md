@@ -180,6 +180,33 @@ API surface we touch is small (`Engine`/`Store`/`Module`/`Linker`/`Caller`/`Exte
 contained — it just needs its own change with its own evidence pass (`wasm_e2e`, `production_shape`,
 `protocol_matrix`, `api_compat`, then the full roll), not a drive-by during a release.
 
+### `cargo audit` on 2026-10-22: six vulnerabilities, all in the TLS stack, all now patched
+
+Asking about Cranelift turned up the thing that actually applied to us. `cargo audit` reported six
+advisories against `Cargo.lock`, none of them in the WASM stack:
+
+| Crate | Was | Now | Advisory | Why it matters for an edge on 443 |
+|---|---|---|---|---|
+| `rustls` | 0.23.45 | 0.23.46 | RUSTSEC-2026-0346 | `Debug` on client session values leaks TLS secrets (we are a client to https upstreams) |
+| `rustls` | 〃 | 〃 | RUSTSEC-2026-0347 | buffered app data sent to the outer server after an ECH rejection |
+| `rustls` | 〃 | 〃 | RUSTSEC-2026-0348 | **Brotli-compressed certificate can allocate ~1 GiB before authentication** — reachable by a peer presenting a crafted cert, i.e. attacker-shaped input at a TLS edge |
+| `rustls` | 〃 | 〃 | RUSTSEC-2026-0349 | unauthenticated ServerHello can downgrade *later* connections to classical key exchange (resumption path) |
+| `rustls-webpki` | 0.103.15 | 0.103.16 | RUSTSEC-2026-0382 | verification may accept distrusted intermediates (this is what we verify upstream certs with) |
+| `webpki-root-certs` | 1.0.9 | 1.0.10 | RUSTSEC-2026-0383 | bundled roots trusted distrusted emSign intermediates |
+
+All six are patch-level inside the declared semver range, so the fix was three
+`cargo update -p <crate> --precise <ver>` bumps — no `Cargo.toml` change, no API churn. Re-running
+`cargo audit` afterwards reports **0 vulnerabilities**; the two remaining warnings are
+`paste` (RUSTSEC-2024-0436) and `rustls-pemfile` (RUSTSEC-2025-0134), both `unmaintained` rather
+than vulnerable, both accepted knowingly (`rustls-pemfile` is only used to read PEM files named in
+operator config, never to parse peer input).
+
+Evidence that the bump did not change behaviour: `https_matrix` 76/76, `tls_session`,
+`tls_protocols`, `tls_legacy`, `mtls_upstream`, `https_backend`, `protocol_matrix`,
+`quic_business` 58/58 and the full 95-script roll, all on the rebuilt release binary.
+`cargo audit` is now a release-gate step (§16), so the next advisory batch reaches us as a
+five-minute check rather than a question.
+
 ## Residual risk / follow-ups
 
 - **`wasmi 0.31.2 → 2.0.0` is open** (see the section above). Recorded as a follow-up rather than a

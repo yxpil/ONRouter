@@ -1,6 +1,6 @@
 # ONRouter 1.0 操作手册
 
-适用版本：**1.0.2**（2026-10-21）
+适用版本：**1.0.3**（2026-10-22）
 面向：部署、值守、容量规划与故障排查。
 配套文档：[使用教程](TUTORIAL.md)、[完整功能矩阵与 Lua API](../README.md)、[能力矩阵与证据](CAPABILITY_MATRIX.md)。
 
@@ -49,22 +49,22 @@ target 为 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、
 | `certs/` | 打包时由 `orr-gencert` 现生成的自签名证书对，供 `conf/onrouter.conf` 的 8443 TLS 演示直接使用 |
 | `docs/`、`README.md` | 操作手册、使用教程与项目说明 |
 
-两种包的压缩结构都是"内容在压缩包根"，**没有** `onrouter-v1.0.2-…/` 这样的外层目录，
+两种包的压缩结构都是"内容在压缩包根"，**没有** `onrouter-v1.0.3-…/` 这样的外层目录，
 所以解压时先自己建目录，别指望 `cd` 进一个包里不存在的名字：
 
 ```bash
 # A 类（GitHub 资产）：Linux / macOS
-mkdir -p /usr/local/onrouter && tar xzf onrouter-v1.0.2-x86_64-unknown-linux-gnu.tar.gz -C /usr/local/onrouter
+mkdir -p /usr/local/onrouter && tar xzf onrouter-v1.0.3-x86_64-unknown-linux-gnu.tar.gz -C /usr/local/onrouter
 install -m 0755 /usr/local/onrouter/onrouter /usr/local/onrouter/orr-gencert /usr/local/bin/
 onrouter -V
 
 # A 类：Windows PowerShell
 New-Item -ItemType Directory -Force C:\onrouter | Out-Null
-Expand-Archive onrouter-v1.0.2-x86_64-pc-windows-msvc.zip -DestinationPath C:\onrouter
+Expand-Archive onrouter-v1.0.3-x86_64-pc-windows-msvc.zip -DestinationPath C:\onrouter
 C:\onrouter\onrouter.exe -V
 
 # B 类（完整目录包）：解开就是推荐布局，conf/ 与可执行文件同级，直接能跑
-mkdir -p orr && tar xzf onrouter-v1.0.2-x86_64-unknown-linux-gnu.tar.gz -C orr
+mkdir -p orr && tar xzf onrouter-v1.0.3-x86_64-unknown-linux-gnu.tar.gz -C orr
 cd orr && ./onrouter -t -c conf/onrouter.conf
 ```
 
@@ -439,7 +439,7 @@ server {
 | 请求由哪个站点应答 | HTTP 的 `Host`（h1）或 `:authority`（h2/h3） | 同样是 精确 > 通配 > 默认 server |
 
 - 默认 server = 写了 `listen … default_server` 的那个块；**没写**才是配置顺序里的第一个块。
-  这一条是 v1.0.2 **之后**发现的静默不一致（当前已发布的那批二进制还没有它）：兜底证书原先跟着
+  这一条在 1.0.3 修掉（v1.0.2 及更早的发布包仍带着它）：兜底证书原先跟着
   "配置顺序第一个"走，于是 SNI 匹配不上时出示的是"恰好第一个写的 vhost"的证书，而不是
   `default_server` 的证书——两个后果都不体面：带错域名的客户端看到一个与请求域名无关的证书
   （浏览器报名称不匹配），而换一行配置顺序就会换一张证书。站点选择那半边一直是对的，
@@ -453,6 +453,13 @@ server {
   两种实现看不出差别；18449 那组把它写在**最后一个**块——只有这一组能分辨"跟配置顺序"和
   "跟默认 server"，兜底证书那条红就是靠它复现的。`tools/random_scenarios_e2e.py` 每轮随机
   把兜底块放在最前或最后，并让 SNI 与 authority 各取来源，证书指纹逐探针比对。
+- **h2 与 h3 用的是同一本证书账，也都单独验过**：`tools/quic_business_e2e.py` 的 18156 端口在
+  一个 TCP+UDP 端口号上挂三张证书（a / b / catchall，`default_server` 写在最后一个块），
+  h2（Node，SNI 与 `:authority` 分开给）与 h3（`orr-h3check`，`ORRH3_AUTHORITY` 覆写）逐条比
+  指纹与应答字节：具名站各归各、`SNI=a` 而 `authority=b` 时"a 的证书 + b 的站点"、
+  SNI 谁都不匹配时兜底必须是 catchall 那张。把修复临时退回"按配置顺序"再跑一次，h3 那条不是
+  指纹不符而是**握手直接失败**（`certificate is only valid for DnsName("a.qbiz.test")`）——
+  这就是浏览器在真实世界里看到的那种错误。
 
 ---
 
@@ -1010,7 +1017,7 @@ scrape_configs:
 
 ## 13. 性能与稳定性验证
 
-### 13.1 本机压测口径（1.0.2）
+### 13.1 本机压测口径（1.0.3）
 
 仓库内提供：
 
@@ -1130,7 +1137,7 @@ SAN 必须包含连接用的名字，QUIC 强制校验。
 `course_selection`、`flash_sale`、`production_shape`、`quic_business` 这八条业务形状套件；
 那时 `random_scenarios_e2e` 还按旧 §13.1 的理由记在 `SKIP` 里）。
 
-**v1.0.2 之后的一批**（兜底证书跟 `default_server`、TLS 夹具自给）把回归重新数过：
+**1.0.3**（兜底证书跟 `default_server`、rustls/webpki 安全升级、governor 不再静默丢值、TLS 夹具自给）把回归重新数过：
 `random_scenarios_e2e` 回到 roll 里，套件数 **95**。它的 TLS 预言机原先把"证书按 SNI"与
 "站点按 Host/:authority"记成同一件事，而且探针根本没把 SNI 发出去（`HTTPSConnection("127.0.0.1")`
 把 IP 当了 SNI），于是证书指纹成片红——红的是夹具，报出来的却是"网关选错站/发错证书"。
@@ -1235,7 +1242,7 @@ tail -n 200 conf/logs/error.log
 ### 16.3 打包
 
 ```powershell
-# Windows：生成 target\dist\archives\onrouter-v1.0.2-x86_64-pc-windows-msvc.zip
+# Windows：生成 target\dist\archives\onrouter-v1.0.3-x86_64-pc-windows-msvc.zip
 powershell -ExecutionPolicy Bypass -File .\build-release.ps1 build
 python tools\release_verify.py
 ```

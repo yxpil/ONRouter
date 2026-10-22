@@ -56,7 +56,7 @@ target/release/orr-gencert     # Windows: target\release\orr-gencert.exe
 
 ```bash
 target/release/onrouter -V
-# ONRouter/1.0.2 (Rust, OpenResty-compatible)
+# ONRouter/1.0.3 (Rust, OpenResty-compatible)
 ```
 
 教程里的辅助后端和压测脚本需要 Python 3.8+，只用于本机练习，不参与网关进程。
@@ -309,14 +309,18 @@ server {
 - 每个 `ssl` 站点都必须自己写 `ssl_certificate`/`_key`，缺一个 `-t` 就失败（不会静默共用别人的证书）。
 - 通配证书按 `*.example.com` 这类 `server_name` 声明；它只吃恰好一级子域，`example.com` 本身
   要另写一个名字。
-- 已知并修掉的一处（**v1.0.2 之后**，当前已发布的那批二进制还没有它）：SNI 匹配不上时，
+- 1.0.3 修掉的一处（v1.0.2 及更早的发布包仍带着它）：SNI 匹配不上时，
   兜底证书跟的是"配置顺序第一个块"而不是"默认 server"，于是换一行配置顺序就会换一张证书，
   带错域名的客户端会看到一个跟它请求的域名无关的证书。站点选择那半边一直是对的，
   所以从 HTTP 侧看不出任何异常——只能从握手侧发现。现在两边都跟 `default_server`。
 
 可运行的证据是 `tools/https_matrix_e2e.py` 的 18449 那一组（把 `default_server` 故意写在最后）
-和 `tools/random_scenarios_e2e.py`（每轮随机决定兜底块的位置）。更多运维口径见
-[OPERATIONS.md](OPERATIONS.md) 第 5.5 节。
+和 `tools/random_scenarios_e2e.py`（每轮随机决定兜底块的位置）。
+**分帧协议也各自验过**：`tools/quic_business_e2e.py` 的 18156 在一个 TCP+UDP 端口号上挂三张证书，
+h2 与 h3 都逐条比"出示的证书指纹"和"`:authority` 选出的站点"，包括 `SNI=a` 而 `authority=b` 这种
+分开打法（58 项）。h3 侧用 `ORRH3_AUTHORITY` 覆写 authority、Node 侧用 `servername` 覆写 SNI，
+两个探针都输出 `PEER_SHA256`，所以"证书按 SNI"这句话在三种传输上都是量出来的，不是推出来的。
+更多运维口径见 [OPERATIONS.md](OPERATIONS.md) 第 5.5 节。
 
 ---
 
