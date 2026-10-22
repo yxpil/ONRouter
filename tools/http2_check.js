@@ -19,12 +19,13 @@ function request(path) {
     const req = session.request({ ':path': path, ':method': 'GET' });
     let body = '';
     let status = 0;
-    req.on('response', (h) => { status = h[':status']; });
+    let location = '';
+    req.on('response', (h) => { status = h[':status']; location = h['location'] || ''; });
     req.setEncoding('utf8');
     req.on('data', (d) => { body += d; });
-    req.on('end', () => resolve({ status, body }));
-    req.on('error', () => resolve({ status: 0, body: '' }));
-    req.setTimeout(8000, () => { req.close(http2.errors?.CONNECT_ERROR ?? 2); resolve({ status: 0, body: '' }); });
+    req.on('end', () => resolve({ status, body, location }));
+    req.on('error', () => resolve({ status: 0, body: '', location: '' }));
+    req.setTimeout(8000, () => { req.close(http2.errors?.CONNECT_ERROR ?? 2); resolve({ status: 0, body: '', location: '' }); });
   });
 }
 
@@ -33,6 +34,11 @@ function request(path) {
     const results = await Promise.all(Array.from({ length: n }, () => request('/')));
     const ok = results.filter((r) => r.status === 200).length;
     console.log('STREAMS=' + ok);
+  } else if (mode === 'redirect') {
+    // 用真实 h2 流取 Location，验证服务端的 $request_uri 是 :path 而非绝对 URI
+    const r = await request(process.argv[5] || '/redir?x=1');
+    console.log('STATUS=' + r.status);
+    console.log('LOCATION=' + r.location);
   } else {
     const r = await request('/');
     // Node 的 http2 客户端只有在服务端确实协商到 HTTP/2 时才能拿到 200，

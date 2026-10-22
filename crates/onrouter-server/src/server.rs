@@ -864,6 +864,22 @@ fn request_host(headers: &hyper::HeaderMap, uri: &hyper::Uri) -> Option<String> 
     uri.authority().map(|a| a.as_str().to_string())
 }
 
+/// `$request_uri` 的取值。h1 就是请求行里的原始 target（origin-form 与绝对形式都原样保留）；
+/// h2/h3 没有请求行，hyper 会把 `:scheme`/`:authority` 一起重建成绝对 `Uri`，直接
+/// `to_string()` 会让 `$request_uri` 变成 `https://host/path`，插进
+/// `return 302 https://main$request_uri` 就拼出两个 URL 相连。分帧协议上它只能是
+/// `:path`（RFC 9113 §8.3.1），含原始 query，不解码。
+fn request_target(uri: &hyper::Uri, version: http::Version) -> String {
+    if matches!(version, http::Version::HTTP_2 | http::Version::HTTP_3) {
+        match uri.query() {
+            Some(q) => format!("{}?{}", uri.path(), q),
+            None => uri.path().to_string(),
+        }
+    } else {
+        uri.to_string()
+    }
+}
+
 async fn handle_request(
     state: Arc<AppState>,
     meta: Arc<ConnMeta>,
@@ -950,7 +966,7 @@ async fn handle_request(
         method: method.as_str().to_string(),
         path,
         query: uri.query().unwrap_or("").to_string(),
-        uri: uri.to_string(),
+        uri: request_target(&uri, version),
         host,
         remote_addr: rec.remote(),
         remote_port: meta.peer.map(|p| p.port()).unwrap_or(0),
@@ -4907,6 +4923,20 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn request_uri_on_h2_is_path_and_query_not_absolute() {
+        let abs: hyper::Uri = "https://yxp.hk/redir?x=1".parse().unwrap();
+        assert_eq!(request_target(&abs, Version::HTTP_2), "/redir?x=1");
+        assert_eq!(request_target(&abs, Version::HTTP_3), "/redir?x=1");
+        // h1 的绝对形式请求行原样进 $request_uri（与 nginx 一致）
+        assert_eq!(
+            request_target(&abs, Version::HTTP_11),
+            "https://yxp.hk/redir?x=1"
+        );
+        let origin: hyper::Uri = "/redir?x=1".parse().unwrap();
+        assert_eq!(request_target(&origin, Version::HTTP_11), "/redir?x=1");
     }
 
     #[test]

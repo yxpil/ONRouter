@@ -120,6 +120,27 @@ def main():
         check("TLS 响应状态 200", kv.get("STATUS") == "200", f"probe={kv}")
         check("TLS h2 响应体正确", "h2-tls-ok" in kv.get("BODY", ""), f"probe={kv}")
 
+        # 2.5) $request_uri：h2 上没有请求行，必须是 :path（含 query），不能是绝对 URI。
+        # 这是 `return 302 https://main$request_uri` 这类整站跳转正确性的前提。
+        kv = node_probe(f"http://127.0.0.1:{H2C_PORT}/redir?x=1", "redirect")
+        check(
+            "h2c $request_uri 只有 path+query",
+            kv.get("STATUS") == "302" and kv.get("LOCATION") == "https://dest.local/redir?x=1",
+            f"probe={kv}",
+        )
+        kv = node_probe(f"https://localhost:{TLS_PORT}/redir?x=1", "redirect")
+        check(
+            "TLS h2 $request_uri 只有 path+query",
+            kv.get("STATUS") == "302" and kv.get("LOCATION") == "https://dest.local/redir?x=1",
+            f"probe={kv}",
+        )
+        rc, so, se = curl(["-i", "--http1.1", f"http://127.0.0.1:{H2C_PORT}/redir?x=1"])
+        check(
+            "HTTP/1.1 $request_uri 保持原样",
+            rc == 0 and "location: https://dest.local/redir?x=1" in so.lower(),
+            f"rc={rc} out={so!r} err={se}",
+        )
+
         # 3) 同一明文端口 HTTP/1.1 共存（前导未命中回落 h1）
         rc, so, se = curl(["--http1.1", f"http://127.0.0.1:{H2C_PORT}/"])
         body, ver = split_ver(so)
