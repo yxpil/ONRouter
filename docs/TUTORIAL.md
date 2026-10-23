@@ -56,7 +56,7 @@ target/release/orr-gencert     # Windows: target\release\orr-gencert.exe
 
 ```bash
 target/release/onrouter -V
-# ONRouter/1.0.4 (Rust, OpenResty-compatible)
+# ONRouter/1.0.5 (Rust, OpenResty-compatible)
 #   crypto: rustls/ring [pq=off]
 ```
 

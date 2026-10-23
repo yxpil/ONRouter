@@ -191,9 +191,27 @@ page; this file is the detailed record. Per-row capability status and known gaps
     on unit+clippy, sixteen E2E suites and the pq build job. Published release archives remain
     `[pq=off]`; the `[pq=on]` Linux binary is built by CI as a workflow artifact.
 
-- **Release engineering**: CI runs unit tests + clippy + sixteen real-traffic E2E suites in three
+- **1.0.5 — the forwarded path keeps the characters it was sent with**:
+  - **`/@username/` pages stopped 404ing.** Location matching runs on the decoded path, and the
+    forward step re-encoded that result with `ngx.escape_uri`'s "unreserved only" set, so a literal
+    `/@username/` went upstream as `/%40username/`. The origin — and the WAF in front of it — match
+    only the literal form, so every user homepage, avatar and banner 404'd through the gateway while
+    the same request straight to the origin returned 200. Forwarding now encodes over RFC 3986
+    `pchar`: `@ : + , ; = & $ ! ' ( ) * ~` pass through, and exactly the bytes that must not go raw
+    (`% # ?`, space, control bytes, non-ASCII) are escaped, which round-trips what the client sent.
+    The two forward seams (the proxied request URI and the WebSocket upgrade fallback) and the
+    directory-listing hrefs share one helper; `ngx.escape_uri` for Lua keeps its own, stricter
+    semantics. `tools/uri_encode_e2e.py` reads back the raw request line the origin receives over
+    real traffic: **7/14 before the change, 14/14 after**.
+  - Verified on the 1.0.5 binary: unit **504/504**, full local regression `reg_uriencode.txt` →
+    **TOTAL 97 scripts, nonzero=0** with `SKIP` empty (the count went from 96 to 97 because
+    `uri_encode` is now part of the roll), and the packaged artefacts re-checked by
+    `tools/release_verify.py`.
+
+- **Release engineering**: CI runs unit tests + clippy + seventeen real-traffic E2E suites in three
   steps (functional contract — `tls_groups` joined it, since a refused handshake is a production
-  shape no other suite covers — business shapes, then the h1/h2/h3 transport-parity suite), with an
+  shape no other suite covers, and `uri_encode` after the `/@username/` 404 — business shapes, then
+  the h1/h2/h3 transport-parity suite), with an
   optional `workflow_dispatch` 21-minute soak that checks private-memory growth. The 1.0 docs are
   [OPERATIONS.md](OPERATIONS.md) (run it in production) and
   [TUTORIAL.md](TUTORIAL.md) (build it feature by feature).

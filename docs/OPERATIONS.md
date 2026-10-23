@@ -1,6 +1,6 @@
 # ONRouter 1.0 操作手册
 
-适用版本：**1.0.4**（2026-10-22）
+适用版本：**1.0.5**（2026-10-23）
 面向：部署、值守、容量规划与故障排查。
 配套文档：[使用教程](TUTORIAL.md)、[功能矩阵](FEATURES.md)、[Lua API](LUA_API.md)、[能力矩阵与证据](CAPABILITY_MATRIX.md)。
 
@@ -49,22 +49,22 @@ target 为 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、
 | `certs/` | 打包时由 `orr-gencert` 现生成的自签名证书对，供 `conf/onrouter.conf` 的 8443 TLS 演示直接使用 |
 | `docs/`、`README.md` | 操作手册、使用教程与项目说明 |
 
-两种包的压缩结构都是"内容在压缩包根"，**没有** `onrouter-v1.0.4-…/` 这样的外层目录，
+两种包的压缩结构都是"内容在压缩包根"，**没有** `onrouter-v1.0.5-…/` 这样的外层目录，
 所以解压时先自己建目录，别指望 `cd` 进一个包里不存在的名字：
 
 ```bash
 # A 类（GitHub 资产）：Linux / macOS
-mkdir -p /usr/local/onrouter && tar xzf onrouter-v1.0.4-x86_64-unknown-linux-gnu.tar.gz -C /usr/local/onrouter
+mkdir -p /usr/local/onrouter && tar xzf onrouter-v1.0.5-x86_64-unknown-linux-gnu.tar.gz -C /usr/local/onrouter
 install -m 0755 /usr/local/onrouter/onrouter /usr/local/onrouter/orr-gencert /usr/local/bin/
 onrouter -V
 
 # A 类：Windows PowerShell
 New-Item -ItemType Directory -Force C:\onrouter | Out-Null
-Expand-Archive onrouter-v1.0.4-x86_64-pc-windows-msvc.zip -DestinationPath C:\onrouter
+Expand-Archive onrouter-v1.0.5-x86_64-pc-windows-msvc.zip -DestinationPath C:\onrouter
 C:\onrouter\onrouter.exe -V
 
 # B 类（完整目录包）：解开就是推荐布局，conf/ 与可执行文件同级，直接能跑
-mkdir -p orr && tar xzf onrouter-v1.0.4-x86_64-unknown-linux-gnu.tar.gz -C orr
+mkdir -p orr && tar xzf onrouter-v1.0.5-x86_64-unknown-linux-gnu.tar.gz -C orr
 cd orr && ./onrouter -t -c conf/onrouter.conf
 ```
 
@@ -1368,7 +1368,7 @@ tail -n 200 conf/logs/error.log
 ### 16.3 打包
 
 ```powershell
-# Windows：生成 target\dist\archives\onrouter-v1.0.4-x86_64-pc-windows-msvc.zip
+# Windows：生成 target\dist\archives\onrouter-v1.0.5-x86_64-pc-windows-msvc.zip
 powershell -ExecutionPolicy Bypass -File .\build-release.ps1 build
 python tools\release_verify.py
 ```
