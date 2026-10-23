@@ -1355,10 +1355,11 @@ tail -n 200 conf/logs/error.log
 - [ ] 全量回归 `python run_regression.py <本次发布名>.txt` 记录零非零退出（`run_regression.py`
       顶部的 `SKIP` 集是**唯一**允许"不参与"的地方，往里加一条必须同时写清为什么它的红绿
       不构成证据；当前 `SKIP` 为空）；
-- [ ] CI 的三个 E2E 步骤在 Linux 上全绿：功能契约（12 条：canary、wasm、resilience、affinity、
-      proxy_split、proxy_disk、limit_key、expires、herd、security_matrix、https_matrix、tls_groups）、业务形状
+- [ ] CI 的三个 E2E 步骤在 Linux 上全绿：功能契约（13 条：canary、wasm、resilience、affinity、
+      proxy_split、proxy_disk、limit_key、expires、herd、security_matrix、https_matrix、tls_groups、
+      uri_encode）、业务形状
       （选课/静态站+WASM+Lua/游戏 UDP 共 3 条）、跨传输一致性（`orr-h3check` 探针 + `quic_business` 1 条），
-      共 16 条；
+      共 17 条；
 - [ ] 21 分钟 soak 通过，私有内存预热后走平；
 - [ ] 发布包内二进制的 `-V` 与 `Cargo.toml` 版本一致；
 - [ ] 用发布包里的二进制跑 `-t` 与一次真实请求；
