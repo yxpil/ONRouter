@@ -52,6 +52,11 @@ class Backend(BaseHTTPRequestHandler):
 
 
 def find_binary():
+    # ONROUTER_BIN lets the suite drive an artefact that is not in the build tree -- e.g. the
+    # archive attached to a published Release, which is what a user actually runs.
+    override = os.environ.get("ONROUTER_BIN")
+    if override:
+        return override
     for profile in ("release", "debug"):
         for name in ("onrouter.exe", "onrouter"):
             p = os.path.join(ROOT, "target", profile, name)
