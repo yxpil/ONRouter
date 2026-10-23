@@ -670,6 +670,49 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Re-encode an outbound path, segment by segment. Location matching runs on the decoded
+/// path, and `%`, `#`, `?`, spaces, control bytes and bare UTF-8 cannot go on the wire as they
+/// are, so the decoded result has to be encoded again before it is forwarded.
+pub fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Encode one path segment over the RFC 3986 `pchar` set: unreserved (A-Za-z0-9 plus `-._~`),
+/// sub-delims (`!$&'()*+,;=`) and `:` `@` stay literal, every other byte becomes `%XX` (upper
+/// case hex).
+///
+/// Deliberately looser than `lua_engine::escape_uri` (which mirrors `ngx.escape_uri` and keeps
+/// only unreserved): that set is for serializing query arguments, and applied to a path segment
+/// it turns `@` into `%40` and `:` into `%3A`. ONRouter decodes the path for matching and encodes
+/// it again for forwarding, so the strict set rewrote a client's literal `/@username/` into a
+/// `/%40username/` the origin does not recognize — every user homepage 404'd through the gateway.
+/// `pchar` is the legal character set for a path segment, and round-tripping over it is what
+/// makes the forwarded target match nginx's.
+///
+/// `%` still has to be re-encoded: the input is already decoded, so `%25` in the forwarded URI
+/// stands for a literal `%` the client sent as part of a name. Dropping that escape would let the
+/// origin decode a second, different set of escapes (`%2F` into `/`, `%23` into `#`), and the
+/// gateway and the origin would then be serving different resources.
+pub fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if is_pchar(b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn is_pchar(b: u8) -> bool {
+    const ALLOWED: &[u8] = b"-._~!$&'()*+,;=:@";
+    b.is_ascii_alphanumeric() || ALLOWED.contains(&b)
+}
+
 /// 解析变量 `$name`：优先内置 map 目标，其次 geo 目标，最后内置变量表。
 /// map/geo 的源变量可再次经本函数递归解析（`depth` 防环）。`None` 表示未定义。
 pub fn resolve_var(ctx: &RequestCtx, name: &str, depth: u8) -> Option<String> {

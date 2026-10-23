@@ -72,7 +72,8 @@ jobs:
         run: |
           mkdir -p conf/logs
           for suite in canary wasm resilience affinity proxy_split proxy_disk \
-                       limit_key expires herd security_matrix https_matrix tls_groups; do
+                       limit_key expires herd security_matrix https_matrix tls_groups \
+                       uri_encode; do
             echo "::group::${suite}_e2e"
             python3 "tools/${suite}_e2e.py"
             echo "::endgroup::"

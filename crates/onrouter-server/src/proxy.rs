@@ -34,6 +34,7 @@ use hyper_util::rt::{TokioExecutor, TokioTimer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_service::Service as _;
 
+use crate::engine::encode_path;
 use crate::engine::RequestCtx;
 use crate::engine::SplitRole;
 use crate::proxy_tls::{ProxyConnector, ProxyStream, TlsPolicy};
@@ -851,16 +852,6 @@ fn rewrite_proxy_path(effective: &str, loc_prefix: &str, repl: &str) -> String {
     }
 }
 
-/// 路径按段重新做百分号编码后转发：
-/// location 匹配用的是解码后的路径，而 URI 语法不允许空格/控制字符/裸 UTF-8 字节，
-/// 直接把解码结果拼进转发 URI 会让后端收到非法请求行（含中文文件名、带空格的路径必现）。
-fn encode_path(path: &str) -> String {
-    path.split('/')
-        .map(crate::lua_engine::escape_uri)
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 /// Upgrade（WebSocket 隧道）的请求行必须转发客户端**原始的、未解码**的 request target。
 /// 用解码后的路径拼接会让 `%23` 变成裸 `#`（后端把它当片段截断 URI）、`%2f` 变成 `/`、
 /// `%2541` 之类二次编码也被顺手解掉一层——前后端对"这是哪个资源"的认知就此分叉，
@@ -1632,6 +1623,16 @@ mod tests {
         // 原本就是转义形式的 '%' 不能二次误解
         assert_eq!(encode_path("/100%25/"), "/100%2525/");
         assert_eq!(encode_path("/"), "/");
+        // pchar characters must pass through untouched: encoding `@` as `%40` 404s every
+        // `/@username/` homepage, because the origin only matches the literal form
+        assert_eq!(encode_path("/@yinglink/"), "/@yinglink/");
+        assert_eq!(
+            encode_path("/a:b/c,d;e=f&g$h+i%j"),
+            "/a:b/c,d;e=f&g$h+i%25j"
+        );
+        // bytes that would truncate the URI or are illegal inside it still get escaped
+        assert_eq!(encode_path("/a#b?c"), "/a%23b%3Fc");
+        assert_eq!(encode_path("/a<b>"), "/a%3Cb%3E");
     }
 
     #[test]

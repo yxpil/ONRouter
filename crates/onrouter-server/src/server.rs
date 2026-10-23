@@ -3476,7 +3476,9 @@ fn autoindex_html(dir: &std::path::Path, uri: &str) -> Option<String> {
         }
         let slash = if e.path().is_dir() { "/" } else { "" };
         let disp = html_escape(&format!("{name}{slash}"));
-        let href = url_encode_path_segment(&name) + slash;
+        // Directory-listing hrefs must be re-encoded or names with spaces/non-ASCII are
+        // unclickable; the pchar set keeps characters like `@` exactly as the client sent them
+        let href = crate::engine::encode_path_segment(&name) + slash;
         entries.push(format!("<a href=\"{href}\">{disp}</a>"));
     }
     entries.sort();
@@ -3499,20 +3501,6 @@ fn html_escape(s: &str) -> String {
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&#39;"),
             c => out.push(c),
-        }
-    }
-    out
-}
-
-/// 目录列表里的链接要重新做百分号编码，否则含空格/中文的文件名点不开
-fn url_encode_path_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out
