@@ -65,6 +65,52 @@ jobs:
         with:
           name: onrouter-linux-${{ matrix.target }}
           path: dist/*.tar.gz
+
+  # 后量子构建。真实动因（2026-10-26 生产事故）：Cloudflare 较新的 zone 回源时 ClientHello
+  # 只带 X25519MLKEM768，而本 workflow 之前每个构建都不带 --features pq，于是装了官方 release
+  # 产物的网关只能拒绝它 —— CDN 侧表现为 525。能力、断言、文档都早已在仓库里，缺的只是产物。
+  # 默认构建保持 ring 不动：开 pq 换的是整个 crypto provider（ring -> aws-lc-rs），由运维选。
+  linux-pq:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与 ci.yml 的 pq job 同一个理由：在 debian:bookworm（glibc 2.36）里编译 aws-lc 的 C 代码，
+      # 直接在 ubuntu-24.04（glibc 2.39）上产出的二进制会在 Debian 12 生产机上起不来。
+      - name: Build with pq (inside debian:bookworm, glibc 2.36)
+        run: |
+          docker run --rm -v "$PWD":/work -w /work debian:bookworm bash -euo pipefail -c '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends curl ca-certificates build-essential cmake pkg-config perl python3 openssl
+            curl --proto "=https" -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            export PATH="$HOME/.cargo/bin:$PATH"
+            cargo build --release -p onrouter-server --features pq --bin onrouter
+            # orr-gencert 只签自签名证书，和入向密钥交换组无关，按默认 feature 出，与其余包一致；
+            # 不给它开 pq 是为了不把未验证过的 provider 组合塞进 release。
+            cargo build --release -p onrouter-server --bin orr-gencert
+            chown -R "$(id -u):$(id -g)" target/release
+          '
+
+      - name: Create archive
+        run: |
+          mkdir -p dist
+          cd target/release
+          tar czf ../../dist/onrouter-${{ github.ref_name }}-x86_64-unknown-linux-gnu-pq.tar.gz onrouter orr-gencert
+
+      # 文件名里写了 pq 不算数：产物必须自己声明，否则发出去的还是谈不拢 CDN 的那一份。
+      - name: pq=on and glibc guard
+        run: |
+          out=$(./target/release/onrouter -V)
+          echo "$out"
+          echo "$out" | grep -q '\[pq=on\]' || { echo "::error::release 产物没有报告 pq=on"; exit 1; }
+          echo "产物要求的最高 glibc：$(readelf -V ./target/release/onrouter | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: onrouter-linux-x86_64-pq
+          path: dist/*.tar.gz
   
   # macOS builds (Intel + Apple Silicon)
   macos:
@@ -139,7 +185,7 @@ jobs:
   
   # Create GitHub Release
   release:
-    needs: [linux, macos, windows]
+    needs: [linux, linux-pq, macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

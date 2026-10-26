@@ -30,7 +30,8 @@ Linux/macOS 用信号管理进程；Windows 只响应 Ctrl+C，热重载依赖�
 
 有两种产物，装的东西不一样，先看清要拿哪一个：
 
-**A. GitHub Release 上的平台包**（`release.yml` 推 `v*` 标签时自动产出 8 个）——
+**A. GitHub Release 上的平台包**（`release.yml` 推 `v*` 标签时自动产出 8 个，外加一个
+`onrouter-v<版本>-x86_64-unknown-linux-gnu-pq.tar.gz` 后量子构建，共 9 个）——
 每个里面**只有两个可执行文件**（`onrouter` 与 `orr-gencert`），文件名是
 `onrouter-v<版本>-<target>.tar.gz`（Linux/macOS）或 `.zip`（Windows），
 target 为 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、
@@ -528,6 +529,11 @@ onrouter_tls_handshake_failures_total 2
    代价是构建链引入 C 依赖 aws-lc-sys（需要 cmake/汇编；Windows MSVC 与 Linux 实测可编，
    八个发布目标里 armv7/riscv64 尚未验证），并且"100% in Rust"这条表述要按构建口径改写。
    因此它**默认关闭**：发布包默认仍是 `[pq=off]`，只服务 {X25519, P-256, P-384}。
+   从 1.0.5 之后的第一个标签起，Release 另外附带一个 `…-x86_64-unknown-linux-gnu-pq.tar.gz`
+   （`release.yml` 的 `linux-pq` 作业，在 debian:bookworm 里编译，产物自己声明 `[pq=on]`），
+   挂在只发后量子回源 hello 的 CDN 后面就装这一个——动因是 2026-10-26 的一次生产 525：能力、
+   断言、文档都在仓库里，可当时**没有任何一条发布链产出过 pq 二进制**，照本文装官方包的运维
+   只能拿到谈不拢的那一份。
    要不要在某个目标上默认打开，是一个明确的发布策略决定，不是 bug 修复。
 3. **把它当边界写进验收清单**：默认构建的入向曲线集合就是 {X25519, P-256, P-384}。
    只给 P-521、只给 ML-KEM 混合曲线（默认构建）、或只给实验 codepoint 的客户端一律拒绝——
